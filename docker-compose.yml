@@ -1,0 +1,70 @@
+# Local development stack.
+#
+# `docker compose up` brings up the trading floor plus Redis and PostgreSQL.
+# The platform itself needs neither: with the defaults it runs entirely
+# in-process against a synthetic market and a SQLite event store. These
+# services exist so the Redis-Streams bus and the PostgreSQL event store can
+# be exercised the way they will run in a real deployment.
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", ""]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - redis-data:/data
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: trading
+      POSTGRES_PASSWORD: trading
+      POSTGRES_DB: trading_floor
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading -d trading_floor"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./storage/migrations:/docker-entrypoint-initdb.d:ro
+
+  trading-floor:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      TF_ENVIRONMENT: docker
+      TF_LOG_FORMAT: json
+      # Change to "live" for public read-only exchange feeds.
+      TF_FEED: simulated
+      TF_BUS: redis
+      TF_REDIS_URL: redis://redis:6379/0
+      TF_STORAGE_BACKEND: postgres
+      TF_POSTGRES_DSN: postgresql://trading:trading@postgres:5432/trading_floor
+      TF_PAPER_INITIAL_BALANCE: "100000"
+      TF_INTELLIGENCE_PROVIDER: "${TF_INTELLIGENCE_PROVIDER:-null}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      TF_API_HOST: 0.0.0.0
+      TF_API_PORT: "8080"
+    ports:
+      - "8080:8080"
+    # No exchange credentials are mounted, because nothing in this build can
+    # use them: the venue adapters read public market data only.
+    volumes:
+      - ./data:/app/data
+
+volumes:
+  redis-data:
+  postgres-data:

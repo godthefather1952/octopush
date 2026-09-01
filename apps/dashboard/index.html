@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trading Floor — PAPER MODE</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #262d36; --text: #e6edf3;
+    --muted: #8b949e; --good: #3fb950; --warn: #d29922; --bad: #f85149;
+    --accent: #58a6ff; --paper: #bb8009;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 10;
+  }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  .paper-badge {
+    background: var(--paper); color: #000; font-weight: 700; padding: 3px 10px;
+    border-radius: 3px; letter-spacing: .08em; font-size: 12px;
+  }
+  .pill { padding: 2px 8px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 12px; padding: 12px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  section > h2 {
+    margin: 0; padding: 8px 12px; font-size: 12px; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--muted); border-bottom: 1px solid var(--line);
+  }
+  .body { padding: 8px 12px 12px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 8px 4px 0; white-space: nowrap; }
+  td { padding: 3px 8px 3px 0; white-space: nowrap; border-top: 1px solid var(--line); }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .kv { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  .HEALTHY, .FRESH, .pos { color: var(--good); }
+  .DEGRADED, .warn { color: var(--warn); }
+  .OFFLINE, .STALE, .UNAVAILABLE, .neg { color: var(--bad); }
+  .bar { height: 5px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 3px; }
+  .bar > i { display: block; height: 100%; background: var(--good); }
+  .bar > i.warn { background: var(--warn); }
+  .bar > i.bad { background: var(--bad); }
+  .muted { color: var(--muted); }
+  .banner { background: var(--bad); color: #fff; padding: 6px 16px; font-weight: 600; }
+  footer { padding: 10px 16px; color: var(--muted); font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Multi-Agent Trading Floor</h1>
+  <span class="paper-badge" id="mode">PAPER MODE</span>
+  <span class="pill" id="session">session —</span>
+  <span class="pill" id="tick">tick 0</span>
+  <span class="pill" id="sysstatus">—</span>
+  <span class="pill muted" id="updated">—</span>
+</header>
+<div id="kill-banner" class="banner" hidden></div>
+
+<div class="grid">
+  <section><h2>Venue market state</h2><div class="body"><table id="venues"></table></div></section>
+  <section><h2>Consolidated &amp; fair value</h2><div class="body"><table id="consolidated"></table></div></section>
+  <section><h2>Paper account</h2><div class="body"><dl class="kv" id="portfolio"></dl></div></section>
+  <section><h2>Risk utilisation</h2><div class="body" id="risk"></div></section>
+  <section><h2>Agent health &amp; scorecards</h2><div class="body"><table id="agents"></table></div></section>
+  <section><h2>Open positions</h2><div class="body"><table id="positions"></table></div></section>
+  <section><h2>Opportunities</h2><div class="body"><table id="opportunities"></table></div></section>
+  <section><h2>Open paper orders</h2><div class="body"><table id="orders"></table></div></section>
+  <section><h2>Recent risk rejections</h2><div class="body"><table id="rejections"></table></div></section>
+  <section><h2>Trade attribution</h2><div class="body"><table id="attributions"></table></div></section>
+  <section><h2>Errors</h2><div class="body" id="errors"></div></section>
+</div>
+
+<footer>
+  Paper trading only. This build contains no exchange order-submission
+  implementation; venue adapters are public market data only.
+</footer>
+
+<script>
+const num = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v)) ? "—" : Number(v).toFixed(d);
+const money = (v) => v === null || v === undefined ? "—" :
+  (v < 0 ? "-" : "") + "$" + Math.abs(v).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const sign = (v) => v === null || v === undefined ? "" : (v > 0 ? "pos" : v < 0 ? "neg" : "");
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function table(el, cols, rows, cells) {
+  el.innerHTML =
+    "<thead><tr>" + cols.map(c => `<th>${esc(c)}</th>`).join("") + "</tr></thead>" +
+    "<tbody>" + (rows.length
+      ? rows.map(r => "<tr>" + cells(r).map(c =>
+          typeof c === "object"
+            ? `<td class="${c.cls || ""}">${c.html ?? esc(c.text ?? "")}</td>`
+            : `<td>${esc(c)}</td>`).join("") + "</tr>").join("")
+      : `<tr><td colspan="${cols.length}" class="muted">no data</td></tr>`) +
+    "</tbody>";
+}
+
+function meter(label, used, limit) {
+  const pct = limit > 0 ? Math.min(1, Math.abs(used) / limit) : 0;
+  const cls = pct > 0.9 ? "bad" : pct > 0.7 ? "warn" : "";
+  return `<div style="margin-bottom:8px">
+    <div style="display:flex;justify-content:space-between">
+      <span class="muted">${esc(label)}</span>
+      <span>${money(used)} / ${money(limit)}</span>
+    </div>
+    <div class="bar"><i class="${cls}" style="width:${(pct * 100).toFixed(1)}%"></i></div>
+  </div>`;
+}
+
+async function refresh() {
+  let s, a, at;
+  try {
+    [s, a, at] = await Promise.all([
+      fetch("/api/state").then(r => r.json()),
+      fetch("/api/agents").then(r => r.json()),
+      fetch("/api/attributions?limit=12").then(r => r.json()),
+    ]);
+  } catch (e) {
+    document.getElementById("updated").textContent = "disconnected";
+    return;
+  }
+
+  document.getElementById("mode").textContent = s.mode + " MODE";
+  document.getElementById("session").textContent = "session " + s.session_id;
+  document.getElementById("tick").textContent = "tick " + s.ticks;
+  document.getElementById("sysstatus").textContent = s.warmed_up ? "RUNNING" : "WARMING UP";
+  document.getElementById("updated").textContent = new Date().toLocaleTimeString();
+
+  const banner = document.getElementById("kill-banner");
+  banner.hidden = !s.kill_switch.engaged;
+  if (s.kill_switch.engaged) {
+    banner.textContent = "KILL SWITCH ENGAGED — " + s.kill_switch.triggered_by.join(", ") +
+      (s.kill_switch.trading_allowed ? "" : " — new trading halted");
+  }
+
+  table(document.getElementById("venues"),
+    ["venue", "symbol", "bid", "ask", "spread bps", "imb", "depth", "age ms", "lat ms", "quality"],
+    s.venues,
+    r => [r.venue, r.symbol,
+      {text: num(r.bid), cls: "num"}, {text: num(r.ask), cls: "num"},
+      {text: num(r.spread_bps, 2), cls: "num"}, {text: num(r.imbalance, 3), cls: "num " + sign(r.imbalance)},
+      {text: money(r.bid_depth + r.ask_depth), cls: "num"},
+      {text: r.age_ms ?? "—", cls: "num"}, {text: num(r.latency_ms, 0), cls: "num"},
+      {text: r.quality, cls: r.quality}]);
+
+  table(document.getElementById("consolidated"),
+    ["symbol", "reference", "fair value", "best bid", "best ask", "x-venue bps", "max dev bps"],
+    s.consolidated,
+    r => [r.symbol,
+      {text: num(r.reference_price), cls: "num"}, {text: num(r.fair_value), cls: "num"},
+      {text: `${num(r.best_bid)} @ ${r.best_bid_venue ?? "—"}`, cls: "num"},
+      {text: `${num(r.best_ask)} @ ${r.best_ask_venue ?? "—"}`, cls: "num"},
+      {text: num(r.cross_venue_spread_bps, 2), cls: "num " + sign(r.cross_venue_spread_bps)},
+      {text: num(r.max_deviation_bps, 2), cls: "num"}]);
+
+  const p = s.portfolio;
+  document.getElementById("portfolio").innerHTML = [
+    ["Initial balance", money(p.initial_balance)],
+    ["Cash", money(p.cash)],
+    ["Equity", money(p.equity)],
+    ["Gross P&L", money(p.gross_pnl)],
+    ["Fees", money(p.fees_paid)],
+    ["Net P&L", money(p.net_pnl)],
+    ["Realised", money(p.realized_pnl)],
+    ["Unrealised", money(p.unrealized_pnl)],
+    ["Drawdown", money(p.drawdown)],
+    ["Gross exposure", money(p.gross_exposure)],
+    ["Net exposure", money(p.net_exposure)],
+  ].map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
+
+  document.getElementById("risk").innerHTML =
+    meter("Gross exposure", s.risk.gross_exposure, s.risk.max_gross_exposure) +
+    meter("Net exposure", s.risk.net_exposure, s.risk.max_net_exposure) +
+    meter("Unhedged", s.risk.unhedged_notional, s.risk.max_unhedged_notional) +
+    meter("Day loss", s.risk.day_loss, s.risk.max_day_loss) +
+    meter("Drawdown", s.risk.drawdown, s.risk.max_drawdown);
+
+  table(document.getElementById("agents"),
+    ["agent", "status", "weight", "required", "obs", "contribution", "hit rate"],
+    a.agents,
+    r => [r.agent, {text: r.status, cls: r.status}, {text: num(r.weight, 1), cls: "num"},
+      r.required ? "yes" : "no", {text: r.observations, cls: "num"},
+      {text: num(r.predictive_contribution, 3), cls: "num " + sign(r.predictive_contribution)},
+      {text: num(r.hit_rate, 2), cls: "num"}]);
+
+  table(document.getElementById("positions"),
+    ["venue", "symbol", "qty", "entry", "mark", "unrealised", "realised"],
+    p.positions.filter(x => Math.abs(x.quantity) > 1e-9),
+    r => [r.venue, r.symbol, {text: num(r.quantity, 6), cls: "num " + sign(r.quantity)},
+      {text: num(r.average_entry_price), cls: "num"}, {text: num(r.mark_price), cls: "num"},
+      {text: money(r.unrealized_pnl), cls: "num " + sign(r.unrealized_pnl)},
+      {text: money(r.realized_pnl), cls: "num " + sign(r.realized_pnl)}]);
+
+  table(document.getElementById("opportunities"),
+    ["symbol", "state", "gross bps", "net bps", "notional", "consensus", "P&L", "note"],
+    s.opportunities,
+    r => [r.symbol, r.state, {text: num(r.gross_edge_bps, 2), cls: "num"},
+      {text: num(r.expected_net_edge_bps, 2), cls: "num " + sign(r.expected_net_edge_bps)},
+      {text: money(r.notional), cls: "num"},
+      {text: r.consensus === null ? "—" : (r.consensus * 100).toFixed(1) + "%", cls: "num"},
+      {text: money(r.realized_pnl), cls: "num " + sign(r.realized_pnl)},
+      {text: r.rejected_reason ?? "", cls: "muted"}]);
+
+  table(document.getElementById("orders"),
+    ["venue", "symbol", "side", "qty", "filled", "limit", "status"],
+    s.open_orders,
+    r => [r.venue, r.symbol, r.side, {text: num(r.quantity, 6), cls: "num"},
+      {text: num(r.filled, 6), cls: "num"}, {text: num(r.limit_price), cls: "num"}, r.status]);
+
+  table(document.getElementById("rejections"),
+    ["symbol", "verdict", "failed gates"],
+    s.rejections,
+    r => [r.symbol, r.verdict, {text: r.gates.join(", "), cls: "muted"}]);
+
+  table(document.getElementById("attributions"),
+    ["symbol", "consensus", "exp bps", "cost bps", "slip bps", "fees", "P&L"],
+    at.trades,
+    r => [r.symbol, {text: (r.consensus * 100).toFixed(1) + "%", cls: "num"},
+      {text: num(r.expected_net_edge_bps, 2), cls: "num"},
+      {text: num(r.expected_costs_bps, 2), cls: "num"},
+      {text: num(r.slippage_bps, 2), cls: "num"},
+      {text: money(r.fees), cls: "num"},
+      {text: money(r.realized_pnl), cls: "num " + sign(r.realized_pnl)}]);
+
+  document.getElementById("errors").innerHTML = s.errors.length
+    ? s.errors.map(e => `<div class="neg">${esc(e)}</div>`).join("")
+    : '<span class="muted">none</span>';
+}
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
