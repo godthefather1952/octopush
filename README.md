@@ -231,13 +231,44 @@ tests/         unit, integration, replay, simulation, failure
 ```bash
 pytest                     # everything
 pytest tests/unit          # fast: schemas, books, pricing, risk, execution
+pytest tests/contract      # interface conformance: bus, event store, config
 pytest tests/failure       # failure injection
 pytest tests/replay        # recording and determinism
+pytest tests/stress        # ledger growth and reconciliation scaling
 ```
 
 Every test is offline and deterministic: manual clock, in-process bus,
 in-memory store, seeded market. The end-to-end suites run several hundred
 simulated ticks each, so the full run takes a couple of minutes.
+
+### Backends that need a server
+
+The event-store contract suite in
+`tests/contract/test_event_store_contract.py` runs against every backend, so
+a divergence between them is a test failure rather than a production
+surprise. The `memory` and `sqlite` backends need nothing. The `postgres`
+parameter is **skipped, never silently passed**, unless a server is
+reachable:
+
+```bash
+export TF_TEST_POSTGRES_DSN=postgresql://trading@127.0.0.1:5433/trading_floor
+pytest tests/contract/test_event_store_contract.py
+```
+
+Any PostgreSQL 14+ will do — `docker compose up postgres`, or a throwaway
+cluster:
+
+```bash
+PGBIN=/usr/lib/postgresql/16/bin
+$PGBIN/initdb -D /tmp/pgdata-tf -U trading --auth=trust
+$PGBIN/pg_ctl -D /tmp/pgdata-tf -o "-p 5433" -l /tmp/pgdata-tf.log start
+$PGBIN/createdb -h 127.0.0.1 -p 5433 -U trading trading_floor
+```
+
+The suite creates its own schema on `open()` and truncates between tests, so
+point it only at a database you are happy to have emptied. Redis is the same
+arrangement: the bus contract suite runs its `redis` parameter only when a
+server is reachable.
 
 What the suite is really there to prove, before profitability is ever the
 objective:
