@@ -47,7 +47,7 @@ class VenueAAdapter(WebSocketAdapter):
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
                 f"{base}/api/v3/depth",
-                params={"symbol": venue_symbol, "limit": self.config.book_depth * 2},
+                params={"symbol": venue_symbol, "limit": self.config.book_depth_levels * 2},
             )
             resp.raise_for_status()
             return parser.parse_depth_snapshot(resp.json(), symbol, self.clock.now_ms())

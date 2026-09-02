@@ -3,10 +3,26 @@
 Cash, positions and P&L for the simulated portfolio.  Deliberately simple
 arithmetic that can be recomputed from the fill log alone — which is exactly
 what MARIN does to check it.
+
+The fill log is split into a *sealed* prefix and an *unsealed tail*.  MARIN
+replays only the tail, against totals carried forward in a
+:class:`LedgerCheckpoint`.  A prefix is sealed only once reconciliation has
+compared it against the running state and found them equal, so sealing never
+buries a discrepancy: it records one that was checked.  What sealing does give
+up is re-detection of a *retroactive* change to already-verified history — a
+fill object mutated in place long after the fact.  Fills are immutable value
+objects appended once, so that is not a failure mode this system has; the
+trade is bounded memory and bounded reconciliation cost, and it is made
+explicitly rather than by accident.
+
+Full history remains available: every fill is published and persisted by the
+recorder, so a from-zero rebuild is a replay-from-store operation rather than
+a resident-memory one.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 
 from core.clock import Clock
@@ -16,6 +32,32 @@ from core.models.portfolio import PortfolioState, PositionState
 
 #: Milliseconds in a trading day, used for the daily-loss reset.
 DAY_MS = 24 * 60 * 60 * 1000
+
+#: Fills retained in memory beyond the sealed checkpoint.
+#:
+#: Sized from measurement, not taste: a fill costs ~3.5KB resident, so 10_000
+#: retained fills is ~35MB — a bounded, predictable footprint. It is also far
+#: more than any plausible burst between reconciliation runs (MARIN runs every
+#: few ticks, and a tick produces single-digit fills), so under normal
+#: operation the tail is sealed long before the cap is approached. The cap is
+#: a backstop against a stalled reconciler, not the usual path.
+DEFAULT_RETAINED_FILLS = 10_000
+
+
+@dataclass
+class LedgerCheckpoint:
+    """Verified cumulative totals as of a sealed prefix of the fill log."""
+
+    #: Number of fills folded into this checkpoint, from the start of the session.
+    fills_sealed: int = 0
+    cash: float = 0.0
+    realized_pnl: float = 0.0
+    fees_paid: float = 0.0
+    positions: dict[str, PositionState] = field(default_factory=dict)
+    sealed_at: Millis | None = None
+
+    def clone_positions(self) -> dict[str, PositionState]:
+        return {k: v.model_copy(deep=True) for k, v in self.positions.items()}
 
 
 @dataclass
@@ -31,9 +73,17 @@ class PaperAccount:
     peak_equity: float = 0.0
     day_realized_pnl: float = 0.0
     day_started_at: Millis | None = None
-    #: Every fill applied, in order. The audit trail MARIN replays.
+    #: Fills applied since the checkpoint, in order. The audit trail MARIN
+    #: replays. Bounded: see :data:`DEFAULT_RETAINED_FILLS`.
     fill_log: list[FillEvent] = field(default_factory=list)
+    #: Verified totals for every fill *before* ``fill_log``.
+    checkpoint: LedgerCheckpoint = field(default_factory=LedgerCheckpoint)
+    retained_fills: int = DEFAULT_RETAINED_FILLS
+    #: Lifetime fill count, including sealed ones.
+    fills_applied: int = 0
     _applied: set[str] = field(default_factory=set)
+    #: Insertion order for ``_applied``, so the dedupe window can be trimmed.
+    _dedupe_order: deque[str] = field(default_factory=deque)
 
     def __post_init__(self) -> None:
         if self.cash == 0.0:
@@ -42,6 +92,8 @@ class PaperAccount:
             self.peak_equity = self.initial_balance
         if self.day_started_at is None:
             self.day_started_at = self.clock.now_ms()
+        if self.checkpoint.fills_sealed == 0 and self.checkpoint.sealed_at is None:
+            self.checkpoint.cash = self.initial_balance
 
     # -- mutation ----------------------------------------------------------
 
@@ -56,6 +108,9 @@ class PaperAccount:
         if fill.fill_id in self._applied:
             return False
         self._applied.add(fill.fill_id)
+        self._dedupe_order.append(fill.fill_id)
+        self._trim_dedupe()
+        self.fills_applied += 1
         self._roll_day(fill.created_at)
 
         position = self.position(fill.venue, fill.symbol)
@@ -117,10 +172,17 @@ class PaperAccount:
 
         MARIN uses this as the second opinion in reconciliation: two paths to
         the same numbers, compared with an epsilon.
+
+        The rebuild starts from the last sealed checkpoint rather than from
+        zero, so its cost is proportional to the unsealed tail rather than to
+        lifetime history. The checkpoint's own totals were produced by this
+        same replay and compared against the running state before being
+        sealed, so the arithmetic being checked is still the account's, not
+        the checkpoint's.
         """
-        cash = self.initial_balance
-        realized = 0.0
-        positions: dict[str, PositionState] = {}
+        cash = self.checkpoint.cash
+        realized = self.checkpoint.realized_pnl
+        positions = self.checkpoint.clone_positions()
         for fill in self.fill_log:
             key = f"{fill.venue}:{fill.symbol}"
             if key not in positions:
@@ -128,3 +190,60 @@ class PaperAccount:
             realized += positions[key].apply(fill.side, fill.quantity, fill.price, fill.fee)
             cash += fill.cash_delta
         return cash, positions, realized
+
+    # -- ledger compaction -------------------------------------------------
+
+    @property
+    def unsealed_fills(self) -> int:
+        return len(self.fill_log)
+
+    def seal(self, count: int | None = None) -> int:
+        """Fold a verified prefix of the tail into the checkpoint.
+
+        The caller is responsible for having verified the prefix first, and
+        for choosing where it ends: this method records agreement, it does
+        not establish it. MARIN calls it only after a reconciliation run that
+        found no critical mismatch, with a boundary that keeps the account's
+        and the OMS's retained windows identical.
+
+        A *prefix* rather than a selection, because the replay is
+        order-dependent: skipping a fill in the middle would rebase every
+        position after it. Returns the number of fills sealed.
+        """
+        limit = len(self.fill_log) if count is None else min(count, len(self.fill_log))
+        if limit <= 0:
+            return 0
+
+        prefix, tail = self.fill_log[:limit], self.fill_log[limit:]
+        cash = self.checkpoint.cash
+        realized = self.checkpoint.realized_pnl
+        positions = self.checkpoint.clone_positions()
+        for fill in prefix:
+            key = f"{fill.venue}:{fill.symbol}"
+            if key not in positions:
+                positions[key] = PositionState(venue=fill.venue, symbol=fill.symbol)
+            realized += positions[key].apply(fill.side, fill.quantity, fill.price, fill.fee)
+            cash += fill.cash_delta
+        self.checkpoint = LedgerCheckpoint(
+            fills_sealed=self.checkpoint.fills_sealed + limit,
+            cash=cash,
+            realized_pnl=realized,
+            fees_paid=self.checkpoint.fees_paid + sum(f.fee for f in prefix),
+            positions=positions,
+            sealed_at=self.clock.now_ms(),
+        )
+        self.fill_log = tail
+        return limit
+
+    def _trim_dedupe(self) -> None:
+        """Bound the duplicate-detection window.
+
+        A re-delivered fill arrives close behind the original, so a window of
+        the most recent ``retained_fills`` ids covers every duplicate this
+        system can actually produce. Beyond that horizon a repeat would be
+        applied twice — which is precisely the discrepancy MARIN exists to
+        catch, so the failure is loud rather than silent.
+        """
+        excess = len(self._dedupe_order) - self.retained_fills
+        for _ in range(max(0, excess)):
+            self._applied.discard(self._dedupe_order.popleft())

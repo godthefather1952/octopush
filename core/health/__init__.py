@@ -7,6 +7,7 @@ interpreted as a neutral opinion.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 
 from core.clock import Clock
@@ -20,8 +21,12 @@ class HealthPolicy:
 
     degraded_after_ms: int = 5_000
     offline_after_ms: int = 15_000
-    #: Errors within the window above which a component is DEGRADED.
+    #: Errors inside ``error_window_ms`` at or above which a component is
+    #: DEGRADED; twice that many makes it OFFLINE.
     error_budget: int = 10
+    #: Rolling window for the error budget. Bounded so an old burst does not
+    #: poison a component permanently.
+    error_window_ms: int = 60_000
 
 
 @dataclass
@@ -31,6 +36,8 @@ class HealthRegistry:
     clock: Clock
     policy: HealthPolicy = field(default_factory=HealthPolicy)
     _states: dict[str, HealthState] = field(default_factory=dict)
+    #: Error timestamps per service, trimmed to the rolling window.
+    _errors: dict[str, deque] = field(default_factory=dict)
 
     def register(self, service: str, version: str = "0.1.0") -> None:
         self._states.setdefault(
@@ -47,28 +54,80 @@ class HealthRegistry:
         version: str = "0.1.0",
         detail: str = "",
     ) -> HealthState:
+        """Report liveness and the component's own view of its status.
+
+        Liveness and error history are separate signals. A component can be
+        alive and still unhealthy, so the reported status is combined with the
+        error-budget status rather than replacing it — an earlier version let
+        any heartbeat clear a budget breach, which made the budget inert for
+        every component that heartbeats each tick (i.e. all of them).
+        """
+        now = self.clock.now_ms()
+        errors = self._errors.setdefault(service, deque())
+        self._evict_errors(errors, now)
+        reported = status
+        budget_status = self._budget_status(errors)
+        effective = max((reported, budget_status), key=lambda s: s.rank)
+        if effective is not reported and not detail:
+            detail = (
+                f"{len(errors)} errors in the last "
+                f"{self.policy.error_window_ms}ms exceeds a budget of "
+                f"{self.policy.error_budget}"
+            )
         state = HealthState(
             service=service,
-            status=status,
+            status=effective,
             last_event_age_ms=last_event_age_ms,
-            last_heartbeat_ms=self.clock.now_ms(),
+            last_heartbeat_ms=now,
             queue_depth=queue_depth,
-            error_count=self._states[service].error_count if service in self._states else 0,
+            error_count=len(errors),
             version=version,
             detail=detail,
         )
         self._states[service] = state
         return state
 
+    def _evict_errors(self, errors: deque, now: Millis) -> None:
+        """Drop errors outside the rolling window.
+
+        Bounded history matters in both directions: a component must not be
+        poisoned for ever by an old burst, and must not look healthy while
+        failing continuously.
+        """
+        cutoff = now - self.policy.error_window_ms
+        while errors and errors[0] < cutoff:
+            errors.popleft()
+
+    def _budget_status(self, errors: deque) -> HealthStatus:
+        if len(errors) >= self.policy.error_budget * 2:
+            return HealthStatus.OFFLINE
+        if len(errors) >= self.policy.error_budget:
+            return HealthStatus.DEGRADED
+        return HealthStatus.HEALTHY
+
     def record_error(self, service: str, detail: str = "") -> None:
+        now = self.clock.now_ms()
+        errors = self._errors.setdefault(service, deque())
+        errors.append(now)
+        self._evict_errors(errors, now)
         state = self._states.get(service) or HealthState(service=service)
-        state.error_count += 1
-        if state.error_count >= self.policy.error_budget and state.status is HealthStatus.HEALTHY:
-            state.status = HealthStatus.DEGRADED
+        state.error_count = len(errors)
+        budget_status = self._budget_status(errors)
+        if budget_status.rank > state.status.rank:
+            state.status = budget_status
             state.detail = detail or "error budget exceeded"
         self._states[service] = state
 
+    def error_rate(self, service: str) -> int:
+        """Errors inside the current rolling window."""
+        errors = self._errors.get(service)
+        if not errors:
+            return 0
+        self._evict_errors(errors, self.clock.now_ms())
+        return len(errors)
+
     def clear_errors(self, service: str) -> None:
+        self._errors.pop(service, None)
         if service in self._states:
             self._states[service].error_count = 0
 

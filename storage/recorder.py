@@ -40,6 +40,11 @@ class Recorder:
     events_recorded: int = 0
     failures: int = 0
     healthy: bool = True
+    #: Consecutive failed flushes. One transient error is not an outage; a
+    #: run of them means the audit trail is gone.
+    consecutive_failures: int = 0
+    #: Events accepted into the buffer but never successfully persisted.
+    events_lost: int = 0
 
     async def start(self) -> None:
         await self.store.open()
@@ -74,9 +79,14 @@ class Recorder:
             await self.store.append_many(self.session_id, batch)
             self.events_recorded += len(batch)
             self.healthy = True
+            self.consecutive_failures = 0
         except Exception as exc:
             self.failures += 1
+            self.consecutive_failures += 1
             self.healthy = False
+            # The batch is gone. Say so numerically rather than only in a log
+            # line, so the condition is measurable and can gate trading.
+            self.events_lost += len(batch)
             log.error(
                 "failed to persist events",
                 extra={"count": len(batch), "error": str(exc)},

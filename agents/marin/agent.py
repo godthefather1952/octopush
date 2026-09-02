@@ -52,6 +52,9 @@ class Marin:
     account: PaperAccount
     runs: int = 0
     last_result: ReconciliationResult | None = None
+    #: Lifetime compaction totals, for observability.
+    fills_sealed: int = 0
+    orders_archived: int = 0
 
     def __post_init__(self) -> None:
         self.health.register(SERVICE, VERSION)
@@ -132,8 +135,26 @@ class Marin:
                     )
                 )
 
-        # 4. Fees.
-        expected_fees = sum(fill.fee for fill in account_fills.values())
+        # 3b. Lifetime counts. The set comparison above only sees the unsealed
+        #     window; these totals span the whole session and are what makes a
+        #     fill dropped before the last checkpoint still detectable.
+        if self.oms.fills_applied != self.account.fills_applied:
+            mismatches.append(
+                Mismatch(
+                    kind=MismatchKind.MISSING_FILL,
+                    severity=Severity.CRITICAL,
+                    key="fills_applied",
+                    expected=float(self.oms.fills_applied),
+                    actual=float(self.account.fills_applied),
+                    difference=float(self.account.fills_applied - self.oms.fills_applied),
+                    detail="lifetime fill counts diverge between the OMS and the account",
+                )
+            )
+
+        # 4. Fees. Sealed fees live in the checkpoint; only the tail is resident.
+        expected_fees = self.account.checkpoint.fees_paid + sum(
+            fill.fee for fill in account_fills.values()
+        )
         if abs(expected_fees - self.account.fees_paid) > CASH_TOLERANCE:
             mismatches.append(
                 Mismatch(
@@ -199,8 +220,68 @@ class Marin:
         self.last_result = result
         return result
 
+    # -- compaction --------------------------------------------------------
+
+    def _seal_boundary(self) -> int:
+        """How much of the fill log can leave memory.
+
+        A fill is sealable when its order is terminal *and* every fill of
+        that order sits inside the same prefix. Both halves matter:
+
+        * terminal, because a live order can still produce fills that change
+          the position the checkpoint would have frozen;
+        * wholly inside the prefix, because otherwise an order could keep one
+          sealed fill and one unsealed fill. It would then stay resident in
+          the OMS while the account had already sealed part of it away, and
+          the fill-set comparison would report a missing fill that never went
+          missing — compaction manufacturing its own mismatch.
+
+        Returns an index into ``account.fill_log``.
+        """
+        log = self.account.fill_log
+        boundary = len(log)
+        for index, fill in enumerate(log):
+            order = self.oms.get(fill.client_order_id)
+            if order is None or not order.is_terminal:
+                boundary = index
+                break
+        if boundary == 0:
+            return 0
+        # Pull the boundary back past any order that straddles it.
+        straddling = {fill.client_order_id for fill in log[boundary:]}
+        while boundary > 0 and log[boundary - 1].client_order_id in straddling:
+            boundary -= 1
+        return boundary
+
+    def compact(self) -> tuple[int, int]:
+        """Seal verified history and archive the orders it belongs to.
+
+        Only ever called after a reconciliation run with no critical
+        mismatch, so nothing leaves memory unverified.
+
+        Sealing is a *backstop*, not a routine step: history stays fully
+        resident — and therefore fully re-verified on every run — until it
+        exceeds the account's retention window. A session that never reaches
+        the window is never compacted at all and keeps end-to-end replay
+        coverage from the first fill. Only beyond it does the ledger trade
+        re-verification of old, already-checked history for a flat footprint.
+
+        Returns ``(fills_sealed, orders_archived)``.
+        """
+        excess = len(self.account.fill_log) - self.account.retained_fills
+        if excess <= 0:
+            return 0, 0
+        sealed = self.account.seal(min(self._seal_boundary(), excess))
+        unsealed = {fill.fill_id for fill in self.account.fill_log}
+        archived = self.oms.compact(unsealed)
+        self.fills_sealed += sealed
+        self.orders_archived += archived
+        return sealed, archived
+
     async def run(self) -> ReconciliationResult:
         result = self.reconcile()
+        if result.ok:
+            self.compact()
         await self.bus.publish(
             Event(
                 type=(

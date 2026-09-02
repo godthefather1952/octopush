@@ -22,6 +22,14 @@ from tests.conftest import START_MS, run_platform
 
 
 def summary(platform) -> dict:
+    """Full state fingerprint, identifiers included.
+
+    The identifiers matter. An earlier version of this helper omitted them,
+    so `test_replay_is_repeatable` passed while every replay produced entirely
+    different fill, order and opportunity ids — the exact property the test
+    claimed to verify. Anything excluded here must be excluded deliberately
+    and for a stated reason.
+    """
     account = platform.account.snapshot()
     return {
         "opportunities": len(platform.state.opportunities),
@@ -31,10 +39,51 @@ def summary(platform) -> dict:
         "realized_pnl": round(account.realized_pnl, 9),
         "fees": round(account.fees_paid, 9),
         "positions": {
-            key: round(position.quantity, 12)
+            key: [round(position.quantity, 12), round(position.average_entry_price, 9)]
             for key, position in sorted(account.positions.items())
         },
+        # --- identity ---
+        "fill_ids": [f.fill_id for f in platform.account.fill_log],
+        "order_ids": sorted(platform.oms.orders),
+        "opportunity_ids": sorted(platform.state.opportunities),
+        "intent_ids": sorted(
+            r.intent.intent_id for r in platform.state.opportunities.values() if r.intent
+        ),
+        "decision_ids": sorted(
+            r.decision.decision_id
+            for r in platform.state.opportunities.values()
+            if r.decision
+        ),
+        # --- correlation chains ---
+        "fill_correlations": [f.correlation_id or "" for f in platform.account.fill_log],
+        "order_plans": sorted(
+            (o.client_order_id, o.plan_id or "", o.intent_id or "")
+            for o in platform.oms.orders.values()
+        ),
     }
+
+
+IDENTITY_FIELDS = (
+    "fill_ids",
+    "order_ids",
+    "opportunity_ids",
+    "intent_ids",
+    "decision_ids",
+    "fill_correlations",
+    "order_plans",
+)
+
+
+def economic_summary(platform) -> dict:
+    """The fingerprint with identity deliberately excluded.
+
+    Used only to compare two *live* runs. Live runs mint random identifiers by
+    design (see core/ids.py), so their ids cannot match and must not be
+    asserted on. Every excluded field is named in IDENTITY_FIELDS rather than
+    silently omitted — the omission being silent is what let the replay
+    determinism defect survive.
+    """
+    return {k: v for k, v in summary(platform).items() if k not in IDENTITY_FIELDS}
 
 
 def fresh_platform(settings, *, seed_start: int = START_MS, store=None):
@@ -121,7 +170,19 @@ class TestDeterminism:
         b = fresh_platform(settings)
         await run_platform(a, 120)
         await run_platform(b, 120)
-        assert summary(a) == summary(b)
+        # Economic state only: two live runs mint independent random ids.
+        assert economic_summary(a) == economic_summary(b)
+
+    async def test_two_live_runs_do_not_share_identifiers(self, settings):
+        """The converse guarantee: live ids are unique, not reproducible."""
+        a = fresh_platform(settings)
+        b = fresh_platform(settings)
+        await run_platform(a, 60)
+        await run_platform(b, 60)
+        ids_a = {f.fill_id for f in a.account.fill_log}
+        ids_b = {f.fill_id for f in b.account.fill_log}
+        assert ids_a and ids_b
+        assert not (ids_a & ids_b), "live runs must not reuse identifiers"
 
     async def test_a_different_seed_produces_a_different_market(self, settings):
         a = fresh_platform(settings)
@@ -136,7 +197,7 @@ class TestDeterminism:
         )
         await run_platform(a, 120)
         await run_platform(b, 120)
-        assert summary(a) != summary(b)
+        assert economic_summary(a) != economic_summary(b)
 
 
 class TestReplaySession:
@@ -159,12 +220,13 @@ class TestReplaySession:
         # Feeds stay off: the recording is the market.
         await platform.start(record=False, feeds=False)
         session = ReplaySession(store=store, bus=bus, clock=clock, session_id=session_id)
-        await session.open()
-        while True:
-            event = await session.step()
-            if event is None:
-                break
-            await platform.orchestrator.tick()
+        with session:
+            await session.open()
+            while True:
+                event = await session.step()
+                if event is None:
+                    break
+                await platform.orchestrator.tick()
         return platform, session
 
     async def test_replay_reproduces_market_state(self, settings):

@@ -83,7 +83,7 @@ class Tidal:
     def _book(self, venue: str, symbol: str) -> LocalOrderBook:
         key = (venue, symbol)
         if key not in self.books:
-            depth = self.settings.venue(venue).book_depth if self._known(venue) else 25
+            depth = self.settings.venue(venue).book_depth_levels if self._known(venue) else 25
             self.books[key] = LocalOrderBook(venue=venue, symbol=symbol, max_depth=depth)
             self.flows[key] = TradeFlowWindow()
             self.mids[key] = MidWindow()

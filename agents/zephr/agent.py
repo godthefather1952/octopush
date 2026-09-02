@@ -7,6 +7,8 @@ signal is how much net edge survives relative to what the strategy needs.
 
 from __future__ import annotations
 
+import math
+
 from agents.zephr.liquidity import SizingCurve, build_sizing_curve
 from core.bus import EventBus
 from core.clock import Clock
@@ -132,6 +134,12 @@ class Zephr:
             for leg in best.legs:
                 detail[f"expected_price_{leg.venue}"] = leg.expected_price
                 detail[f"slippage_bps_{leg.venue}"] = round(leg.slippage_bps, 3)
+                # Impact is unbounded when a book side is exhausted. The value
+                # serialises as null, so state *why* rather than leaving a
+                # bare null to be guessed at.
+                detail[f"impact_status_{leg.venue}"] = (
+                    "OK" if math.isfinite(leg.impact_bps) else "INSUFFICIENT_LIQUIDITY"
+                )
             # Signal saturates at three times the minimum acceptable edge.
             floor = max(self.settings.zephr.min_net_edge_bps, 1e-9)
             signal = min(1.0, best.net_edge_bps / (floor * 3.0))

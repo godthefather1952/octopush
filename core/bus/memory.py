@@ -39,6 +39,8 @@ class InMemoryEventBus(EventBus):
         self.published_count = 0
         self.delivered_count = 0
         self.dropped_count = 0
+        #: Events accepted but abandoned by stop() (clause 7).
+        self.discarded_at_stop = 0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -49,6 +51,9 @@ class InMemoryEventBus(EventBus):
         self._task = asyncio.create_task(self._run(), name="bus-dispatch")
 
     async def stop(self) -> None:
+        # Clause 7: undispatched events are discarded, not delivered. Recorded
+        # so the condition is observable rather than silent.
+        self.discarded_at_stop += len(self._queue)
         self._running = False
         if self._task is not None:
             self._task.cancel()

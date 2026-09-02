@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from core.bus import EventBus
 from core.clock import ManualClock
 from core.events import MARKET_INPUT_TYPES, Event, EventType
+from core.ids import DeterministicIdGenerator, IdGenerator, set_id_generator
 from core.models.common import Millis, StrEnum
 from storage.base import EventStore
 
@@ -71,11 +72,24 @@ class ReplaySession:
     end_ms: Millis | None = None
     #: Called after each event is published and the bus has drained.
     on_event: Callable[[Event], None] | None = None
+    #: Install reproducible identifiers for the duration of the replay, so two
+    #: replays of one session can be diffed entity by entity. Set False only to
+    #: replay with live-style random ids.
+    deterministic_ids: bool = True
+    #: Extra seed material, so the same session can be replayed under different
+    #: id streams when comparing two code versions side by side.
+    id_seed: str = ""
+    _id_generator: IdGenerator | None = None
+    _previous_ids: IdGenerator | None = None
     stats: ReplayStats = field(default_factory=ReplayStats)
     _iterator: AsyncIterator[Event] | None = None
     _finished: bool = False
 
     async def open(self) -> None:
+        if self.deterministic_ids and self._id_generator is None:
+            seed = f"{self.session_id}|{self.id_seed}"
+            self._id_generator = DeterministicIdGenerator(seed)
+            self._previous_ids = set_id_generator(self._id_generator)
         await self.store.open()
         self._iterator = self.store.read(
             self.session_id,
@@ -87,6 +101,18 @@ class ReplaySession:
     @property
     def finished(self) -> bool:
         return self._finished
+
+    def close(self) -> None:
+        """Restore the previous id generator. Safe to call more than once."""
+        if self._previous_ids is not None:
+            set_id_generator(self._previous_ids)
+            self._previous_ids = None
+
+    def __enter__(self) -> ReplaySession:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     async def step(self) -> Event | None:
         """Publish exactly one recorded event. Returns ``None`` at the end."""

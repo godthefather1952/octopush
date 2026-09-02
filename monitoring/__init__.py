@@ -1,4 +1,5 @@
 from monitoring.metrics import (
+    AGENT_RESPONSE_TIMEOUT,
     AGENT_UP,
     CLAUDE_FAILURES,
     CLAUDE_LATENCY,
@@ -28,6 +29,7 @@ from monitoring.metrics import (
 )
 
 __all__ = [
+    "AGENT_RESPONSE_TIMEOUT",
     "AGENT_UP",
     "CLAUDE_FAILURES",
     "CLAUDE_LATENCY",

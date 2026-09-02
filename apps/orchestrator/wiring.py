@@ -265,6 +265,7 @@ def build_platform(
         metrics=metrics,
         consensus=ConsensusEngine(settings.consensus, clock),
         detector=CrossVenueDetector(settings, clock),
+        recorder=recorder,
     )
 
     # Cross-venue relative value intends to carry no directional exposure.

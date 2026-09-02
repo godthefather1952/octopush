@@ -85,7 +85,7 @@ class PostgresEventStore(EventStore):  # pragma: no cover - requires a server
                 event.source,
                 event.schema_name,
                 event.correlation_id,
-                json.dumps(event.payload, default=str),
+                json.dumps(event.payload, default=str, allow_nan=False),
             )
             for event in events
         ]

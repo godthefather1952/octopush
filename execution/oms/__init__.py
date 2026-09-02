@@ -12,6 +12,7 @@ a platform ends up with a position it does not know about.
 from __future__ import annotations
 
 import logging
+from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
@@ -28,14 +29,58 @@ from core.models.opportunity import PlannedOrder
 log = logging.getLogger(__name__)
 
 
+#: Fill ids kept for duplicate detection. Matches the paper account's window
+#: so both layers reject the same re-deliveries.
+DEFAULT_DEDUPE_FILLS = 10_000
+
+
+@dataclass
+class ArchivedOrders:
+    """Totals for orders compacted out of memory.
+
+    Reconciliation checks these as aggregates. The orders themselves are not
+    lost — every one was published and persisted by the recorder — they are
+    simply no longer resident, which is what keeps a long session's footprint
+    flat instead of linear in orders placed.
+    """
+
+    count: int = 0
+    fills: int = 0
+    filled_quantity: float = 0.0
+    fees_paid: float = 0.0
+    by_status: dict[str, int] = field(default_factory=dict)
+
+    def absorb(self, order: PaperOrder) -> None:
+        self.count += 1
+        self.fills += len(order.fills)
+        self.filled_quantity += order.filled_quantity
+        self.fees_paid += order.fees_paid
+        self.by_status[order.status.value] = self.by_status.get(order.status.value, 0) + 1
+
+
 @dataclass
 class OrderManager:
-    """In-memory order book of record."""
+    """In-memory order book of record.
+
+    Holds *active* orders. Terminal orders are compacted into
+    :class:`ArchivedOrders` once reconciliation has verified them, so the
+    resident set is bounded by concurrent activity rather than by session
+    length.
+    """
 
     clock: Clock
     orders: dict[str, PaperOrder] = field(default_factory=dict)
-    #: Fill ids already applied, for idempotent duplicate handling.
+    #: Fill ids already applied, for idempotent duplicate handling. Bounded to
+    #: the most recent ``dedupe_fills`` ids; a re-delivery arrives close behind
+    #: its original, and a repeat beyond that horizon surfaces as a
+    #: reconciliation mismatch rather than being silently absorbed.
     _applied_fills: set[str] = field(default_factory=set)
+    _dedupe_order: deque[str] = field(default_factory=deque)
+    dedupe_fills: int = DEFAULT_DEDUPE_FILLS
+    archived: ArchivedOrders = field(default_factory=ArchivedOrders)
+    #: Lifetime counters, unaffected by compaction.
+    orders_created: int = 0
+    fills_applied: int = 0
     duplicate_fills: int = 0
     illegal_transitions: int = 0
 
@@ -78,6 +123,7 @@ class OrderManager:
             order.client_order_id = client_order_id
         order.history = [(now, OrderStatus.CREATED)]
         self.orders[order.client_order_id] = order
+        self.orders_created += 1
         return order
 
     def from_plan(
@@ -152,6 +198,9 @@ class OrderManager:
                 f"{fill.quantity} > {order.remaining_quantity} remaining"
             )
         self._applied_fills.add(fill.fill_id)
+        self._dedupe_order.append(fill.fill_id)
+        self._trim_dedupe()
+        self.fills_applied += 1
         order.apply_fill(fill)
         target = (
             OrderStatus.FILLED
@@ -184,5 +233,39 @@ class OrderManager:
             if order.is_live and order.expires_at is not None and now_ms >= order.expires_at:
                 yield order
 
+    # -- compaction --------------------------------------------------------
 
-__all__ = ["OrderManager", "OrderStatus", "PaperOrder"]
+    def _trim_dedupe(self) -> None:
+        excess = len(self._dedupe_order) - self.dedupe_fills
+        for _ in range(max(0, excess)):
+            self._applied_fills.discard(self._dedupe_order.popleft())
+
+    def compact(self, unsealed_fills: set[str]) -> int:
+        """Archive terminal orders the ledger has finished with.
+
+        An order leaves memory only when it is terminal *and* none of its
+        fills are still awaiting reconciliation — ``unsealed_fills`` is the
+        set the paper account has yet to seal. That condition is what keeps
+        the two views in step: neither side ever drops a fill the other still
+        holds, so a genuine missing-fill mismatch stays detectable instead of
+        being manufactured by compaction.
+
+        Returns the number of orders archived.
+        """
+        doomed = [
+            order
+            for order in self.orders.values()
+            if order.is_terminal
+            and not any(fill.fill_id in unsealed_fills for fill in order.fills)
+        ]
+        for order in doomed:
+            self.archived.absorb(order)
+            del self.orders[order.client_order_id]
+        return len(doomed)
+
+    @property
+    def resident_fills(self) -> int:
+        return sum(len(order.fills) for order in self.orders.values())
+
+
+__all__ = ["ArchivedOrders", "OrderManager", "OrderStatus", "PaperOrder"]

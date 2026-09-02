@@ -104,6 +104,14 @@ class SQLiteEventStore(EventStore):
 
     @staticmethod
     def _row(session_id: str, event: Event) -> tuple:
+        """Serialise one event.
+
+        ``allow_nan=False`` is deliberate: SQLite would happily store the bare
+        ``Infinity``/``NaN`` literals as text while PostgreSQL JSONB rejects
+        them, so without this the two backends diverge silently. Payloads are
+        already sanitised by ``Base.to_json_dict``; this makes any bypass fail
+        loudly here instead of at the production backend.
+        """
         return (
             session_id,
             event.id,
@@ -113,7 +121,7 @@ class SQLiteEventStore(EventStore):
             event.source,
             event.schema_name,
             event.correlation_id,
-            json.dumps(event.payload, default=str),
+            json.dumps(event.payload, default=str, allow_nan=False),
         )
 
     async def append(self, session_id: str, event: Event) -> None:

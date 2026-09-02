@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from datetime import UTC, datetime
 from typing import Any
 
 _RESERVED = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {
@@ -23,9 +24,22 @@ class JsonFormatter(logging.Formatter):
         super().__init__()
         self.service = service
 
+    @staticmethod
+    def _timestamp(created: float) -> str:
+        """RFC 3339 / ISO 8601 in UTC with real milliseconds.
+
+        The previous implementation passed ``"%Y-%m-%dT%H:%M:%S.%03dZ"`` to
+        ``strftime``, where ``%03d`` is not a millisecond directive — it
+        rendered the zero-padded *day of month*, so three lines 250 ms apart
+        all carried ``.002Z``. It also used ``time.localtime`` while labelling
+        the result ``Z``, which is only correct on a UTC host.
+        """
+        moment = datetime.fromtimestamp(created, tz=UTC)
+        return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S.%03dZ"),
+            "ts": self._timestamp(record.created),
             "level": record.levelname,
             "service": self.service,
             "logger": record.name,

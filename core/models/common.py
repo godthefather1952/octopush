@@ -12,11 +12,13 @@ deterministic.
 
 from __future__ import annotations
 
-import uuid
+import math
 from enum import StrEnum as _StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from core.ids import new_id as _mint
 
 # Milliseconds since the Unix epoch.
 Millis = int
@@ -30,9 +32,30 @@ MONEY_EPSILON = 1e-6
 QTY_EPSILON = 1e-9
 
 
+def sanitize_json(value: Any) -> Any:
+    """Recursively replace non-finite floats with ``None``.
+
+    Applied at the serialisation boundary so that ``inf`` remains usable in
+    intermediate arithmetic (an exhausted book really does have unbounded
+    market impact) while never reaching the wire or the store.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: sanitize_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [sanitize_json(v) for v in value]
+    return value
+
+
 def new_id(prefix: str) -> str:
-    """Return a short, human-greppable unique identifier."""
-    return f"{prefix}-{uuid.uuid4().hex[:12]}"
+    """Mint an identifier in the ``prefix`` namespace.
+
+    Delegates to the generator installed in :mod:`core.ids`, so that replay can
+    swap in reproducible identifiers without every call site knowing. Live runs
+    get full-width random ids.
+    """
+    return _mint(prefix)
 
 
 class StrEnum(_StrEnum):
@@ -125,12 +148,30 @@ class Base(BaseModel):
         frozen=False,
         use_enum_values=False,
         validate_assignment=True,
-        ser_json_inf_nan="constants",
+        # Non-finite floats serialise as JSON null, never as the bare
+        # ``Infinity`` / ``NaN`` literals, which are not valid RFC 8259 and
+        # which PostgreSQL JSONB rejects outright. This covers model_dump_json;
+        # to_json_dict() sanitises the dict path explicitly below, because
+        # pydantic applies this setting only to its own JSON serialiser.
+        ser_json_inf_nan="null",
     )
 
     def to_json_dict(self) -> dict[str, Any]:
-        """JSON-safe dict (enums as values, floats as floats)."""
-        return self.model_dump(mode="json")
+        """Strictly JSON-safe dict.
+
+        Every event payload in the system passes through here, so this is the
+        one place that has to guarantee RFC 8259 compliance. ``model_dump``
+        happily returns ``inf``/``nan`` floats even in json mode, and
+        ``json.dumps`` then writes bare ``Infinity``/``NaN`` — accepted by
+        SQLite (which stores text) and rejected by PostgreSQL JSONB, so a
+        payload that worked on the default backend would fail on the
+        production one.
+
+        Non-finite values become ``None``. Producers that need the distinction
+        to survive should publish an explicit status field alongside the value
+        rather than relying on the sentinel.
+        """
+        return sanitize_json(self.model_dump(mode="json"))
 
 
 class Envelope(Base):

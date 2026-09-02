@@ -171,6 +171,7 @@ CLAUDE_REQUESTS = "tf_intelligence_requests_total"
 CLAUDE_LATENCY = "tf_intelligence_latency_ms"
 CLAUDE_FAILURES = "tf_intelligence_failures_total"
 RISK_REJECTIONS = "tf_risk_rejections_total"
+AGENT_RESPONSE_TIMEOUT = "tf_agent_response_timeouts_total"
 RECONCILIATION_MISMATCHES = "tf_reconciliation_mismatches_total"
 KILL_SWITCH_ENGAGED = "tf_kill_switch_engaged"
 
@@ -198,6 +199,7 @@ def build_registry() -> MetricsRegistry:
     registry.describe(CLAUDE_LATENCY, "Intelligence-provider latency, in ms")
     registry.describe(CLAUDE_FAILURES, "Intelligence-provider failures")
     registry.describe(RISK_REJECTIONS, "Trade intents rejected by RUNE, by gate")
+    registry.describe(AGENT_RESPONSE_TIMEOUT, "Evaluations decided without every required agent")
     registry.describe(RECONCILIATION_MISMATCHES, "Reconciliation mismatches, by kind")
     registry.describe(KILL_SWITCH_ENGAGED, "1 when the kill switch is engaged")
     return registry

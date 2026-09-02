@@ -32,6 +32,7 @@ from agents.rune import RiskContext, Rune
 from agents.tidal import Tidal
 from agents.zephr import Zephr
 from core.bus import EventBus
+from core.bus.barrier import ResponseBarrier
 from core.clock import Clock
 from core.config import Settings
 from core.events import Event, EventType
@@ -87,6 +88,10 @@ class Orchestrator:
     metrics: MetricsRegistry
     consensus: ConsensusEngine
     detector: CrossVenueDetector
+    #: Explicit agent-response tracking. Replaces the old assumption that
+    #: bus.drain() means "the agents have answered" — a guarantee no
+    #: distributed transport can make (see core/bus/base.py clause 4).
+    barrier: ResponseBarrier | None = None
     scorecard: Scorecard = field(default_factory=Scorecard)
     #: Reconcile every N ticks; every tick would be wasteful and every hour
     #: would be too late.
@@ -104,6 +109,13 @@ class Orchestrator:
     warmup_ticks: int = 0
     #: How often to warn while warm-up has not completed.
     warmup_warn_every: int = 40
+    #: Recorder whose health gates trading. None when the session is running
+    #: deliberately unrecorded.
+    recorder: object | None = None
+    #: Consecutive failed flushes before storage is considered down. One
+    #: transient write error should not halt the platform; a sustained
+    #: inability to persist should.
+    storage_failure_threshold: int = 3
     attributions: dict[str, AttributionBuilder] = field(default_factory=dict)
     #: Opportunity id -> notional currently working, for strategy exposure.
     working_notional: dict[str, float] = field(default_factory=dict)
@@ -115,6 +127,10 @@ class Orchestrator:
 
     def __post_init__(self) -> None:
         self.health.register(SERVICE, VERSION)
+        if self.recorder is not None:
+            self.health.register("RECORDER", "recorder-0.1")
+        if self.barrier is None:
+            self.barrier = ResponseBarrier(self.clock)
 
     # -- wiring ------------------------------------------------------------
 
@@ -136,7 +152,10 @@ class Orchestrator:
         self.metrics.inc(M.EVENTS_PROCESSED, source=event.source, type=event.type.value)
 
     async def _on_opinion(self, event: Event) -> None:
-        self.state.put_opinion(AgentOpinion.model_validate(event.payload))
+        opinion = AgentOpinion.model_validate(event.payload)
+        self.state.put_opinion(opinion)
+        if opinion.correlation_id:
+            self.barrier.record(opinion.correlation_id, opinion.agent_id)
 
     async def _on_order(self, event: Event) -> None:
         from core.models.execution import PaperOrder
@@ -249,6 +268,25 @@ class Orchestrator:
         self._prune()
         self._heartbeat()
 
+    def _recorder_heartbeat(self) -> None:
+        """Surface persistence health alongside every other component."""
+        recorder = self.recorder
+        if recorder is None:
+            return
+        failures = recorder.consecutive_failures
+        if failures >= self.storage_failure_threshold:
+            status, detail = HealthStatus.OFFLINE, (
+                f"{failures} consecutive flush failures; "
+                f"{recorder.events_lost} events unpersisted"
+            )
+        elif failures:
+            status, detail = HealthStatus.DEGRADED, f"{failures} recent flush failures"
+        else:
+            status, detail = HealthStatus.HEALTHY, ""
+        self.health.heartbeat(
+            "RECORDER", status=status, version="recorder-0.1", detail=detail
+        )
+
     def _prune(self) -> None:
         """Drop opinions whose subject is no longer live.
 
@@ -302,6 +340,7 @@ class Orchestrator:
         self.veska.heartbeat()
         self.rune.heartbeat()
         self.marin.heartbeat()
+        self._recorder_heartbeat()
         self.state.health = self.health.snapshot()
 
         self.metrics.set(M.NET_PNL, portfolio.net_pnl)
@@ -313,6 +352,20 @@ class Orchestrator:
                 M.AGENT_UP, 1.0 if component.status is HealthStatus.HEALTHY else 0.0, agent=name
             )
         return portfolio
+
+    def _storage_ok(self) -> bool:
+        """Whether durable event storage is working.
+
+        Fail-closed by default: if the audit trail is lost, reconciliation
+        cannot be reconstructed and no trade taken from here on could be
+        verified afterwards, so new trading stops. The recorder is optional
+        (a session may run unrecorded on purpose); when there is no recorder
+        attached there is nothing to be unhealthy about.
+        """
+        recorder = self.recorder
+        if recorder is None:
+            return True
+        return recorder.consecutive_failures < self.storage_failure_threshold
 
     async def _protect(self, market: MarketState, portfolio: PortfolioState) -> None:
         """Reconcile, evaluate the kill switch, and carry out its actions."""
@@ -352,7 +405,7 @@ class Orchestrator:
                     book.crossed for book in self.tidal.books.values()
                 ),
                 max_latency_ms=float(max_age),
-                storage_ok=True,
+                storage_ok=self._storage_ok(),
                 unexpected_position=abs(unhedged)
                 > self.settings.risk.max_unhedged_notional * 3,
                 required_components=REQUIRED_COMPONENTS,
@@ -381,6 +434,9 @@ class Orchestrator:
         # after its opportunity is closed, and something has to keep working
         # it down.
         await self._hedge(market, portfolio)
+        # Opportunities still waiting on agent responses get another chance
+        # before anything else in the lifecycle runs.
+        await self._await_pending_agents(market, portfolio)
         for record in self.state.open_opportunities():
             if record.state is StrategyState.EXECUTING:
                 await self._advance_execution(record, market)
@@ -408,11 +464,64 @@ class Orchestrator:
                     payload=opportunity.to_json_dict(),
                 )
             )
+            self.barrier.expect(
+                opportunity.opportunity_id, set(self.settings.consensus.required_agents)
+            )
             await self.transition(record, StrategyState.AGENTS_EVALUATING)
-            # Agents evaluate synchronously on the in-process bus; on a
-            # networked bus this drain is where their opinions arrive.
+            # drain() gives local completion only (bus contract clause 4), so
+            # it settles in-process agents but proves nothing about remote
+            # ones. The barrier is what actually decides whether the required
+            # agents have answered.
             await self.bus.drain()
+            await self._evaluate_or_defer(record, market, portfolio)
+
+    async def _evaluate_or_defer(
+        self, record: OpportunityRecord, market: MarketState, portfolio: PortfolioState
+    ) -> None:
+        """Decide now if every required agent has answered; otherwise wait.
+
+        Waiting is done by leaving the record in AGENTS_EVALUATING and
+        retrying on later ticks — never by blocking inside a tick. Blocking
+        would stall the market feed and, under a manual clock, could not make
+        progress at all. The opportunity's own expiry bounds the wait.
+        """
+        opportunity = record.opportunity
+        responded = self.barrier.responded(opportunity.opportunity_id)
+        required = set(self.settings.consensus.required_agents)
+
+        if required <= responded:
+            self.barrier.forget(opportunity.opportunity_id)
             await self._decide(record, market, portfolio)
+            return
+
+        now = self.clock.now_ms()
+        waited = now - opportunity.created_at
+        if waited >= self.settings.consensus.agent_response_timeout_ms or not (
+            opportunity.is_valid_at(now)
+        ):
+            # Deadline reached. Decide with what arrived — the consensus engine
+            # already treats a missing required agent as incomplete, which is
+            # a rejection, not a neutral vote.
+            missing = sorted(a.value for a in required - responded)
+            log.warning(
+                "agent responses incomplete at deadline",
+                extra={
+                    "opportunity_id": opportunity.opportunity_id,
+                    "missing": missing,
+                    "waited_ms": waited,
+                },
+            )
+            self.metrics.inc(M.AGENT_RESPONSE_TIMEOUT, agents=",".join(missing) or "none")
+            self.barrier.forget(opportunity.opportunity_id)
+            await self._decide(record, market, portfolio)
+
+    async def _await_pending_agents(
+        self, market: MarketState, portfolio: PortfolioState
+    ) -> None:
+        """Retry every opportunity still waiting on its agents."""
+        for record in self.state.open_opportunities():
+            if record.state is StrategyState.AGENTS_EVALUATING:
+                await self._evaluate_or_defer(record, market, portfolio)
 
     # -- opportunity pipeline ---------------------------------------------
 
@@ -630,6 +739,9 @@ class Orchestrator:
     async def _monitor(self, record: OpportunityRecord, market: MarketState) -> None:
         """Continuous re-evaluation: agents keep voting after entry."""
         opportunity = record.opportunity
+        self.barrier.expect(
+            opportunity.opportunity_id, set(self.settings.consensus.required_agents)
+        )
         await self.bus.publish(
             Event(
                 type=EventType.OPPORTUNITY_DETECTED,
@@ -641,6 +753,9 @@ class Orchestrator:
             )
         )
         await self.bus.drain()
+        # Continuous re-evaluation uses the same completion tracking; a
+        # position is not exited merely because a remote agent was slow.
+        self.barrier.forget(opportunity.opportunity_id)
         result = self._consensus_for(record)
         await self._publish_consensus(result)
         record.last_agreement = result.agreement
