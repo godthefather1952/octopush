@@ -23,6 +23,25 @@ from core.ids import new_id as _mint
 # Milliseconds since the Unix epoch.
 Millis = int
 
+# Currency assumption
+# -------------------
+# Every monetary field in this codebase — `notional`, `cash`, `price`, `fee`,
+# `realized_pnl`, every `*_notional` risk limit — is denominated in the single
+# quote currency, and none of them says so in its name.
+#
+# That is a deliberate simplification and it is only safe because the symbol
+# layer already collapses quote currencies: USDT and USDC markets are
+# normalised to a `-USD` symbol (see venues/base/symbols.py), which is an
+# explicit modelling decision that carries a residual basis risk the platform
+# does not currently model.
+#
+# The assumption holds while the universe is USD-quoted. It breaks the moment
+# a second quote currency is admitted — a EUR or a BTC-quoted pair — at which
+# point summing `notional` across venues stops being meaningful and every
+# money field needs a currency alongside it. Adding that pair is therefore not
+# a configuration change; it is a modelling change, and this comment is here
+# so that is discovered before the fact rather than after.
+
 #: Tolerance used when comparing two independently derived monetary amounts.
 #: Prices and sizes are carried as float64; reconciliation therefore compares
 #: with an epsilon rather than for exact equality.

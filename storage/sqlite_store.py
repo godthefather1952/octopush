@@ -35,7 +35,9 @@ CREATE TABLE IF NOT EXISTS events (
     type           TEXT NOT NULL,
     source         TEXT NOT NULL,
     schema_name    TEXT,
+    schema_version INTEGER NOT NULL DEFAULT 1,
     correlation_id TEXT,
+    causation_id   TEXT,
     payload        TEXT NOT NULL,
     PRIMARY KEY (session_id, event_id)
 );
@@ -44,6 +46,33 @@ CREATE INDEX IF NOT EXISTS idx_events_order ON events (session_id, ts_ms, seq, e
 CREATE INDEX IF NOT EXISTS idx_events_type  ON events (session_id, type, ts_ms);
 CREATE INDEX IF NOT EXISTS idx_events_corr  ON events (session_id, correlation_id);
 """
+
+
+#: Columns added after the initial schema, with the DDL to add them.
+#: ``CREATE TABLE IF NOT EXISTS`` does nothing to a table that already exists,
+#: so without this a database created by an older build keeps its original
+#: columns and every insert fails on the unknown ones — which the recorder
+#: catches by design, so the loss shows up as a climbing ``events_lost``
+#: rather than as a crash.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    # (table, column, DDL)
+    ("events", "schema_version", "ALTER TABLE events ADD COLUMN schema_version INTEGER"),
+    ("events", "causation_id", "ALTER TABLE events ADD COLUMN causation_id TEXT"),
+)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Bring an existing database up to the current schema.
+
+    Only ever adds nullable columns, so it cannot fail on existing rows and
+    needs no backfill: a row written before the column existed reads back as
+    NULL, which is the truthful answer — that event genuinely had no
+    causation recorded.
+    """
+    for table, column, ddl in _ADDED_COLUMNS:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(ddl)
 
 
 class SQLiteEventStore(EventStore):
@@ -64,6 +93,7 @@ class SQLiteEventStore(EventStore):
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(SCHEMA)
+        _add_missing_columns(conn)
         conn.commit()
         self._conn = conn
 
@@ -120,7 +150,9 @@ class SQLiteEventStore(EventStore):
             event.type.value,
             event.source,
             event.schema_name,
+            int(event.schema_version),
             event.correlation_id,
+            event.causation_id,
             json.dumps(event.payload, default=str, allow_nan=False),
         )
 
@@ -136,7 +168,8 @@ class SQLiteEventStore(EventStore):
             conn.executemany(
                 "INSERT OR IGNORE INTO events "
                 "(session_id, event_id, seq, ts_ms, type, source, schema_name, "
-                " correlation_id, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " schema_version, correlation_id, causation_id, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
             conn.commit()
@@ -179,7 +212,13 @@ class SQLiteEventStore(EventStore):
                 source=row["source"],
                 payload=json.loads(row["payload"]),
                 schema_name=row["schema_name"],
+                # A row written before the column existed reports NULL. It was
+                # written by the schema that predates versioning, which is
+                # version 1 — not today's version, which would claim the old
+                # row had a shape it never had.
+                schema_version=row["schema_version"] or 1,
                 correlation_id=row["correlation_id"],
+                causation_id=row["causation_id"],
                 sequence=row["seq"],
             )
             # Yield control so a long replay does not starve the loop.

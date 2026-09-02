@@ -132,7 +132,10 @@ class TestRecording:
         await platform.recorder.stop()
         info = await platform.store.session(platform.session_id)
         assert info is not None
-        assert info.config_hash == config_digest(platform.settings.model_dump(mode="json"))
+        # model_dump(), not mode="json": the DSN is a SecretStr and the json
+        # dump masks every secret to the same asterisks, so a digest taken
+        # from it could not tell two different stores apart (P0-L2).
+        assert info.config_hash == config_digest(platform.settings.model_dump())
         assert info.ended_at is not None
 
     async def test_sqlite_round_trips_events(self, settings, tmp_path):

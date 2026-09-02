@@ -490,3 +490,106 @@ class TestPostgresSpecifics:
 
         await asyncio.gather(*(writer(w) for w in range(8)))
         assert await pg.count("s1") == 400
+
+
+class TestOpeningAnOlderDatabase:
+    """A store must upgrade a database it did not create.
+
+    ``CREATE TABLE IF NOT EXISTS`` is a no-op against an existing table, so a
+    schema change adds columns to the DDL and silently leaves an older file
+    without them. Every insert then fails on the unknown columns — and the
+    recorder catches write failures by design, so the loss surfaces as a
+    climbing ``events_lost`` rather than a crash. This was found when adding
+    ``schema_version`` and ``causation_id`` (P0-M2) broke an existing
+    ``data/trading_floor.db``.
+    """
+
+    OLD_SCHEMA = """
+    CREATE TABLE sessions (
+        session_id   TEXT PRIMARY KEY,
+        started_at   INTEGER NOT NULL,
+        ended_at     INTEGER,
+        label        TEXT NOT NULL DEFAULT '',
+        config_hash  TEXT NOT NULL DEFAULT ''
+    );
+    CREATE TABLE events (
+        session_id     TEXT NOT NULL,
+        event_id       TEXT NOT NULL,
+        seq            INTEGER,
+        ts_ms          INTEGER NOT NULL,
+        type           TEXT NOT NULL,
+        source         TEXT NOT NULL,
+        schema_name    TEXT,
+        correlation_id TEXT,
+        payload        TEXT NOT NULL,
+        PRIMARY KEY (session_id, event_id)
+    );
+    """
+
+    def _old_database(self, tmp_path):
+        import sqlite3
+
+        path = tmp_path / "old.db"
+        connection = sqlite3.connect(path)
+        connection.executescript(self.OLD_SCHEMA)
+        connection.execute(
+            "INSERT INTO events (session_id, event_id, seq, ts_ms, type, source, "
+            "schema_name, correlation_id, payload) "
+            "VALUES ('s1', 'legacy-1', 0, 1000, 'MARKET_UPDATE', 'TIDAL', 'Probe', NULL, '{}')"
+        )
+        connection.execute(
+            "INSERT INTO sessions (session_id, started_at) VALUES ('s1', 1000)"
+        )
+        connection.commit()
+        connection.close()
+        return path
+
+    async def test_an_older_database_gains_the_new_columns(self, tmp_path):
+        from storage import SQLiteEventStore
+
+        path = self._old_database(tmp_path)
+        store = SQLiteEventStore(str(path))
+        await store.open()
+        try:
+            await store.append("s1", make_event(sequence=1, causation_id="legacy-1"))
+            read = [event async for event in store.read("s1")]
+        finally:
+            await store.close()
+
+        assert len(read) == 2, "writing to an upgraded database must succeed"
+        assert read[-1].causation_id == "legacy-1"
+        assert read[-1].schema_version == Event.CURRENT_SCHEMA_VERSION
+
+    async def test_rows_written_before_the_upgrade_are_still_readable(self, tmp_path):
+        from storage import SQLiteEventStore
+
+        path = self._old_database(tmp_path)
+        store = SQLiteEventStore(str(path))
+        await store.open()
+        try:
+            read = [event async for event in store.read("s1")]
+        finally:
+            await store.close()
+
+        legacy = read[0]
+        assert legacy.id == "legacy-1"
+        assert legacy.source == "TIDAL"
+        # Backfilled to the version that wrote them, not to today's.
+        assert legacy.schema_version == 1
+        assert legacy.causation_id is None
+
+    async def test_upgrading_twice_is_harmless(self, tmp_path):
+        from storage import SQLiteEventStore
+
+        path = self._old_database(tmp_path)
+        for _ in range(3):
+            store = SQLiteEventStore(str(path))
+            await store.open()
+            await store.close()
+
+        store = SQLiteEventStore(str(path))
+        await store.open()
+        try:
+            assert await store.count("s1") == 1
+        finally:
+            await store.close()

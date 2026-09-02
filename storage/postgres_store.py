@@ -33,6 +33,12 @@ class PostgresEventStore(EventStore):  # pragma: no cover - requires a server
         )
         async with self._pool.acquire() as conn:
             await conn.execute(MIGRATION_SQL)
+            # Same reason as the SQLite store: CREATE TABLE IF NOT EXISTS is a
+            # no-op against a table that already exists, so a database created
+            # by an older build would keep its original columns and every
+            # insert would fail on the unknown ones. IF NOT EXISTS on the
+            # column makes this idempotent and safe to run on every open.
+            await conn.execute(ADD_COLUMNS_SQL)
 
     async def close(self) -> None:
         if self._pool is not None:
@@ -84,7 +90,9 @@ class PostgresEventStore(EventStore):  # pragma: no cover - requires a server
                 event.type.value,
                 event.source,
                 event.schema_name,
+                int(event.schema_version),
                 event.correlation_id,
+                event.causation_id,
                 json.dumps(event.payload, default=str, allow_nan=False),
             )
             for event in events
@@ -95,8 +103,9 @@ class PostgresEventStore(EventStore):  # pragma: no cover - requires a server
             await conn.executemany(
                 """
                 INSERT INTO events (session_id, event_id, seq, ts_ms, type, source,
-                                    schema_name, correlation_id, payload)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+                                    schema_name, schema_version, correlation_id,
+                                    causation_id, payload)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
                 ON CONFLICT (session_id, event_id) DO NOTHING
                 """,
                 rows,
@@ -136,7 +145,13 @@ class PostgresEventStore(EventStore):  # pragma: no cover - requires a server
                     source=row["source"],
                     payload=json.loads(payload) if isinstance(payload, str) else payload,
                     schema_name=row["schema_name"],
+                    # A row written before the column existed reports NULL. It was
+                    # written by the schema that predates versioning, which is
+                    # version 1 — not today's version, which would claim the old
+                    # row had a shape it never had.
+                    schema_version=row["schema_version"] or 1,
                     correlation_id=row["correlation_id"],
+                    causation_id=row["causation_id"],
                     sequence=row["seq"],
                 )
 
@@ -177,6 +192,11 @@ class PostgresEventStore(EventStore):  # pragma: no cover - requires a server
             )
 
 
+ADD_COLUMNS_SQL = """
+ALTER TABLE events ADD COLUMN IF NOT EXISTS schema_version INTEGER;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS causation_id   TEXT;
+"""
+
 MIGRATION_SQL = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id   TEXT PRIMARY KEY,
@@ -194,7 +214,9 @@ CREATE TABLE IF NOT EXISTS events (
     type           TEXT   NOT NULL,
     source         TEXT   NOT NULL,
     schema_name    TEXT,
+    schema_version INTEGER NOT NULL DEFAULT 1,
     correlation_id TEXT,
+    causation_id   TEXT,
     payload        JSONB  NOT NULL,
     PRIMARY KEY (session_id, event_id)
 );

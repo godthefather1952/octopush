@@ -2,15 +2,60 @@
 
 One line per event, machine-parseable, with a per-record ``extra`` dict merged
 into the top level so log aggregation can filter on domain fields.
+
+Records carry two times, deliberately. ``ts`` is host wall-clock: when the
+line was really emitted. ``clock_ms`` is the platform clock's reading, and is
+present only when a clock is bound. Under a replay the two diverge by years —
+events carry recorded time while the process runs today — and without the
+second field a log line cannot be placed against the event it describes.
 """
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import logging
 import sys
 from datetime import UTC, datetime
 from typing import Any
+
+#: The platform clock, when one is bound. A context variable rather than a
+#: module global so a replay running alongside other work cannot stamp its
+#: logical time onto unrelated log lines.
+_clock: contextvars.ContextVar[Any | None] = contextvars.ContextVar("tf_log_clock", default=None)
+
+
+def bind_clock(clock: Any | None) -> Any | None:
+    """Bind the clock whose reading appears as ``clock_ms``. Returns the old one."""
+    previous = _clock.get()
+    _clock.set(clock)
+    return previous
+
+
+@contextlib.contextmanager
+def clock_context(clock: Any):
+    """Bind ``clock`` for the duration of the block."""
+    previous = bind_clock(clock)
+    try:
+        yield clock
+    finally:
+        bind_clock(previous)
+
+
+def _platform_time() -> int | None:
+    """The bound clock's reading, or None.
+
+    Never raises: logging must not be the thing that fails, and a log line
+    with no ``clock_ms`` is better than a lost line or a wrong number.
+    """
+    clock = _clock.get()
+    if clock is None:
+        return None
+    try:
+        return int(clock.now_ms())
+    except Exception:
+        return None
 
 _RESERVED = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {
     "message",
@@ -45,6 +90,9 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
+        platform_ms = _platform_time()
+        if platform_ms is not None:
+            payload["clock_ms"] = platform_ms
         for key, value in record.__dict__.items():
             if key not in _RESERVED and not key.startswith("_"):
                 payload[key] = value

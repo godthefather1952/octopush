@@ -20,13 +20,18 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass, field
+from typing import Any
 
 from core.bus import EventBus
 from core.clock import ManualClock
 from core.events import MARKET_INPUT_TYPES, Event, EventType
 from core.ids import DeterministicIdGenerator, IdGenerator, set_id_generator
+from core.logging import bind_clock
 from core.models.common import Millis, StrEnum
 from storage.base import EventStore
+
+#: Distinguishes "nothing was bound" from "None was bound".
+_UNBOUND = object()
 
 log = logging.getLogger(__name__)
 
@@ -84,8 +89,16 @@ class ReplaySession:
     stats: ReplayStats = field(default_factory=ReplayStats)
     _iterator: AsyncIterator[Event] | None = None
     _finished: bool = False
+    #: Sentinel-guarded so "no clock was bound" is distinguishable from
+    #: "None was bound", which close() must restore faithfully.
+    _previous_log_clock: Any = _UNBOUND
 
     async def open(self) -> None:
+        # Bind the replay clock for logging, so log lines carry replay time
+        # alongside host time and can be aligned with the events they
+        # describe. Restored by close().
+        if self._previous_log_clock is _UNBOUND:
+            self._previous_log_clock = bind_clock(self.clock)
         if self.deterministic_ids and self._id_generator is None:
             seed = f"{self.session_id}|{self.id_seed}"
             self._id_generator = DeterministicIdGenerator(seed)
@@ -103,10 +116,13 @@ class ReplaySession:
         return self._finished
 
     def close(self) -> None:
-        """Restore the previous id generator. Safe to call more than once."""
+        """Undo what open() installed. Safe to call more than once."""
         if self._previous_ids is not None:
             set_id_generator(self._previous_ids)
             self._previous_ids = None
+        if self._previous_log_clock is not _UNBOUND:
+            bind_clock(self._previous_log_clock)
+            self._previous_log_clock = _UNBOUND
 
     def __enter__(self) -> ReplaySession:
         return self
@@ -161,13 +177,41 @@ class ReplaySession:
         return self.stats
 
 
+def _unmask(value: object) -> object:
+    """Replace masked secrets with a digest of what they hide.
+
+    ``model_dump`` renders a ``SecretStr`` as ``'**********'``, so every
+    distinct credential dumps identically. Hashing the real value keeps a
+    changed setting detectable — which is the whole point of the digest —
+    without putting the credential into a recorded session.
+    """
+    import hashlib
+
+    from pydantic import SecretStr
+
+    if isinstance(value, SecretStr):
+        return "secret:" + hashlib.sha256(
+            value.get_secret_value().encode()
+        ).hexdigest()[:16]
+    if isinstance(value, dict):
+        return {key: _unmask(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_unmask(item) for item in value]
+    return value
+
+
 def config_digest(payload: dict) -> str:
-    """Stable digest of configuration, recorded with each session."""
+    """Stable digest of configuration, recorded with each session.
+
+    Pass the *model* dump (``settings.model_dump()``, not ``mode="json"``) so
+    secrets arrive as ``SecretStr`` and can be hashed rather than arriving
+    pre-masked and indistinguishable.
+    """
     import hashlib
     import json
 
     return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, default=str).encode()
+        json.dumps(_unmask(payload), sort_keys=True, default=str).encode()
     ).hexdigest()[:16]
 
 

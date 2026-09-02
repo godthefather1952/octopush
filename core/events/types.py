@@ -6,7 +6,7 @@ component's methods across a boundary.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import Field
 
@@ -83,7 +83,15 @@ class Event(Base):
     ``payload`` is always the JSON form of a model from ``core.models``; the
     producing component's schema is named in ``schema_name`` so consumers can
     validate rather than duck-type.
+
+    Two fields exist for reading a recording back rather than for running:
+    ``schema_version`` says which envelope shape wrote it, and
+    ``causation_id`` says which event produced it.
     """
+
+    #: Envelope shape this build writes. Bump when a change would make an
+    #: older recording invalid, and handle the older shape on read.
+    CURRENT_SCHEMA_VERSION: ClassVar[int] = 1
 
     id: str = Field(default_factory=lambda: new_id("bus"))
     type: EventType
@@ -92,10 +100,41 @@ class Event(Base):
     source: str
     payload: dict[str, Any] = Field(default_factory=dict)
     schema_name: str | None = None
+    #: Envelope version at the time of writing. Without it a payload shape
+    #: change breaks replay of older sessions silently: the recording either
+    #: fails validation somewhere confusing, or — if the change was additive
+    #: — validates and behaves differently from the run it recorded.
+    schema_version: int = Field(default=CURRENT_SCHEMA_VERSION, ge=1)
+    #: Groups every event belonging to one opportunity.
     correlation_id: str | None = None
+    #: The event that produced this one. Correlation answers "which events
+    #: belong together"; only causation answers "what did this come from",
+    #: which is the question attribution and post-mortems actually ask.
+    causation_id: str | None = None
     #: Monotonic sequence assigned by the recorder; drives deterministic
     #: replay ordering when several events share a timestamp.
     sequence: int | None = None
+
+    @property
+    def is_readable(self) -> bool:
+        """Whether this build understands the envelope that wrote this event.
+
+        A newer version is not a warning to proceed past: validating a
+        payload against a model that does not describe it either errors
+        somewhere unhelpful or, when the change was additive, quietly
+        produces different behaviour from the recorded run.
+        """
+        return self.schema_version <= self.CURRENT_SCHEMA_VERSION
+
+    @classmethod
+    def caused_by(cls, cause: Event, **fields: Any) -> Event:
+        """Build an event descending from ``cause``.
+
+        Correlation is inherited unless given explicitly, so a caller cannot
+        link causation and forget the grouping.
+        """
+        fields.setdefault("correlation_id", cause.correlation_id)
+        return cls(causation_id=cause.id, **fields)
 
     def sort_key(self) -> tuple[int, int, str]:
         return (self.ts_ms, self.sequence if self.sequence is not None else 0, self.id)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from core.models.common import AgentId, Base, DataQuality, Envelope, Millis
 
@@ -26,6 +26,17 @@ class AgentOpinion(Envelope):
     #: Agent-specific structured detail. Never parsed for control flow by
     #: other components; used for attribution and the dashboard.
     detail: dict[str, float | int | str | bool | None] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _cannot_expire_before_it_exists(self) -> AgentOpinion:
+        if self.expires_at < self.created_at:
+            raise ValueError(
+                f"expires_at ({self.expires_at}) precedes created_at "
+                f"({self.created_at}): an opinion cannot be born expired. "
+                "quality_at() would report STALE, which is indistinguishable "
+                "from an agent that has simply gone quiet."
+            )
+        return self
 
     @property
     def subject(self) -> str:

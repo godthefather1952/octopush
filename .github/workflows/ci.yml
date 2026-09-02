@@ -1,0 +1,126 @@
+name: CI
+
+# Nothing enforced ruff or pytest on commit before this, so both could rot
+# between the moments someone remembered to run them locally — P0-M9.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install ".[dev]"
+      - run: ruff check .
+
+  types:
+    name: mypy (core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install ".[dev,postgres,intelligence]" mypy
+      # Gated on core/ only, which is at zero. The other packages carry a
+      # known backlog that is not Phase 0 work to clear; see
+      # docs/static-analysis.md for the package-by-package plan.
+      - run: mypy --ignore-missing-imports core
+
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+
+    # The event-store and bus contract suites skip their postgres and redis
+    # parameters when no server is reachable. Skipping is correct locally and
+    # useless in CI: the whole point of those suites is that the backends
+    # cannot drift apart unnoticed, so CI runs them for real.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: trading
+          POSTGRES_PASSWORD: trading
+          POSTGRES_DB: trading_floor
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U trading -d trading_floor"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6399:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+
+    env:
+      TF_TEST_POSTGRES_DSN: postgresql://trading:trading@127.0.0.1:5432/trading_floor
+      TF_TEST_REDIS_URL: redis://127.0.0.1:6399/0
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install ".[dev,postgres,intelligence]"
+
+      - name: Fail if a backend suite skipped
+        # A green run that quietly skipped postgres and redis would say
+        # nothing about the thing this job exists to check.
+        run: |
+          python -m pytest tests/contract -q -p no:cacheprovider -rs \
+            | tee /tmp/contract.log
+          # Case-insensitive: the reasons read "no PostgreSQL server
+          # configured" and "no Redis at ...", not the lowercase service name.
+          if grep -qiE "^SKIPPED.*(postgres|redis)" /tmp/contract.log; then
+            echo "::error::a backend contract suite skipped; the service is not reachable"
+            grep -iE "^SKIPPED.*(postgres|redis)" /tmp/contract.log
+            exit 1
+          fi
+
+      - name: Full suite
+        run: python -m pytest tests -q -p no:cacheprovider
+
+  paper-boundary:
+    name: paper boundary
+    runs-on: ubuntu-latest
+    # Kept as its own job so the one property that must never regress cannot
+    # be lost in a long test log.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install ".[dev]"
+      - run: |
+          python -m pytest -q -p no:cacheprovider \
+            tests/contract/test_invariants.py::TestPaperBoundary \
+            tests/unit/test_venues.py
+      - name: Startup refuses a non-paper mode
+        run: |
+          for mode in live production real testnet-live; do
+            if TF_MODE=$mode python -c \
+                "from core.config import load_settings; load_settings()" 2>/dev/null; then
+              echo "::error::TF_MODE=$mode was accepted"
+              exit 1
+            fi
+          done
+          echo "every non-paper mode refused"

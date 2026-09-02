@@ -11,7 +11,7 @@ import json
 import os
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from core.models.common import AgentId, TradingMode
 
@@ -269,7 +269,12 @@ class StorageConfig(BaseModel):
     #: "memory" | "sqlite" | "postgres"
     backend: Literal["memory", "sqlite", "postgres"] = "sqlite"
     sqlite_path: str = "./data/trading_floor.db"
-    postgres_dsn: str = "postgresql://trading:trading@localhost:5432/trading_floor"
+    #: SecretStr, not str: it carries a password, and a plain string appears
+    #: in full in model_dump() and in any log line that takes the settings
+    #: object. Nothing leaked it, but nothing prevented it either.
+    postgres_dsn: SecretStr = SecretStr(
+        "postgresql://trading:trading@localhost:5432/trading_floor"
+    )
     #: Persist raw venue payloads alongside normalised events.
     record_raw: bool = True
     # There is deliberately no `checkpoint_every` here. It documented book
@@ -337,7 +342,9 @@ class Settings(BaseModel):
             raise ValueError(f"duplicate venue names: {', '.join(sorted(duplicates))}")
         if self.bus == "redis" and not self.redis_url:
             raise ValueError("bus='redis' requires redis_url")
-        if self.storage.backend == "postgres" and not self.storage.postgres_dsn:
+        if self.storage.backend == "postgres" and not (
+            self.storage.postgres_dsn and self.storage.postgres_dsn.get_secret_value()
+        ):
             raise ValueError("storage.backend='postgres' requires postgres_dsn")
         return self
 

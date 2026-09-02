@@ -29,9 +29,7 @@ from core.models.execution import (
 )
 from core.models.market import (
     BookMetrics,
-    BookSide,
     ConsolidatedView,
-    MarketSnapshot,
     MarketState,
     OrderBookSnapshot,
     PriceLevel,
@@ -88,7 +86,6 @@ __all__ = [
     "AgentScore",
     "Base",
     "BookMetrics",
-    "BookSide",
     "ConsensusResult",
     "ConsolidatedView",
     "CostBreakdown",
@@ -107,7 +104,6 @@ __all__ = [
     "KillAction",
     "KillSwitchState",
     "Liquidity",
-    "MarketSnapshot",
     "MarketState",
     "Millis",
     "Mismatch",

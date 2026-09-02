@@ -153,6 +153,15 @@ class PaperAccount:
         return sum(p.unrealized_pnl for p in self.positions.values())
 
     def snapshot(self) -> PortfolioState:
+        """A detached copy of the account's state.
+
+        ``deep=True`` on the positions is required, not stylistic. A shallow
+        ``model_copy()`` aliases the nested ``PositionState`` objects, so the
+        "snapshot" would keep changing as the account traded — every consumer
+        holding one (the dashboard, an attribution record, a risk evaluation)
+        would silently be reading live state instead of the moment it asked
+        for. The same applies anywhere else a snapshot is taken.
+        """
         now = self.clock.now_ms()
         state = PortfolioState(
             created_at=now,

@@ -16,13 +16,18 @@ class PositionState(Base):
 
     venue: str
     symbol: str
-    #: Signed base-asset quantity. Positive is long.
+    #: Signed base-asset quantity. Positive is long, negative is short —
+    #: the one field here that is *meant* to go negative.
     quantity: float = 0.0
-    average_entry_price: float = 0.0
+    #: Average cost of the open quantity. Zero while flat; never negative,
+    #: because no one is paid to open a position.
+    average_entry_price: float = Field(default=0.0, ge=0.0)
     realized_pnl: float = 0.0
-    fees_paid: float = 0.0
-    #: Last mark used for unrealised P&L.
-    mark_price: float | None = None
+    fees_paid: float = Field(default=0.0, ge=0.0)
+    #: Last mark used for unrealised P&L. ``None`` means unmarked — which is
+    #: a real state and must not be spelled zero, since a zero mark values
+    #: every position at nothing without anything looking wrong.
+    mark_price: float | None = Field(default=None, gt=0.0)
     updated_at: Millis | None = None
 
     @property
@@ -83,7 +88,11 @@ class PortfolioState(Envelope):
     """The paper account's full state."""
 
     mode: str = "PAPER"
-    initial_balance: float
+    #: Starting capital. An account funded with nothing or with a debt can
+    #: never place a trade; refusing it here beats discovering it as a
+    #: risk-check rejection on every opportunity.
+    initial_balance: float = Field(gt=0.0)
+    #: Free quote-currency cash. Legitimately negative after a short sale.
     cash: float
     positions: dict[str, PositionState] = Field(default_factory=dict)
     realized_pnl: float = 0.0

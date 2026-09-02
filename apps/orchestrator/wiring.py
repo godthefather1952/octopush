@@ -207,7 +207,7 @@ def build_platform(
     store = store or build_store(
         settings.storage.backend,
         sqlite_path=settings.storage.sqlite_path,
-        postgres_dsn=settings.storage.postgres_dsn,
+        postgres_dsn=settings.storage.postgres_dsn.get_secret_value(),
     )
 
     health = HealthRegistry(clock=clock)
@@ -218,7 +218,7 @@ def build_platform(
         store=store,
         clock=clock,
         label=session_label,
-        config_hash=config_digest(settings.model_dump(mode="json")),
+        config_hash=config_digest(settings.model_dump()),
     )
 
     # --- agents ---------------------------------------------------------

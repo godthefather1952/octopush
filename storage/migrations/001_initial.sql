@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS events (
     type           TEXT   NOT NULL,
     source         TEXT   NOT NULL,
     schema_name    TEXT,
+    schema_version INTEGER NOT NULL DEFAULT 1,
     correlation_id TEXT,
+    causation_id   TEXT,
     payload        JSONB  NOT NULL,
     PRIMARY KEY (session_id, event_id)
 );

@@ -32,7 +32,7 @@ async def list_sessions() -> None:
     store = build_store(
         settings.storage.backend,
         sqlite_path=settings.storage.sqlite_path,
-        postgres_dsn=settings.storage.postgres_dsn,
+        postgres_dsn=settings.storage.postgres_dsn.get_secret_value(),
     )
     await store.open()
     sessions = await store.sessions()
@@ -55,7 +55,7 @@ async def replay(args: argparse.Namespace) -> None:
     store = build_store(
         settings.storage.backend,
         sqlite_path=settings.storage.sqlite_path,
-        postgres_dsn=settings.storage.postgres_dsn,
+        postgres_dsn=settings.storage.postgres_dsn.get_secret_value(),
     )
     await store.open()
     info = await store.session(args.session)

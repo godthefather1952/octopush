@@ -23,33 +23,11 @@ class PriceLevel(Base):
         return self.price * self.size
 
 
-class BookSide(Base):
-    """One side of an order book, sorted best-price-first."""
-
-    side: Side
-    levels: list[PriceLevel] = Field(default_factory=list)
-
-    @property
-    def best(self) -> PriceLevel | None:
-        return self.levels[0] if self.levels else None
-
-    def depth_notional(self, max_levels: int | None = None) -> float:
-        levels = self.levels if max_levels is None else self.levels[:max_levels]
-        return sum(level.notional for level in levels)
-
-    def depth_within_bps(self, reference: float, bps: float) -> float:
-        """Notional resting within ``bps`` of ``reference``."""
-        if reference <= 0:
-            return 0.0
-        limit = reference * (1 + bps / 10_000 * (1 if self.side is Side.SELL else -1))
-        total = 0.0
-        for level in self.levels:
-            if self.side is Side.SELL and level.price > limit:
-                break
-            if self.side is Side.BUY and level.price < limit:
-                break
-            total += level.notional
-        return total
+# There is deliberately no `BookSide` model. It duplicated depth arithmetic
+# that TIDAL already performs on its own `LocalOrderBook` (see
+# agents/tidal/metrics.py), and nothing outside this module ever constructed
+# one. Two implementations of the same calculation is one more than can be
+# kept correct.
 
 
 class OrderBookSnapshot(Base):
@@ -91,14 +69,6 @@ class OrderBookSnapshot(Base):
     @property
     def best_ask(self) -> float | None:
         return self.asks[0].price if self.asks else None
-
-    @property
-    def bid_side(self) -> BookSide:
-        return BookSide(side=Side.BUY, levels=self.bids)
-
-    @property
-    def ask_side(self) -> BookSide:
-        return BookSide(side=Side.SELL, levels=self.asks)
 
     def side(self, side: Side) -> list[PriceLevel]:
         return self.bids if side is Side.BUY else self.asks
@@ -219,11 +189,11 @@ class MarketState(Envelope):
         return [s for s in self.venues.values() if s.symbol == symbol]
 
 
-class MarketSnapshot(Envelope):
-    """A recorded, replayable bundle of raw normalised market data."""
-
-    books: list[OrderBookSnapshot] = Field(default_factory=list)
-    trades: list[TradeEvent] = Field(default_factory=list)
+# There is deliberately no `MarketSnapshot` bundle. The specification named
+# one, but the recording path never used it: books and trades are published
+# individually onto the bus and read back in order by the replay engine, so a
+# second bundled representation of the same data would be a parallel format
+# that nothing writes and nothing validates.
 
 
 def safe_bps(numerator: float, reference: float) -> float | None:
