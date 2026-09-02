@@ -271,9 +271,11 @@ class StorageConfig(BaseModel):
     postgres_dsn: str = "postgresql://trading:trading@localhost:5432/trading_floor"
     #: Persist raw venue payloads alongside normalised events.
     record_raw: bool = True
-    #: Emit a book checkpoint every N updates, to bound replay reconstruction.
-    #: Bare ``checkpoint_every`` read as either updates or milliseconds.
-    checkpoint_every_updates: int = Field(default=200, gt=0)
+    # There is deliberately no `checkpoint_every` here. It documented book
+    # checkpointing to bound replay reconstruction — a feature that does not
+    # exist and that nothing read the setting for. A knob that changes nothing
+    # is worse than no knob: an operator tuning it believes they have altered
+    # replay behaviour.
 
 
 class Settings(BaseModel):

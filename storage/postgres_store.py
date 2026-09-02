@@ -79,7 +79,7 @@ class PostgresEventStore(EventStore):  # pragma: no cover - requires a server
             (
                 session_id,
                 event.id,
-                int(event.sequence or 0),
+                None if event.sequence is None else int(event.sequence),
                 int(event.ts_ms),
                 event.type.value,
                 event.source,
@@ -124,7 +124,7 @@ class PostgresEventStore(EventStore):  # pragma: no cover - requires a server
         sql = (
             "SELECT * FROM events WHERE "
             + " AND ".join(clauses)
-            + " ORDER BY ts_ms, seq, event_id"
+            + " ORDER BY ts_ms, COALESCE(seq, 0), event_id"
         )
         async with self._require().acquire() as conn, conn.transaction():
             async for row in conn.cursor(sql, *params):
@@ -189,7 +189,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS events (
     session_id     TEXT   NOT NULL,
     event_id       TEXT   NOT NULL,
-    seq            BIGINT NOT NULL,
+    seq            BIGINT,
     ts_ms          BIGINT NOT NULL,
     type           TEXT   NOT NULL,
     source         TEXT   NOT NULL,

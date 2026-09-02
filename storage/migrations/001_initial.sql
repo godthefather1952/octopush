@@ -24,7 +24,7 @@ COMMENT ON COLUMN sessions.config_hash IS
 CREATE TABLE IF NOT EXISTS events (
     session_id     TEXT   NOT NULL,
     event_id       TEXT   NOT NULL,
-    seq            BIGINT NOT NULL,
+    seq            BIGINT,
     ts_ms          BIGINT NOT NULL,
     type           TEXT   NOT NULL,
     source         TEXT   NOT NULL,
@@ -45,19 +45,13 @@ CREATE INDEX IF NOT EXISTS idx_events_type  ON events (session_id, type, ts_ms);
 -- Attribution walks every event belonging to one opportunity.
 CREATE INDEX IF NOT EXISTS idx_events_corr  ON events (session_id, correlation_id);
 
--- Raw venue payloads, kept separately: high volume, rarely read, and only
--- needed when a normalisation bug has to be reproduced from the wire.
-CREATE TABLE IF NOT EXISTS raw_messages (
-    session_id  TEXT   NOT NULL,
-    id          BIGSERIAL,
-    venue       TEXT   NOT NULL,
-    received_ts BIGINT NOT NULL,
-    channel     TEXT,
-    payload     TEXT   NOT NULL,
-    PRIMARY KEY (session_id, id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_raw_venue ON raw_messages (session_id, venue, received_ts);
+-- There is deliberately no `raw_messages` table. An earlier revision created
+-- one, but nothing ever read or wrote it: with `storage.record_raw` on, the
+-- venue publisher emits each unparsed payload as a MARKET_UPDATE event, so
+-- raw messages are already recorded in `events` alongside everything else and
+-- replay reaches them through the same ordered read. A table that only the
+-- schema knows about invites code to be written against storage that is not
+-- actually maintained.
 
 COMMIT;
 

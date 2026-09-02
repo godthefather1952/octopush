@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS events (
     session_id     TEXT NOT NULL,
     event_id       TEXT NOT NULL,
-    seq            INTEGER NOT NULL,
+    seq            INTEGER,
     ts_ms          INTEGER NOT NULL,
     type           TEXT NOT NULL,
     source         TEXT NOT NULL,
@@ -115,7 +115,7 @@ class SQLiteEventStore(EventStore):
         return (
             session_id,
             event.id,
-            int(event.sequence or 0),
+            None if event.sequence is None else int(event.sequence),
             int(event.ts_ms),
             event.type.value,
             event.source,
@@ -169,7 +169,7 @@ class SQLiteEventStore(EventStore):
         sql = (
             "SELECT * FROM events WHERE "
             + " AND ".join(clauses)
-            + " ORDER BY ts_ms, seq, event_id"
+            + " ORDER BY ts_ms, COALESCE(seq, 0), event_id"
         )
         for row in conn.execute(sql, params):
             yield Event(

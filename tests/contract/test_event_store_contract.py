@@ -304,12 +304,44 @@ class TestTypeFidelity:
         (read,) = await drain(store, "s1")
         assert read.payload == {}
 
-    async def test_a_missing_sequence_does_not_become_a_silent_zero(self, store):
-        """Regression: ``sequence or 0`` also rewrites a real 0."""
+    async def test_a_real_sequence_survives(self, store):
         await store.start_session("s1", 1)
         await store.append("s1", make_event(sequence=0, payload={"i": 0}))
         (read,) = await drain(store, "s1")
         assert read.sequence == 0
+
+    async def test_an_unsequenced_event_does_not_come_back_claiming_zero(self, store):
+        """``int(event.sequence or 0)`` conflated "never sequenced" with "first".
+
+        The bus assigns a sequence before middleware runs, so on the recording
+        path this never fired. A direct append — replay tooling, a repair
+        script — stored None and read back 0, which is not what went in and
+        which sorts ahead of every genuinely-sequenced event sharing its
+        millisecond.
+        """
+        await store.start_session("s1", 1)
+        await store.append("s1", make_event(sequence=None))
+        (read,) = await drain(store, "s1")
+        assert read.sequence is None
+
+    async def test_unsequenced_events_sort_where_sort_key_says_they_do(self, store):
+        """Ordering must agree with Event.sort_key on every backend.
+
+        SQL engines disagree about where NULLs sort by default, so leaving it
+        to the backend would make the same session read back in two different
+        orders depending on where it was stored.
+        """
+        await store.start_session("s1", 1)
+        events = [
+            make_event(ts_ms=100, sequence=None, payload={"tag": "unsequenced"}),
+            make_event(ts_ms=100, sequence=5, payload={"tag": "five"}),
+            make_event(ts_ms=100, sequence=1, payload={"tag": "one"}),
+        ]
+        await store.append_many("s1", events)
+
+        read = await drain(store, "s1")
+        expected = sorted(events, key=lambda e: e.sort_key())
+        assert [e.payload["tag"] for e in read] == [e.payload["tag"] for e in expected]
 
 
 class TestNonFiniteNumbersAreRejected:

@@ -6,12 +6,20 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-COPY pyproject.toml ./
-RUN pip install --upgrade pip && \
-    pip install "pydantic>=2.6" "fastapi>=0.110" "uvicorn[standard]>=0.27" \
-                "websockets>=12.0" "httpx>=0.26" "redis>=5.0" "asyncpg>=0.29"
-
 COPY . .
+
+# Installed from pyproject.toml rather than a hand-copied list, which had
+# already drifted: `anthropic` was missing, so a container started with
+# TF_INTELLIGENCE_PROVIDER=claude — which docker-compose.yml exposes — came
+# up healthy and then failed on LUMEN's first poll, because the SDK is
+# imported lazily. Both extras are installed because both are reachable from
+# configuration this image ships with.
+#
+# Installing the project itself (rather than relying on WORKDIR being on
+# sys.path) is also what puts the `trading-floor` and `trading-floor-replay`
+# console scripts declared in pyproject.toml on PATH.
+RUN pip install --upgrade pip && \
+    pip install ".[postgres,intelligence]"
 
 RUN mkdir -p /app/data
 
