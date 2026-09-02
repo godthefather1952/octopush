@@ -156,6 +156,36 @@ class SystemState:
 
     def put_order(self, order: PaperOrder) -> None:
         self.orders[order.client_order_id] = order
+        self._trim_orders()
+
+    def _trim_orders(self) -> None:
+        """Bound the order mirror the way opportunities are already bounded.
+
+        This dict was the one piece of ``SystemState`` that grew for the life
+        of the process. Everything else here is trimmed; orders were not, so
+        a long session accumulated every order it had ever placed in state
+        that exists only to answer dashboard and attribution reads.
+
+        An order is kept while it is live, or while a retained opportunity
+        record still names it — attribution walks ``record.order_ids`` and
+        must not find a hole. Beyond that, the most recent terminal orders
+        are kept up to ``max_history``, oldest dropped first, so eviction is
+        deterministic rather than dependent on dict iteration order.
+        """
+        if len(self.orders) <= self.max_history:
+            return
+        referenced = {
+            oid for record in self.opportunities.values() for oid in record.order_ids
+        }
+        droppable = sorted(
+            (
+                (order.terminal_at or order.created_at, oid)
+                for oid, order in self.orders.items()
+                if not order.is_live and oid not in referenced
+            )
+        )
+        for _, oid in droppable[: len(self.orders) - self.max_history]:
+            self.orders.pop(oid, None)
 
     def open_orders(self) -> list[PaperOrder]:
         return [o for o in self.orders.values() if o.is_live]

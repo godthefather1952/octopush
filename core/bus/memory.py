@@ -95,7 +95,7 @@ class InMemoryEventBus(EventBus):
         name: str | None = None,
     ) -> Subscription:
         sub = Subscription(
-            name=name or getattr(handler, "__qualname__", "handler"),
+            name=name or str(getattr(handler, "__qualname__", "handler")),
             types=frozenset(types) if types is not None else None,
             handler=handler,
         )

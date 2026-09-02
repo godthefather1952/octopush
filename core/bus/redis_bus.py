@@ -141,7 +141,7 @@ class RedisStreamBus(EventBus):
         # Clause 3: valid before or after start(); the consumer reads the
         # subscription list at dispatch time, so this takes effect at once.
         sub = Subscription(
-            name=name or getattr(handler, "__qualname__", "handler"),
+            name=name or str(getattr(handler, "__qualname__", "handler")),
             types=frozenset(types) if types is not None else None,
             handler=handler,
         )

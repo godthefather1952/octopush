@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pydantic import Field
 
-from core.models.common import Base, Envelope, Millis, Side
+from core.models.common import FLAT_EPSILON, Base, Envelope, Millis, Side
 
 
 class PositionState(Base):
@@ -31,7 +31,7 @@ class PositionState(Base):
 
     @property
     def is_flat(self) -> bool:
-        return abs(self.quantity) < 1e-12
+        return abs(self.quantity) < FLAT_EPSILON
 
     @property
     def notional(self) -> float:
@@ -57,7 +57,7 @@ class PositionState(Base):
         if self.is_flat or (self.quantity > 0) == (signed > 0):
             # Opening or increasing: roll the average entry price.
             new_qty = self.quantity + signed
-            if abs(new_qty) > 1e-12:
+            if abs(new_qty) > FLAT_EPSILON:
                 self.average_entry_price = (
                     self.average_entry_price * self.quantity + price * signed
                 ) / new_qty
@@ -68,7 +68,7 @@ class PositionState(Base):
             realized = (price - self.average_entry_price) * closing * direction
             remaining = abs(signed) - closing
             self.quantity += signed
-            if abs(self.quantity) < 1e-12:
+            if abs(self.quantity) < FLAT_EPSILON:
                 self.quantity = 0.0
                 self.average_entry_price = 0.0
             elif remaining > 0:

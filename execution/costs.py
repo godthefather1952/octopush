@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from core.config import FeeSchedule, ZephrConfig
-from core.models.common import Side
+from core.models.common import QTY_EPSILON, Side
 from core.models.market import PriceLevel
 from core.models.opportunity import CostBreakdown
 
@@ -63,7 +63,7 @@ def walk_book(levels: list[PriceLevel], notional: float, side: Side) -> WalkResu
         quantity += take / level.price
         remaining -= take
         consumed += 1
-        if remaining <= 1e-9:
+        if remaining <= QTY_EPSILON:
             break
 
     if quantity <= 0:

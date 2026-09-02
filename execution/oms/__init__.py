@@ -17,7 +17,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from core.clock import Clock
-from core.models.common import Millis, OrderType, Side, TimeInForce
+from core.models.common import QTY_EPSILON, Millis, OrderType, Side, TimeInForce
 from core.models.execution import (
     FillEvent,
     IllegalTransition,
@@ -192,7 +192,7 @@ class OrderManager:
         order = self.orders.get(fill.client_order_id)
         if order is None:
             raise KeyError(f"fill for unknown order {fill.client_order_id}")
-        if fill.quantity > order.remaining_quantity + 1e-9:
+        if fill.quantity > order.remaining_quantity + QTY_EPSILON:
             raise ValueError(
                 f"overfill on {order.client_order_id}: "
                 f"{fill.quantity} > {order.remaining_quantity} remaining"
@@ -204,7 +204,7 @@ class OrderManager:
         order.apply_fill(fill)
         target = (
             OrderStatus.FILLED
-            if order.remaining_quantity <= 1e-9
+            if order.remaining_quantity <= QTY_EPSILON
             else OrderStatus.PARTIALLY_FILLED
         )
         if order.status is not target or target is OrderStatus.PARTIALLY_FILLED:

@@ -212,8 +212,9 @@ class ExecutionConfig(BaseModel):
     #: Adverse price drift applied per 100ms of modelled latency, in bps.
     latency_drift_bps_per_100ms: float = Field(default=0.4, ge=0.0)
     default_order_ttl_ms: int = Field(default=5_000, gt=0)
-    #: Deterministic seed for the simulator's randomness.
-    seed: int = 20260901
+    #: Deterministic seed for the simulator's randomness. Bounded like every
+    #: other numeric setting: an unconstrained number is one nobody checked.
+    seed: int = Field(default=20260901, ge=0)
 
 
 class ZephrConfig(BaseModel):
@@ -221,7 +222,7 @@ class ZephrConfig(BaseModel):
 
     #: Notional ladder used to find the maximum economical size.
     size_ladder: list[float] = Field(
-        default_factory=lambda: [1_000, 5_000, 10_000, 25_000, 50_000]
+        default_factory=lambda: [1_000.0, 5_000.0, 10_000.0, 25_000.0, 50_000.0]
     )
     #: Market-impact coefficient: impact_bps = k * (size / depth) ** exponent.
     impact_coefficient: float = Field(default=12.0, gt=0.0)

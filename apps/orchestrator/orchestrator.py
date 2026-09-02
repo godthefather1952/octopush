@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from agents.marin import Marin
 from agents.noro import Noro
@@ -59,6 +60,11 @@ from monitoring.metrics import MetricsRegistry
 from risk.kill_switch import KillSwitch, KillSwitchInputs
 from strategies.consensus import ConsensusEngine
 from strategies.cross_venue import REQUIRED_COMPONENTS, STRATEGY, CrossVenueDetector
+
+if TYPE_CHECKING:
+    # Imported for typing only: storage imports core, and a runtime import
+    # here would close the cycle.
+    from storage import Recorder
 
 log = logging.getLogger(__name__)
 
@@ -111,7 +117,7 @@ class Orchestrator:
     warmup_warn_every: int = 40
     #: Recorder whose health gates trading. None when the session is running
     #: deliberately unrecorded.
-    recorder: object | None = None
+    recorder: Recorder | None = None
     #: Consecutive failed flushes before storage is considered down. One
     #: transient write error should not halt the platform; a sustained
     #: inability to persist should.
@@ -226,6 +232,11 @@ class Orchestrator:
         self.ticks += 1
         now = self.clock.now_ms()
 
+        # First, not last: the warm-up branch below can return early, and a
+        # tick that skipped persistence would reintroduce exactly the quiet
+        # period this is here to close.
+        await self._persist()
+
         market = await self._observe()
         await self._settle(now)
         portfolio = self._measure(market)
@@ -267,6 +278,16 @@ class Orchestrator:
         await self._publish_state(portfolio)
         self._prune()
         self._heartbeat()
+
+    async def _persist(self) -> None:
+        """Give the recorder a chance to flush on age, not only on traffic.
+
+        Without this the buffer's age trigger only fires when a new event
+        arrives, so a quiet period leaves the events explaining the quiet
+        unpersisted.
+        """
+        if self.recorder is not None:
+            await self.recorder.flush_if_due()
 
     def _recorder_heartbeat(self) -> None:
         """Surface persistence health alongside every other component."""

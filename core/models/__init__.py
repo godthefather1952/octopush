@@ -2,6 +2,7 @@
 
 from core.models.agent import AgentContribution, AgentOpinion, ConsensusResult
 from core.models.common import (
+    FLAT_EPSILON,
     MONEY_EPSILON,
     QTY_EPSILON,
     AgentId,
@@ -75,6 +76,7 @@ from core.models.risk import (
 )
 
 __all__ = [
+    "FLAT_EPSILON",
     "MONEY_EPSILON",
     "ORDER_TRANSITIONS",
     "QTY_EPSILON",

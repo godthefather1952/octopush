@@ -22,7 +22,7 @@ import random
 from dataclasses import dataclass
 
 from core.config import ExecutionConfig, FeeSchedule
-from core.models.common import Liquidity, Millis, OrderType, Side, TimeInForce
+from core.models.common import QTY_EPSILON, Liquidity, Millis, OrderType, Side, TimeInForce
 from core.models.execution import FillEvent, PaperOrder
 from core.models.market import PriceLevel
 from execution.costs import walk_book
@@ -176,7 +176,7 @@ class FillSimulator:
         # Only the part of our order beyond the queue ahead of us trades.
         share = max(0.0, 1.0 - self.config.queue_ahead_fraction * self.rng.random())
         quantity = order.remaining_quantity * share
-        if quantity <= 1e-9:
+        if quantity <= QTY_EPSILON:
             return None
         price = order.limit_price
         fee = self._fee(quantity * price, fees, Liquidity.MAKER)

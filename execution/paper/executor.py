@@ -15,7 +15,7 @@ from core.bus import EventBus
 from core.clock import Clock
 from core.config import Settings
 from core.events import Event, EventType
-from core.models.common import Millis
+from core.models.common import QTY_EPSILON, Millis
 from core.models.execution import ExecutionReport, FillEvent, OrderStatus, PaperOrder
 from core.models.market import MarketState, PriceLevel
 from core.models.opportunity import ExecutionPlan
@@ -255,7 +255,7 @@ class PaperExecutor(Executor):
                 order, view, self.settings.venue(order.venue).fees
             )
         )
-        if simulated is None or simulated.quantity <= 1e-9:
+        if simulated is None or simulated.quantity <= QTY_EPSILON:
             return None
         source_ts = self.market.source_data_timestamp if self.market else None
         return self.simulator.build_fill(order, simulated, now_ms, source_ts)

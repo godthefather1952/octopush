@@ -31,6 +31,12 @@ MONEY_EPSILON = 1e-6
 #: Tolerance used when comparing quantities (base-asset units).
 QTY_EPSILON = 1e-9
 
+#: Below this a position counts as flat. Deliberately tighter than
+#: :data:`QTY_EPSILON`: that one asks "did two paths agree", this one asks
+#: "is anything left", and rounding a real residual to flat would strand
+#: exposure the risk limits then stop seeing.
+FLAT_EPSILON = 1e-12
+
 
 def sanitize_json(value: Any) -> Any:
     """Recursively replace non-finite floats with ``None``.

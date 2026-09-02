@@ -39,8 +39,14 @@ VERSION = "marin-0.1"
 
 #: Cash tolerance. Prices and sizes are float64, so two arithmetically
 #: identical paths can differ in the last bits; anything larger is a real bug.
-CASH_TOLERANCE = 1e-6
-QTY_TOLERANCE = 1e-9
+#:
+#: Aliases, not copies. These were separate literals that happened to equal
+#: the shared epsilons, which meant tightening one of them left reconciliation
+#: comparing on a different tolerance from the rest of the system — and the
+#: divergence would have shown up as a reconciliation mismatch blamed on
+#: arithmetic rather than on configuration.
+CASH_TOLERANCE = MONEY_EPSILON
+QTY_TOLERANCE = QTY_EPSILON
 
 
 @dataclass

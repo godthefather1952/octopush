@@ -61,13 +61,37 @@ class Recorder:
     def attach(self, bus: EventBus) -> None:
         bus.add_middleware(self.record)
 
+    @property
+    def unpersisted(self) -> int:
+        """Events accepted but not yet written. The exposure window."""
+        return len(self._buffer)
+
+    def flush_is_due(self) -> bool:
+        return bool(self._buffer) and (
+            len(self._buffer) >= self.buffer_size
+            or self.clock.now_ms() - self._last_flush >= self.flush_interval_ms
+        )
+
+    async def flush_if_due(self) -> None:
+        """Flush on the age trigger without needing a new event to arrive.
+
+        The age check used to live only in ``record()``, so it fired only
+        when traffic did. A quiet period — a halted strategy, an out-of-hours
+        session, a kill switch that stopped new trades — left the last events
+        before the pause sitting in memory indefinitely, and those are
+        precisely the events that explain why the platform went quiet.
+
+        Driven from the orchestrator's tick rather than a background task:
+        a task sleeping on real time cannot be stepped by ManualClock, and
+        every determinism guarantee here depends on the clock being the only
+        source of time.
+        """
+        if self.flush_is_due():
+            await self.flush()
+
     async def record(self, event: Event) -> None:
         self._buffer.append(event)
-        now = self.clock.now_ms()
-        if (
-            len(self._buffer) >= self.buffer_size
-            or now - self._last_flush >= self.flush_interval_ms
-        ):
+        if self.flush_is_due():
             await self.flush()
 
     async def flush(self) -> None:
