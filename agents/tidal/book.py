@@ -19,6 +19,21 @@ class BookDesyncError(RuntimeError):
     """Raised when an update cannot be applied to the current book."""
 
 
+class BookOverflowError(BookDesyncError):
+    """Raised when a book's stored level count exceeds its safety bound.
+
+    A subclass of :class:`BookDesyncError` on purpose: TIDAL already treats
+    that as "this book needs re-establishing" and requests a resync/reconnect
+    through the existing per-venue recovery path (see ``agents/tidal/agent.py:
+    on_delta``). Overflow is a different failure than a sequence gap — the
+    feed did not skip anything, storage simply grew past what is trusted to
+    hold correctly — so it is counted separately (``overflow_count``, not
+    ``sequence_gaps``), but recovers the same way: fail the book closed and
+    let a fresh snapshot re-establish bounded state, never silently evict
+    levels to fit (FULL-BOOK STORAGE BOUND, Batch 5).
+    """
+
+
 @dataclass
 class LocalOrderBook:
     """One venue's L2 book for one symbol.
@@ -44,6 +59,12 @@ class LocalOrderBook:
     venue: str
     symbol: str
     max_depth: int = 25
+    #: Hard safety bound on distinct levels held per side (storage, not the
+    #: read-time ``max_depth`` trim). See :class:`BookOverflowError`. Defaults
+    #: to the same conservative value as ``VenueConfig.max_book_levels_per_side``
+    #: so a book built directly (tests, or a venue absent from settings) still
+    #: fails closed instead of growing without limit.
+    max_levels_per_side: int = 10_000
     bids: dict[float, float] = field(default_factory=dict)
     asks: dict[float, float] = field(default_factory=dict)
     sequence: int | None = None
@@ -63,6 +84,10 @@ class LocalOrderBook:
     #: — this proves the dropped message was not newer than what we have, and
     #: nothing stronger.
     out_of_order_dropped: int = 0
+    #: Times this book's stored level count exceeded ``max_levels_per_side``.
+    #: Distinct from ``sequence_gaps``: the feed did not skip anything here,
+    #: storage simply grew past the trusted bound. See :class:`BookOverflowError`.
+    overflow_count: int = 0
     #: Set when a gap is seen, cleared by the next checkpoint.
     needs_resync: bool = False
     #: True between a snapshot and the first delta applied on top of it.
@@ -73,6 +98,48 @@ class LocalOrderBook:
     # -- mutation ----------------------------------------------------------
 
     def apply_snapshot(self, snapshot: OrderBookSnapshot) -> None:
+        """Replace the book from a fresh checkpoint.
+
+        Raises :class:`BookOverflowError` if the snapshot exceeds
+        ``max_levels_per_side`` on either side -- checked, deliberately,
+        *before* anything is copied into ``self.bids``/``self.asks`` (Batch 5
+        final pre-commit correction). A delta's possible overshoot is
+        naturally tiny (however many levels one venue message carries, at
+        most a few thousand in practice), so building the dicts and checking
+        their size afterwards (:meth:`_check_storage_bound`, used by
+        :meth:`apply_delta`) is cheap either way. A snapshot is different in
+        kind: it is a full checkpoint that can legitimately be enormous, and
+        an oversized one -- ten, a hundred times the bound -- must never even
+        momentarily become resident in this book's own authoritative storage,
+        or the safety bound this whole mechanism exists to provide would be
+        defeated by the exact case it is meant to catch. The check therefore
+        runs against the incoming message's own level counts, which can only
+        ever be an upper bound on the eventual distinct-price dict (duplicate
+        prices or explicit zero-size deletions can only shrink it further) --
+        a conservative, safe pre-flight that never requires building the
+        oversized structure to know it is oversized.
+
+        On overflow, this book's prior state is left completely untouched:
+        neither the new (oversized) content nor a partial/trimmed version of
+        it is stored. That is not the destructive trimming TIDAL-M1 removed
+        -- trimming silently keeps *some* levels while hiding that others
+        existed; this rejects the *entire* snapshot, loudly, and asks for a
+        fresh one instead. The previous authoritative book (whatever it
+        was -- absent, or a still-valid earlier snapshot) is exactly as it
+        was before this call.
+        """
+        incoming_bids = len(snapshot.bids)
+        incoming_asks = len(snapshot.asks)
+        if incoming_bids > self.max_levels_per_side or incoming_asks > self.max_levels_per_side:
+            self.overflow_count += 1
+            self.synced = False
+            self.needs_resync = True
+            self.awaiting_first_delta = False
+            raise BookOverflowError(
+                f"{self.venue}:{self.symbol} snapshot exceeded max_levels_per_side="
+                f"{self.max_levels_per_side} (incoming bids={incoming_bids}, "
+                f"asks={incoming_asks}) -- rejected before copying into storage"
+            )
         self.bids = {level.price: level.size for level in snapshot.bids if level.size > 0}
         self.asks = {level.price: level.size for level in snapshot.asks if level.size > 0}
         self.sequence = snapshot.sequence
@@ -177,8 +244,10 @@ class LocalOrderBook:
     def apply_delta(self, delta: BookDelta) -> None:
         """Apply an incremental update.
 
-        Raises :class:`BookDesyncError` on a sequence gap; the caller marks the
-        book unsynchronised and requests a checkpoint.  Out-of-order or
+        Raises :class:`BookDesyncError` on a sequence gap, or its subclass
+        :class:`BookOverflowError` if applying this update pushes stored
+        levels past ``max_levels_per_side``; either way the caller marks the
+        book unsynchronised and requests a checkpoint. Out-of-order or
         duplicate updates (sequence at or below what we hold, or — on a feed
         with no sequence numbers at all — older than what we hold) are
         dropped.
@@ -197,12 +266,47 @@ class LocalOrderBook:
             self._set(self.bids, level)
         for level in delta.asks:
             self._set(self.asks, level)
+        self._check_storage_bound()
         if delta.sequence is not None:
             self.sequence = delta.sequence
         self.exchange_ts = delta.exchange_ts
         self.last_update_ts = delta.received_ts
         self.updates_applied += 1
         self.awaiting_first_delta = False
+
+    def _check_storage_bound(self) -> None:
+        """Fail the book closed if stored levels exceed the safety bound.
+
+        Exactly at the bound is valid (a book that legitimately holds
+        ``max_levels_per_side`` distinct prices is not a problem); one level
+        past it is not — there is no partial-credit "keep the first N and
+        drop the rest" here, because that is exactly the destructive trimming
+        TIDAL-M1 removed. The only correct response to "storage exceeded what
+        is trusted to hold correctly" is to stop trusting this book and let a
+        fresh, bounded snapshot re-establish it (see :class:`BookOverflowError`).
+
+        Used only by :meth:`apply_delta`: it checks the dicts *after*
+        applying one delta's levels, which is safe because a single venue
+        message's possible overshoot is inherently tiny (however many levels
+        one message carries). :meth:`apply_snapshot` cannot use this
+        check-after-building approach — a checkpoint can legitimately be
+        enormous, so it preflights the incoming message's own level counts
+        *before* ever touching ``self.bids``/``self.asks`` (Batch 5 final
+        pre-commit correction) rather than building the dicts first. See its
+        own docstring.
+        """
+        over_bids = len(self.bids) > self.max_levels_per_side
+        over_asks = len(self.asks) > self.max_levels_per_side
+        if not over_bids and not over_asks:
+            return
+        self.overflow_count += 1
+        self.synced = False
+        self.needs_resync = True
+        self.awaiting_first_delta = False
+        raise BookOverflowError(
+            f"{self.venue}:{self.symbol} delta exceeded max_levels_per_side="
+            f"{self.max_levels_per_side} (bids={len(self.bids)}, asks={len(self.asks)})"
+        )
 
     @staticmethod
     def _set(side: dict[float, float], level: PriceLevel) -> None:

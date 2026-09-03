@@ -89,6 +89,16 @@ class VenueConfig(BaseModel):
     cancel_latency_ms: int = Field(default=60, ge=0, le=60_000)
     #: Book depth to maintain per side, in price levels.
     book_depth_levels: int = Field(default=25, gt=0, le=5_000)
+    #: Hard safety bound on distinct price levels a local book may hold per
+    #: side (storage, not the read-time ``book_depth_levels`` trim — see
+    #: ``LocalOrderBook``). A correctly-trimming feed never approaches this;
+    #: it exists only to fail a book closed if the untrimmed store somehow
+    #: grows without bound (an insert-only pathological stream, or a bug),
+    #: rather than let it grow forever. Comfortably above both
+    #: ``book_depth_levels``'s maximum (5,000) and Binance's REST checkpoint
+    #: depth, and large enough for an ordinary full Coinbase L2 book; see the
+    #: Batch 5 report for the measurement behind the default.
+    max_book_levels_per_side: int = Field(default=10_000, gt=0, le=200_000)
     #: Depth updates held per symbol while a REST checkpoint is in flight.
     #: Bounded on purpose: a buffer that grows without limit turns a slow
     #: checkpoint into an out-of-memory failure. At ~10 depth messages a
@@ -106,6 +116,36 @@ class VenueConfig(BaseModel):
     #: the adapter renders them into the venue's own spelling and never
     #: substitutes a different quote asset to find a listing.
     symbols: list[str] = Field(default_factory=lambda: ["BTC-USD", "ETH-USD"])
+
+    @model_validator(mode="after")
+    def _storage_bound_covers_read_depth(self) -> VenueConfig:
+        if self.max_book_levels_per_side < self.book_depth_levels:
+            raise ValueError(
+                f"max_book_levels_per_side ({self.max_book_levels_per_side}) is "
+                f"below book_depth_levels ({self.book_depth_levels}): the book "
+                "could never hold enough state to serve its own configured read "
+                "depth"
+            )
+        # Binance's REST checkpoint is requested at book_depth_levels * 2
+        # (see venues/venue_a/adapter.py:_checkpoint_limit), because the venue
+        # only accepts specific depths and the adapter rounds up to the next
+        # one it supports. A checkpoint response can therefore legitimately
+        # be up to twice book_depth_levels; requiring the storage bound cover
+        # that here catches an incompatible configuration at settings-load
+        # time (Batch 5 pre-commit correction) rather than as a live,
+        # perpetually-failing snapshot handshake discovered only at runtime.
+        # Coinbase has no such doubling, so this is a strictly conservative
+        # (over-)requirement for it, not an incorrect one.
+        checkpoint_ceiling = self.book_depth_levels * 2
+        if self.max_book_levels_per_side < checkpoint_ceiling:
+            raise ValueError(
+                f"max_book_levels_per_side ({self.max_book_levels_per_side}) is "
+                f"below book_depth_levels*2 ({checkpoint_ceiling}): a Binance-style "
+                "REST checkpoint requested at this book_depth_levels can legitimately "
+                "return up to that many levels per side, and every such checkpoint "
+                "would overflow this bound before ever becoming usable"
+            )
+        return self
 
 
 class RiskLimits(BaseModel):

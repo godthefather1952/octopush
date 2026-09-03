@@ -53,6 +53,30 @@ class VenueBAdapter(WebSocketAdapter):
         self.mark_healthy()
         await self.emit(parsed)
 
+    async def request_resync(self, symbol: str, reason: str = "") -> None:
+        """Re-establish this feed's books from a fresh snapshot.
+
+        Unlike Binance, there is no per-symbol checkpoint endpoint here (see
+        ``_contain``): the only verified way to obtain a fresh Coinbase
+        snapshot is a full reconnect, which resubscribes and re-snapshots
+        every symbol carried on this connection, not just ``symbol``. That is
+        the same blast radius ``_contain`` already accepts for a malformed
+        book-affecting message, applied here for the same underlying reason —
+        TIDAL-M6-adjacent FULL-BOOK STORAGE BOUND overflow, or any other
+        caller of this method, gets no narrower recovery than a sequence gap
+        does on this venue.
+
+        Closing the live socket (if one is open) is enough: it makes the next
+        ``recv()`` in ``_session()`` raise, which unwinds into ``run()``'s
+        existing, already-tested reconnect loop — the same path a real
+        disconnect takes. Nothing to do if no socket is currently open; the
+        reconnect loop already in progress will re-snapshot everything once
+        it succeeds.
+        """
+        self.stats.sequence_gaps += 1
+        if self._ws is not None:
+            await self._ws.close()
+
     def _contain(self, exc: MalformedVenueMessage) -> None:
         """TIDAL-M2/M4: malformed L2 content leaves book state uncertain.
 

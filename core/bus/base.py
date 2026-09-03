@@ -86,13 +86,43 @@ the recorder has persisted them; only in-process delivery is abandoned.
 Callers wanting delivery before shutdown must ``await drain()`` first. This is
 explicit rather than best-effort so that shutdown is bounded.
 
-8. BACKPRESSURE — NONE
-----------------------
-``publish()`` never blocks on a slow consumer and the queue is unbounded. A
-consumer that cannot keep up grows memory without limit. This is a known,
-accepted limitation of the current design, recorded here rather than left to
-be discovered: the platform's own load is bounded by its tick rate, and
-``queue_depth`` is exported so the condition is observable.
+8. BACKPRESSURE — BOUNDED, NEVER SILENT LOSS
+---------------------------------------------
+A consumer that cannot keep up must not grow this process's memory without
+limit, and an event accepted for publication must not silently vanish because
+of that. Both implementations satisfy this, by different means suited to
+their own architecture — this clause does not mandate one mechanism:
+
+* :class:`~core.bus.memory.InMemoryEventBus` has a hard, finite queue ceiling
+  of ``max_pending + cascade_reserve`` events (defaults 10,000 + 1,000, ~58
+  MiB + ~6 MiB resident at full per the Batch 5 ``tracemalloc`` measurement;
+  see the class docstring). A publish made from outside the bus's own
+  dispatch blocks until capacity frees up when ``max_pending`` is reached —
+  real backpressure, not a drop — which is provably deadlock-free because
+  such a publisher always runs on a different task from the one dispatching
+  (see the module docstring for the proof). A publish made from *inside* a
+  handler the bus is currently dispatching — the causal cascades this
+  platform's pipeline depends on — cannot wait the same way (that would
+  deadlock the one task capable of ever freeing capacity), so it draws
+  instead against the smaller ``cascade_reserve`` layered on top; once even
+  that is exhausted it fails closed with :class:`~core.bus.memory.CascadeCapacityExceeded`
+  rather than blocking or growing further, counted in ``cascade_overflow``.
+  The only loss under normal operation is at shutdown: a blocked external
+  publisher wakes and abandons rather than hangs, counted in
+  ``discarded_at_stop`` alongside clause 7's existing count — and, since
+  recording happens only once capacity is secured (the "acceptance point"; see
+  the class docstring), an abandoned or refused publish is never durably
+  recorded either, so live and replay never disagree about which events were
+  actually accepted. ``backpressure_events`` exposes how often the primary
+  bound was reached at all.
+
+* :class:`~core.bus.redis_bus.RedisStreamBus` bounds the underlying stream
+  itself (``maxlen``, approximately trimmed by Redis); a slow consumer leaves
+  events durably queued in Redis, not accumulating in this process's memory,
+  and very old, undelivered entries age out of the stream by Redis's own
+  trimming rather than this code choosing to drop anything.
+
+``queue_depth`` is exported by both so the condition is observable either way.
 """
 
 from __future__ import annotations
@@ -128,8 +158,9 @@ class EventBus(ABC):
 
     @abstractmethod
     async def publish(self, event: Event) -> None:
-        """Publish one event. Assigns ``sequence`` if unset. Never blocks on
-        consumers (clause 8)."""
+        """Publish one event. Assigns ``sequence`` if unset. May await
+        capacity under backpressure rather than block on a *consumer*
+        directly, and never blocks forever (clause 8)."""
 
     @abstractmethod
     def subscribe(

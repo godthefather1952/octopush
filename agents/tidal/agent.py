@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from agents.tidal.book import BookDesyncError, LocalOrderBook
+from agents.tidal.book import BookDesyncError, BookOverflowError, LocalOrderBook
 from agents.tidal.metrics import MidWindow, TradeFlowWindow, compute_metrics
 from core.bus import EventBus
 from core.clock import Clock
@@ -85,11 +85,26 @@ class Tidal:
         #: and one request per message would be a request storm aimed at
         #: whoever owns the feed.
         self._resync_requested_ms: dict[tuple[str, str], Millis] = {}
+        #: Consecutive snapshots that overflowed the storage bound for one
+        #: book, reset the moment a snapshot succeeds. Recovery from a
+        #: sequence gap is expected to succeed on the next checkpoint; an
+        #: oversized checkpoint recurring is not a transient condition, it is
+        #: evidence ``max_book_levels_per_side`` is misconfigured for this
+        #: venue/symbol (FULL-BOOK STORAGE BOUND, Batch 5 pre-commit
+        #: correction) -- see ``_persistent_overflow_threshold``.
+        self._snapshot_overflow_streak: dict[tuple[str, str], int] = {}
         self.state: MarketState | None = None
         health.register(SERVICE, VERSION)
 
     #: Floor on the interval between resync requests for one book, in ms.
     resync_request_interval_ms: Millis = 5_000
+    #: Consecutive snapshot overflows on one book before this is escalated
+    #: from "recovering" to "likely misconfigured" (see
+    #: ``_snapshot_overflow_streak``). Requests are already rate-limited by
+    #: ``resync_request_interval_ms``, so this does not change retry
+    #: frequency -- it only makes a persistent mismatch visible instead of
+    #: looking identical to an ordinary, one-off recovery.
+    _persistent_overflow_threshold: int = 3
 
     # -- wiring ------------------------------------------------------------
 
@@ -110,8 +125,16 @@ class Tidal:
     def _book(self, venue: str, symbol: str) -> LocalOrderBook:
         key = (venue, symbol)
         if key not in self.books:
-            depth = self.settings.venue(venue).book_depth_levels if self._known(venue) else 25
-            self.books[key] = LocalOrderBook(venue=venue, symbol=symbol, max_depth=depth)
+            known = self._known(venue)
+            depth = self.settings.venue(venue).book_depth_levels if known else 25
+            max_levels = (
+                self.settings.venue(venue).max_book_levels_per_side
+                if known
+                else LocalOrderBook.max_levels_per_side
+            )
+            self.books[key] = LocalOrderBook(
+                venue=venue, symbol=symbol, max_depth=depth, max_levels_per_side=max_levels
+            )
             self.flows[key] = TradeFlowWindow()
             self.mids[key] = MidWindow()
         return self.books[key]
@@ -224,9 +247,54 @@ class Tidal:
         )
 
     async def on_snapshot(self, snapshot: OrderBookSnapshot) -> None:
+        """Apply a fresh checkpoint.
+
+        A snapshot can fail exactly the same way a delta can (Batch 5
+        pre-commit correction): :meth:`LocalOrderBook.apply_snapshot` raises
+        :class:`BookOverflowError` if the snapshot itself already exceeds the
+        storage bound. That is caught here the same way :meth:`on_delta`
+        catches a sequence gap -- fail closed, report, and ask for recovery
+        through the existing per-venue path -- so an oversized checkpoint
+        never gets marked usable and never silently loses levels to fit.
+
+        A run of consecutive overflowing snapshots on the same book is not
+        the ordinary "gap, then one clean recovery" shape recovery is built
+        for -- it means the venue's checkpoint depth and this book's
+        ``max_book_levels_per_side`` are structurally incompatible, and no
+        number of retries fixes that. That is escalated to a distinct,
+        clearly-labelled health error once it persists, without changing how
+        often a retry is actually attempted (still gated by the existing
+        ``resync_request_interval_ms``, so this can never become a request
+        storm).
+        """
         key = (snapshot.venue, snapshot.symbol)
         book = self._book(*key)
-        book.apply_snapshot(snapshot)
+        try:
+            book.apply_snapshot(snapshot)
+        except BookDesyncError as exc:
+            self.desyncs += 1
+            self.health.record_error(SERVICE, str(exc))
+            if isinstance(exc, BookOverflowError):
+                streak = self._snapshot_overflow_streak.get(key, 0) + 1
+                self._snapshot_overflow_streak[key] = streak
+                if streak >= self._persistent_overflow_threshold:
+                    await self._publish_system_event(
+                        "BOOK_OVERFLOW_PERSISTENT",
+                        Severity.CRITICAL,
+                        f"{key[0]}:{key[1]} snapshot has overflowed {streak} times in a "
+                        "row -- max_book_levels_per_side is likely misconfigured for "
+                        "this venue/symbol, not merely recovering from a transient gap",
+                        {"venue": key[0], "symbol": key[1], "streak": streak},
+                    )
+            await self._publish_system_event(
+                "BOOK_DESYNC",
+                Severity.WARNING,
+                str(exc),
+                {"venue": snapshot.venue, "symbol": snapshot.symbol},
+            )
+            await self.request_resync(snapshot.venue, snapshot.symbol, str(exc))
+            return
+        self._snapshot_overflow_streak.pop(key, None)
         self.updates_since_checkpoint[key] = 0
         await self._record_latency(key, snapshot.exchange_ts, snapshot.received_ts)
         self.connected.setdefault(snapshot.venue, True)
@@ -323,6 +391,17 @@ class Tidal:
         The reference here is a *depth-weighted mid*, deliberately simple: it
         exists so the dashboard and the detector have a stable anchor.  NORO
         owns the economically reasoned fair value.
+
+        ``best_bid``/``best_ask``/``best_bid_venue``/``best_ask_venue``/
+        ``cross_venue_spread_bps`` describe a comparison *between* venues, so
+        they require at least two usable ones to mean anything. With exactly
+        one, the old code still populated them from that single venue's own
+        touch — reporting its bid and its own ask as a "cross-venue spread"
+        against itself, always zero-or-crossed and always false (TIDAL-M6).
+        ``reference_price`` is left populated even with one venue: it is
+        documented as a blended reference, not a claim about two venues, so
+        showing it for monitoring with a single contributor is truthful —
+        the blend of one input is just that input.
         """
         now = self.clock.now_ms()
         usable = [s for s in states if s.quality.is_usable and s.metrics.mid is not None]
@@ -342,18 +421,19 @@ class Tidal:
         ]
         view.reference_price = sum(
             s.metrics.mid * w for s, w in zip(usable, weights, strict=True)
-) / sum(weights)
+        ) / sum(weights)
 
-        best_bid_state = max(usable, key=lambda s: s.metrics.best_bid or -float("inf"))
-        best_ask_state = min(usable, key=lambda s: s.metrics.best_ask or float("inf"))
-        view.best_bid = best_bid_state.metrics.best_bid
-        view.best_bid_venue = best_bid_state.venue
-        view.best_ask = best_ask_state.metrics.best_ask
-        view.best_ask_venue = best_ask_state.venue
-        if view.best_bid is not None and view.best_ask is not None:
-            view.cross_venue_spread_bps = safe_bps(
-                view.best_bid - view.best_ask, view.reference_price
-            )
+        if len(usable) >= 2:
+            best_bid_state = max(usable, key=lambda s: s.metrics.best_bid or -float("inf"))
+            best_ask_state = min(usable, key=lambda s: s.metrics.best_ask or float("inf"))
+            view.best_bid = best_bid_state.metrics.best_bid
+            view.best_bid_venue = best_bid_state.venue
+            view.best_ask = best_ask_state.metrics.best_ask
+            view.best_ask_venue = best_ask_state.venue
+            if view.best_bid is not None and view.best_ask is not None:
+                view.cross_venue_spread_bps = safe_bps(
+                    view.best_bid - view.best_ask, view.reference_price
+                )
 
         deviations = [
             (
