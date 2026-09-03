@@ -6,6 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "trading-floor"
 version = "0.1.0"
 description = "Multi-agent quantitative trading operating system — paper trading only"
+# The supported floor, and a tested one: CI's "python floor" job runs the
+# unit and contract suites on 3.11. The project ships and develops on 3.12
+# (see Dockerfile and .devcontainer), which is the canonical version; 3.11
+# is what it still runs on, verified rather than assumed.
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.6",
@@ -87,6 +91,9 @@ markers = [
 
 [tool.ruff]
 line-length = 100
+# Deliberately the floor, not the version we ship on. Raising this to py312
+# lets ruff propose 3.12-only syntax, which would silently break the 3.11
+# support that requires-python promises and the floor CI job checks.
 target-version = "py311"
 
 [tool.ruff.lint]

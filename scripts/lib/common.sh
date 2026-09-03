@@ -124,13 +124,47 @@ compose_ok() { [[ -n "$(compose_cmd)" ]]; }
 
 # --- compose wrapper ---------------------------------------------------------
 # Always runs from the repository root with paper mode in the environment.
+#
+# TF_COMPOSE_PROJECT selects the compose project, which is what separates one
+# stack's containers *and volumes* from another's. The development stack uses
+# the default; verify-phase0.sh sets its own, so a verification run cannot
+# reach the volumes holding recorded sessions.
 compose() {
   local cc; cc="$(compose_cmd)"
   [[ -z "$cc" ]] && fail_with \
     "Docker Compose is not available" \
     "Neither 'docker compose' nor 'docker-compose' is on PATH." \
     "In Codespaces, rebuild the container (Command Palette → Codespaces: Rebuild Container). Locally, install Docker Desktop or the compose plugin."
-  ( cd "$REPO_ROOT" && TF_MODE=paper $cc "$@" )
+  if [[ -n "${TF_COMPOSE_PROJECT:-}" ]]; then
+    ( cd "$REPO_ROOT" && TF_MODE=paper $cc -p "$TF_COMPOSE_PROJECT" "$@" )
+  else
+    ( cd "$REPO_ROOT" && TF_MODE=paper $cc "$@" )
+  fi
+}
+
+# --- persistent data ---------------------------------------------------------
+# The volumes holding everything a testing session produces: the event store
+# (recorded sessions, event history, paper orders and fills, replay data) and
+# the Redis append-only file. Only ./reset-paper.sh may remove these.
+TF_DATA_VOLUMES=(postgres-data redis-data)
+
+# Names as Docker sees them, which are prefixed with the compose project.
+data_volume_names() {
+  local project="${TF_COMPOSE_PROJECT:-$(basename "$REPO_ROOT")}"
+  local name
+  for name in "${TF_DATA_VOLUMES[@]}"; do
+    printf '%s_%s\n' "$project" "$name"
+  done
+}
+
+# How many of the data volumes currently exist.
+data_volumes_present() {
+  docker_ok || { echo 0; return; }
+  local count=0 name
+  while read -r name; do
+    docker volume inspect "$name" >/dev/null 2>&1 && count=$(( count + 1 ))
+  done < <(data_volume_names)
+  echo "$count"
 }
 
 # --- paper-mode enforcement --------------------------------------------------

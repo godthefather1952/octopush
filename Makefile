@@ -4,7 +4,7 @@
 # is one implementation and three ways to reach it: make, ./trading-floor, or
 # the script directly. All of them run in paper mode.
 
-.PHONY: help setup paper start stop restart status logs test verify lint typecheck clean
+.PHONY: help setup paper start stop restart reset status logs test verify lint typecheck clean
 
 .DEFAULT_GOAL := help
 
@@ -26,8 +26,11 @@ paper:  ## Start the paper-trading stack
 
 start: paper  ## Alias for 'make paper'
 
-stop:  ## Stop everything (recorded sessions are kept)
+stop:  ## Stop everything — your data is preserved
 	@bash scripts/stop-paper.sh
+
+reset:  ## DELETE all paper-session data, then leave it clean (asks first)
+	@bash scripts/reset-paper.sh
 
 restart:  ## Stop, then start
 	@bash scripts/stop-paper.sh

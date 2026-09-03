@@ -16,6 +16,13 @@ cd "$REPO_ROOT"
 
 IMAGE="trading-floor:phase0-verify"
 PROBE="tf-phase0-probe"
+
+# Run under a compose project of its own. Volumes are scoped to the project,
+# so the stack this script brings up and tears down cannot reach the ones
+# holding your recorded sessions — verification needs an empty database to
+# check the migration schema and event persistence, and taking the
+# developer's data to get one would be an unacceptable price.
+export TF_COMPOSE_PROJECT="trading-floor-verify"
 LOG_DIR="$REPO_ROOT/.verify-logs"
 PASSED=0
 FAILED=0
@@ -51,6 +58,16 @@ if ! compose_ok; then
   fail_with "Docker Compose is not available" \
     "Steps 7 to 10 bring up the full stack, which is defined in docker-compose.yml." \
     "In Codespaces, rebuild the container. Locally, install the Docker Compose plugin."
+fi
+
+# The verification stack binds the same host ports as the development one, so
+# they cannot both run. Refusing is better than fighting over a port and
+# reporting a confusing failure four checks later.
+if ( unset TF_COMPOSE_PROJECT; [[ "$(running_service_count)" -gt 0 ]] ); then
+  fail_with "The development stack is running" \
+    "Verification starts its own isolated stack, which needs the same host ports (8080, 5432, 6379). Your data is safe either way — the two stacks use separate volumes — but they cannot run at once." \
+    "./stop-paper.sh      # stop it, keeping all your data
+       ./verify-phase0.sh   # then verify"
 fi
 
 dim "  Image: ${IMAGE}   Logs: ${LOG_DIR}/"

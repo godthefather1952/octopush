@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
       - run: pip install ".[dev]"
       - run: ruff check .
@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
       - run: pip install ".[dev,postgres,intelligence]" mypy
       # Gated on core/ only, which is at zero. The other packages carry a
@@ -77,7 +77,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
       - run: pip install ".[dev,postgres,intelligence]"
 
@@ -98,6 +98,25 @@ jobs:
       - name: Full suite
         run: python -m pytest tests -q -p no:cacheprovider
 
+  floor:
+    name: python floor (3.11)
+    runs-on: ubuntu-latest
+    # Everything else runs 3.12, which is what the Dockerfile ships. This job
+    # exists so that `requires-python = ">=3.11"` is a tested claim rather
+    # than an assertion — if the floor is going to be declared, it has to be
+    # exercised, or it is just a number in a file.
+    #
+    # No service containers: the backend suites skip without them, and this
+    # job is about the language version, not the datastores.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install ".[dev,postgres,intelligence]"
+      - run: python -m pytest tests/unit tests/contract -q -p no:cacheprovider
+
   paper-boundary:
     name: paper boundary
     runs-on: ubuntu-latest
@@ -107,7 +126,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
       - run: pip install ".[dev]"
       - run: |

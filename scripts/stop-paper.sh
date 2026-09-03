@@ -1,31 +1,41 @@
 #!/usr/bin/env bash
-# Stop the paper-trading stack.
+# Stop the paper-trading stack. Never deletes data.
 #
-# Stopping an already-stopped stack is not an error: it says so and exits 0,
-# because "make sure it is off" is a reasonable thing to ask twice.
+# This script has no destructive mode — not a flag, not an argument. Stopping
+# and erasing are different intentions, and putting them behind the same
+# command means one mistyped word costs a testing session. Everything a
+# session produced survives: the event store, recorded sessions, event
+# history, paper orders and fills, and the replay data read back from them.
 #
-# Recorded events survive by default. The named volumes hold the event store,
-# which is the audit trail of every paper session — throwing it away needs to
-# be asked for explicitly, with --volumes.
+# To delete that deliberately, there is ./reset-paper.sh, which says what it
+# will destroy and asks first.
+#
+# Stopping an already-stopped stack is not an error: "make sure it is off" is
+# a reasonable thing to ask twice.
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
 require_repo_root
 cd "$REPO_ROOT"
 
-WIPE=0
 for arg in "$@"; do
   case "$arg" in
-    -v|--volumes) WIPE=1 ;;
     -h|--help)
-      printf 'Usage: ./stop-paper.sh [--volumes]\n\n'
-      printf '  --volumes   also delete the PostgreSQL and Redis volumes.\n'
-      printf '              This erases recorded sessions. Not the default.\n\n'
+      printf '\nUsage: ./stop-paper.sh\n\n'
+      printf '  Stops the stack. Takes no arguments.\n'
+      printf '  Your recorded sessions and event history are preserved.\n\n'
+      printf '  To erase them deliberately:  ./reset-paper.sh\n\n'
       exit 0 ;;
+    -v|--volumes|--wipe|--clean)
+      # This used to be an option here. Refusing by name is friendlier than
+      # "unknown option" to anyone who learned the old spelling.
+      fail_with "./stop-paper.sh no longer deletes data" \
+        "Stopping and erasing are separate commands now, so that stopping can never cost you a testing session by accident." \
+        "./stop-paper.sh      # stop, keeping everything
+       ./reset-paper.sh     # erase deliberately, with confirmation" ;;
     *)
       fail_with "Unknown option: ${arg}" \
-        "./stop-paper.sh takes no arguments except --volumes." \
-        "./stop-paper.sh --help"
-      ;;
+        "./stop-paper.sh takes no arguments." \
+        "./stop-paper.sh --help" ;;
   esac
 done
 
@@ -42,23 +52,22 @@ fi
 if [[ "$(running_service_count)" -eq 0 ]]; then
   check_line "Stack" "STOPPED" "already stopped"
   blank
-  info "  Nothing to do."
+  info "  Nothing to do. Your data is untouched."
   blank
   exit 0
 fi
 
-if (( WIPE )); then
-  printf '  %sRemoving containers and volumes — recorded sessions will be erased.%s\n\n' "$C_WARN" "$C_RESET"
-  compose down --volumes --remove-orphans
-  blank
-  check_line "Stack" "STOPPED" "volumes removed"
-else
-  compose down --remove-orphans
-  blank
-  check_line "Stack" "STOPPED" "volumes kept"
-  dim "  Recorded sessions were preserved. Use ./stop-paper.sh --volumes to erase them."
-fi
+# No --volumes. Containers go, named volumes stay.
+compose down --remove-orphans
 
 blank
-info "  Start again with:  ./start-paper.sh"
+check_line "Stack" "STOPPED"
+check_line "Your data" "OK" "preserved"
+
+blank
+info "  Recorded sessions, event history, orders and fills are all still there."
+info "  Starting again continues from where you left off."
+blank
+info "  Start again:  ./start-paper.sh"
+dim "  Erase data:   ./reset-paper.sh   (asks first)"
 blank

@@ -64,7 +64,8 @@ Every line should read `[PASS]`, ending with
 | Command | What it does |
 | --- | --- |
 | `./start-paper.sh` | Start PostgreSQL, Redis and the trading floor |
-| `./stop-paper.sh` | Stop everything (recorded sessions are kept) |
+| `./stop-paper.sh` | Stop everything — **your data is kept** |
+| `./reset-paper.sh` | **Delete** all paper-session data (asks first) |
 | `./status.sh` | What each service is doing right now |
 | `./logs.sh` | Follow the logs — Ctrl-C to stop |
 | `./test.sh` | Run the test suite |
@@ -76,6 +77,7 @@ remember — they all run the same script:
 ```bash
 ./start-paper.sh          ./trading-floor start          make paper
 ./stop-paper.sh           ./trading-floor stop           make stop
+./reset-paper.sh          ./trading-floor reset          make reset
 ./status.sh               ./trading-floor status         make status
 ```
 
@@ -83,6 +85,26 @@ remember — they all run the same script:
 setting that makes them start anything else: `./start-paper.sh` checks both
 your shell and your `.env`, and refuses to start if either asks for live,
 production or real mode.
+
+### Stopping never loses your work
+
+`./stop-paper.sh` stops the containers and keeps everything a session
+produced — the PostgreSQL event store, recorded sessions, event history,
+paper orders and fills, and the replay data read back from those events.
+Start again and you carry on where you left off. It has no destructive
+option at all, so stopping cannot cost you a session by a mistyped flag.
+
+To erase that data deliberately:
+
+```bash
+./reset-paper.sh
+```
+
+It lists exactly what will be deleted and waits for you to type `reset`
+before doing anything. `./reset-paper.sh --yes` skips the question for
+scripts. It is the only command in this repository that deletes anything;
+`./verify-phase0.sh` runs its own isolated stack precisely so that verifying
+the infrastructure cannot touch your recorded sessions.
 
 ### If something goes wrong
 
@@ -107,8 +129,8 @@ type `Codespaces: Rebuild Container`, and press Enter.
 
 ### Running it on your own machine instead
 
-The same scripts work on Linux and macOS. You need Python 3.11+ and Docker
-installed already — `setup-codespace.sh` will tell you what is missing but
+The same scripts work on Linux and macOS. You need Python 3.11 or newer and
+Docker installed already — `setup-codespace.sh` will tell you what is missing but
 will not change your system, because deciding what gets installed on your
 own machine is yours to make, not a setup script's.
 

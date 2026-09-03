@@ -266,3 +266,292 @@ class TestMakefileAndDispatcherAgree:
         for script in ("setup-codespace.sh", "start-paper.sh", "stop-paper.sh",
                        "status.sh", "logs.sh", "test.sh", "verify-phase0.sh"):
             assert script in makefile, f"the Makefile does not use {script}"
+
+
+class TestStopPreservesData:
+    """Normal shutdown must never cost a testing session.
+
+    The event store holds recorded sessions, event history, paper orders and
+    fills, and the events replay reads back. Stopping is a routine thing to
+    do many times a day; erasing is not. Putting both behind one command
+    means a mistyped flag destroys the history — so they are separate
+    commands, and stop has no destructive mode at all.
+    """
+
+    def test_stop_never_removes_volumes(self):
+        """It must not *hand* --volumes to compose.
+
+        The word still appears in stop-paper.sh, in the branch that refuses
+        the old spelling by name — so the check is on what is executed, not
+        on whether the string occurs.
+        """
+        stop = (ROOT / "scripts" / "stop-paper.sh").read_text()
+        for number, line in enumerate(stop.splitlines(), 1):
+            code = line.strip()
+            if code.startswith("#"):
+                continue
+            if re.match(r"^(compose|docker)\b", code):
+                assert "--volumes" not in code, f"stop-paper.sh:{number} {code}"
+                assert "-v " not in code, f"stop-paper.sh:{number} {code}"
+            assert "volume rm" not in re.sub(r"'[^']*'", "", code), f"line {number}"
+        assert "compose down --remove-orphans" in stop, "stop should bring the stack down"
+
+    def test_stop_takes_no_destructive_flag(self):
+        """The old --volumes spelling is refused by name, not silently."""
+        result = run(["bash", "scripts/stop-paper.sh", "--volumes"])
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert "no longer deletes data" in combined
+        assert "reset-paper.sh" in combined, "it should point at the right command"
+
+    @pytest.mark.parametrize("flag", ["--wipe", "--clean", "-v"])
+    def test_other_destructive_spellings_are_refused(self, flag):
+        result = run(["bash", "scripts/stop-paper.sh", flag])
+        assert result.returncode != 0
+        assert "no longer deletes data" in result.stdout + result.stderr
+
+    def test_stop_says_the_data_is_kept(self):
+        """A developer should not have to infer it.
+
+        Accepts either wording: with a stack running it reports the data
+        preserved, and with nothing running it says the data is untouched.
+        """
+        result = run(["bash", "scripts/stop-paper.sh"])
+        assert result.returncode == 0
+        assert re.search(r"preserved|untouched|Nothing to stop", result.stdout), result.stdout
+
+    def test_stop_is_safe_to_repeat(self):
+        for _ in range(2):
+            assert run(["bash", "scripts/stop-paper.sh"]).returncode == 0
+
+    def test_no_routine_command_removes_volumes(self):
+        """Only reset may. Checked across every script, not just stop."""
+        offenders = []
+        for path in sorted((ROOT / "scripts").rglob("*.sh")):
+            if path.name == "reset-paper.sh":
+                continue
+            verification = path.name == "verify-phase0.sh"
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                if line.strip().startswith("#"):
+                    continue
+                code = re.sub(r'"[^"]*"', "", line).strip()
+                if not re.match(r"^(compose|docker)\b", code):
+                    continue
+                if "--volumes" in code or "volume rm" in code:
+                    # verify-phase0.sh runs an isolated compose project, so the
+                    # volumes it removes are its own, never the developer's.
+                    if verification:
+                        continue
+                    offenders.append(f"{path.name}:{number} {line.strip()}")
+        assert not offenders, "non-reset scripts delete volumes:\n" + "\n".join(offenders)
+
+    def test_verification_uses_an_isolated_compose_project(self):
+        """Otherwise it would erase recorded sessions as a side effect.
+
+        verify-phase0.sh needs an empty database to check the migration schema
+        and event persistence. Compose scopes volumes to the project, so it
+        gets its own and cannot reach the development stack's.
+        """
+        verify = (ROOT / "scripts" / "verify-phase0.sh").read_text()
+        assert 'TF_COMPOSE_PROJECT="trading-floor-verify"' in verify
+        common = (ROOT / "scripts" / "lib" / "common.sh").read_text()
+        assert "TF_COMPOSE_PROJECT" in common, "the wrapper must honour the project"
+
+
+class TestResetIsExplicitlyDestructive:
+    def test_it_exists_and_is_reachable_three_ways(self):
+        assert (ROOT / "reset-paper.sh").is_file()
+        assert (ROOT / "scripts" / "reset-paper.sh").is_file()
+        assert "reset)" in (ROOT / "trading-floor").read_text()
+        assert "\nreset:" in (ROOT / "Makefile").read_text()
+
+    def test_it_names_what_it_will_destroy(self):
+        """A warning that does not say what is lost is not a warning."""
+        result = run(["bash", "scripts/reset-paper.sh", "--help"])
+        assert result.returncode == 0
+        text = result.stdout.lower()
+        for thing in ("event store", "orders and fills", "replay", "redis"):
+            assert thing in text, f"the warning does not mention {thing}"
+
+    @pytest.fixture
+    def data_volumes(self):
+        """Real Docker volumes named exactly as the stack names them.
+
+        Asserting on a message proves only that a message was printed. These
+        tests exist to prove the *data survives*, so the volumes have to
+        actually exist for the destructive path to be reached at all.
+        """
+        import subprocess as sp
+
+        if sp.run(["docker", "info"], capture_output=True).returncode != 0:
+            pytest.skip("no Docker daemon")
+
+        project = ROOT.name
+        names = [f"{project}_postgres-data", f"{project}_redis-data"]
+        created = []
+        for name in names:
+            exists = sp.run(["docker", "volume", "inspect", name], capture_output=True)
+            if exists.returncode != 0:
+                sp.run(["docker", "volume", "create", name], capture_output=True, check=True)
+                created.append(name)
+        try:
+            yield names
+        finally:
+            for name in created:
+                sp.run(["docker", "volume", "rm", "-f", name], capture_output=True)
+
+    @staticmethod
+    def _volume_exists(name: str) -> bool:
+        import subprocess as sp
+
+        return sp.run(["docker", "volume", "inspect", name], capture_output=True).returncode == 0
+
+    def test_it_refuses_without_confirmation_when_not_interactive(self, data_volumes):
+        """stdin is not a terminal here, so the question cannot be asked.
+
+        Refusing is the only safe reading: an unanswerable question must not
+        be treated as answered yes. And the volumes must still be there
+        afterwards — that is the property, not the wording.
+        """
+        result = run(["bash", "scripts/reset-paper.sh"])
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert "Refusing to erase data without confirmation" in combined
+        assert "--yes" in combined, "it should say how to proceed deliberately"
+
+        for name in data_volumes:
+            assert self._volume_exists(name), f"{name} was deleted without confirmation"
+
+    def test_a_declined_confirmation_leaves_every_volume_intact(self, data_volumes):
+        """The core guarantee, checked against Docker rather than output."""
+        result = subprocess.run(
+            ["bash", "scripts/reset-paper.sh"],
+            input="no\n",
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+            timeout=90,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+        assert "Reset complete" not in result.stdout
+        for name in data_volumes:
+            assert self._volume_exists(name), f"{name} was deleted after declining"
+
+    def test_stop_leaves_every_volume_intact(self, data_volumes):
+        """The whole point of separating the two commands.
+
+        This confirms a real invocation leaves real volumes alone. It is the
+        secondary guard, not the primary one: with no stack running, stop
+        returns early and never reaches its compose call, so this would pass
+        even against a destructive stop. `test_stop_never_removes_volumes`
+        is what catches that — it was checked by making stop destructive
+        again and watching it fail.
+        """
+        assert run(["bash", "scripts/stop-paper.sh"]).returncode == 0
+        for name in data_volumes:
+            assert self._volume_exists(name), f"./stop-paper.sh deleted {name}"
+
+    def test_yes_really_does_delete_them(self, data_volumes):
+        """A safety guarantee is only meaningful if reset actually works."""
+        result = run(["bash", "scripts/reset-paper.sh", "--yes"], timeout=180)
+        assert result.returncode == 0, result.stdout + result.stderr
+        for name in data_volumes:
+            assert not self._volume_exists(name), f"{name} survived an explicit reset"
+
+    def test_a_wrong_answer_cancels_and_deletes_nothing(self):
+        """Anything but the exact word cancels."""
+        result = subprocess.run(
+            ["bash", "scripts/reset-paper.sh"],
+            input="yes\n",
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+            timeout=90,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+        # Either it cancelled, or there were no volumes to erase in the first
+        # place — both mean nothing was destroyed on a non-matching answer.
+        combined = result.stdout + result.stderr
+        assert "Cancelled" in combined or "nothing to erase" in combined
+        assert "Reset complete" not in combined
+
+    def test_the_confirmation_word_is_not_a_bare_yes(self):
+        """`y` is muscle memory; `reset` has to be meant."""
+        reset = (ROOT / "scripts" / "reset-paper.sh").read_text()
+        assert '"$REPLY" != "reset"' in reset
+
+    def test_it_still_asserts_paper_mode(self):
+        """A destructive command is the last place to skip the boundary."""
+        reset = (ROOT / "scripts" / "reset-paper.sh").read_text()
+        assert "assert_paper_mode" in reset
+
+        result = run(["bash", "scripts/reset-paper.sh", "--yes"], env={"TF_MODE": "live"})
+        assert result.returncode != 0
+        assert "TF_MODE is set to" in result.stdout + result.stderr
+
+    def test_an_unknown_option_is_refused(self):
+        result = run(["bash", "scripts/reset-paper.sh", "--force"])
+        assert result.returncode != 0
+        assert "Unknown option" in result.stdout + result.stderr
+
+    def test_help_points_back_at_the_safe_command(self):
+        result = run(["bash", "scripts/reset-paper.sh", "--help"])
+        assert "./stop-paper.sh" in result.stdout
+
+
+class TestThePythonVersionIsConsistent:
+    """The Dockerfile is what ships, so it defines the canonical version."""
+
+    @staticmethod
+    def _python_version(text: str, pattern: str) -> str:
+        found = re.search(pattern, text)
+        assert found is not None, f"no version matched {pattern}"
+        return found.group(1)
+
+    def test_the_dockerfile_declares_the_canonical_version(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        assert self._python_version(dockerfile, r"FROM python:(3\.\d+)") == "3.12"
+
+    def test_the_devcontainer_matches_the_dockerfile(self):
+        """A Codespace should be the version the project runs on."""
+        devcontainer = (ROOT / ".devcontainer" / "devcontainer.json").read_text()
+        assert self._python_version(devcontainer, r"python:1-(3\.\d+)-") == "3.12"
+
+    def test_ci_runs_the_canonical_version(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        versions = set(re.findall(r'python-version: "(3\.\d+)"', workflow))
+        assert "3.12" in versions, "CI does not run the shipped version"
+
+    def test_the_declared_floor_is_actually_tested(self):
+        """`requires-python` must be a checked claim, not a number in a file."""
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        pyproject = (ROOT / "pyproject.toml").read_text()
+        floor = self._python_version(pyproject, r'requires-python = ">=(3\.\d+)"')
+        assert f'python-version: "{floor}"' in workflow, (
+            f"requires-python declares {floor} but no CI job runs it"
+        )
+
+    def test_ruff_targets_the_floor_not_the_shipped_version(self):
+        """Targeting 3.12 would let ruff propose syntax that breaks 3.11."""
+        pyproject = (ROOT / "pyproject.toml").read_text()
+        floor = self._python_version(pyproject, r'requires-python = ">=(3\.\d+)"')
+        target = self._python_version(pyproject, r'target-version = "py(3\d+)"')
+        assert target == floor.replace(".", ""), (
+            f"ruff targets py{target} but the supported floor is {floor}"
+        )
+
+    def test_the_code_uses_no_syntax_the_floor_cannot_parse(self):
+        """The floor is only real if the source actually compiles under it."""
+        import subprocess as sp
+
+        floor_python = "python3.11"
+        if sp.run(["which", floor_python], capture_output=True).returncode != 0:
+            pytest.skip(f"{floor_python} is not installed here")
+
+        packages = ["agents", "apps", "core", "execution", "monitoring",
+                    "replay", "risk", "simulation", "storage", "strategies", "venues"]
+        result = sp.run(
+            [floor_python, "-m", "compileall", "-q", "-x", r"__pycache__", *packages],
+            capture_output=True, text=True, cwd=ROOT,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
