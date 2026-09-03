@@ -126,8 +126,21 @@ class RiskLimits(BaseModel):
     #: limits is too small to carry meaningful edge past its costs.
     min_trade_notional: float = Field(default=250.0, gt=0)
     max_unhedged_notional: float = Field(default=10_000.0, gt=0)
-    #: Market data older than this cannot support a trade.
+    #: Market data older than this cannot support a trade. Compared against
+    #: both local silence (now - last_update_ts) and exchange-observation age
+    #: (now - exchange_ts, in milliseconds) — a feed can be receiving packets
+    #: on time while every packet describes a stale exchange observation, and
+    #: local receipt alone cannot see that (TIDAL-H3).
     max_data_age_ms: int = Field(default=2_000, gt=0)
+    #: How far an exchange timestamp may lead local receipt time, in
+    #: milliseconds, before it is treated as a clock problem rather than
+    #: ordinary clock drift between two independently-synced machines. An
+    #: exchange timestamp behind receipt time is normal (that gap is
+    #: transport latency); one far *ahead* of receipt time is not something
+    #: transport latency explains, and past this tolerance it is exactly the
+    #: unreasonable case that must not be allowed to make data look
+    #: infinitely fresh (TIDAL-H3).
+    max_clock_skew_ms: int = Field(default=2_000, gt=0)
     #: Minimum expected net edge, in bps, for a trade to be permitted.
     min_expected_edge_bps: float = Field(default=2.0, ge=0.0)
     #: Rolling API/feed error rate above which trading halts.

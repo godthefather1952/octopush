@@ -39,6 +39,12 @@ class LocalOrderBook:
     #: (quantities are absolute) but not normal, so it is counted rather than
     #: ignored.
     overlapping_updates: int = 0
+    #: Updates carrying no sequence number at all (Coinbase's level2_batch)
+    #: whose exchange timestamp was behind what this book already holds, and
+    #: were therefore dropped rather than applied. See :meth:`_check_unordered`
+    #: — this proves the dropped message was not newer than what we have, and
+    #: nothing stronger.
+    out_of_order_dropped: int = 0
     #: Set when a gap is seen, cleared by the next checkpoint.
     needs_resync: bool = False
     #: True between a snapshot and the first delta applied on top of it.
@@ -106,7 +112,7 @@ class LocalOrderBook:
 
     def _check_point(self, delta: BookDelta) -> bool:
         """Validate a point-sequenced delta. False means "already covered"."""
-        if self.sequence is None or delta.sequence is None:
+        if self.sequence is None:
             return True
         if delta.sequence <= self.sequence:
             # Duplicate or out-of-order replay of something already applied.
@@ -116,18 +122,58 @@ class LocalOrderBook:
             raise self._desync(f"have {self.sequence}, update expects {expected}")
         return True
 
+    def _check_unordered(self, delta: BookDelta) -> bool:
+        """Validate a delta that carries no sequence number at all.
+
+        This is Coinbase's actual shape on the public ``level2_batch``
+        channel: neither the snapshot nor the incremental updates carry a
+        sequence field, so there is no counter whose gap would prove a
+        message went missing. See ``docs/`` and the Batch 3 report for the
+        full account of what this channel does and does not let a client
+        prove; in short, nothing here can detect a dropped update, and this
+        method does not pretend otherwise.
+
+        What timestamp ordering *can* prove is narrower and purely local: an
+        incoming update whose ``exchange_ts`` is older than the newest one
+        already applied to this book is not information we are missing — it
+        is information we already have a newer version of. Applying it would
+        regress the book to a state that predates data we already hold, which
+        is strictly worse than doing nothing. Dropping it is therefore safe
+        regardless of *why* it arrived late (batching jitter, network
+        reordering, or something worse) — the safety of dropping does not
+        depend on diagnosing the cause.
+
+        What this does **not** do is treat an old timestamp as evidence of a
+        gap, invalidate the book, or force a resubscribe. Reacting to a
+        merely-suspicious signal that way would be inventing a confidence the
+        signal cannot support — exactly the kind of fabricated proof of
+        continuity this method exists to avoid. A dropped update is silently
+        absorbed, not escalated.
+        """
+        if self.exchange_ts is None or delta.exchange_ts is None:
+            return True
+        if delta.exchange_ts < self.exchange_ts:
+            self.out_of_order_dropped += 1
+            return False
+        return True
+
     def apply_delta(self, delta: BookDelta) -> None:
         """Apply an incremental update.
 
         Raises :class:`BookDesyncError` on a sequence gap; the caller marks the
         book unsynchronised and requests a checkpoint.  Out-of-order or
-        duplicate updates (sequence at or below what we hold) are dropped.
+        duplicate updates (sequence at or below what we hold, or — on a feed
+        with no sequence numbers at all — older than what we hold) are
+        dropped.
         """
         if not self.synced:
             raise BookDesyncError(f"{self.venue}:{self.symbol} has no snapshot yet")
-        applicable = (
-            self._check_range(delta) if delta.covers_range else self._check_point(delta)
-        )
+        if delta.covers_range:
+            applicable = self._check_range(delta)
+        elif delta.sequence is not None:
+            applicable = self._check_point(delta)
+        else:
+            applicable = self._check_unordered(delta)
         if not applicable:
             return
         for level in delta.bids:

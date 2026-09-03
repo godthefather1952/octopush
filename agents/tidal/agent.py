@@ -57,8 +57,26 @@ class Tidal:
         self.mids: dict[tuple[str, str], MidWindow] = {}
         self.connected: dict[str, bool] = {}
         self.reconnects: dict[str, int] = {}
-        #: Latency samples: received_ts - exchange_ts, exponentially smoothed.
+        #: Smoothed non-negative economic latency: received_ts - exchange_ts,
+        #: floored at zero. This is what ZEPHR's cost model consumes, and it
+        #: must stay a usable "how slow is this feed" number — so a clock
+        #: problem is never folded into it silently. See ``clock_skew_ms``.
         self.latency_ms: dict[tuple[str, str], float] = {}
+        #: Most recently observed raw skew (received_ts - exchange_ts) per
+        #: book, unfloored. Negative means the exchange timestamp is *ahead*
+        #: of local receipt — the case ``latency_ms`` cannot represent, and
+        #: the one that must stay visible rather than silently reading as
+        #: "zero latency" (TIDAL-H3/H9: do not let zero mean "my clock is
+        #: wrong").
+        self.clock_skew_ms: dict[tuple[str, str], float] = {}
+        #: Count of skew observations beyond ``risk.max_clock_skew_ms`` —
+        #: severe enough that "clock drift" no longer explains them.
+        self.clock_skew_violations = 0
+        #: Rate-limits the CLOCK_SKEW system event the same way resync
+        #: requests are rate-limited: the underlying condition persists across
+        #: every message until it resolves, and one event per message would
+        #: flood the bus with the same fact.
+        self._clock_skew_reported_ms: dict[tuple[str, str], Millis] = {}
         self.updates_since_checkpoint: dict[tuple[str, str], int] = {}
         self.desyncs = 0
         self.resync_requests = 0
@@ -161,19 +179,56 @@ class Tidal:
             )
         )
 
-    def _record_latency(
+    async def _record_latency(
         self, key: tuple[str, str], exchange_ts: Millis, received_ts: Millis
     ) -> None:
-        sample = max(0.0, float(received_ts - exchange_ts))
+        """Update the smoothed latency estimate and surface any clock skew.
+
+        ``raw`` is signed: positive is ordinary transport latency (the
+        exchange observed the market before we received word of it, which is
+        the only order events can happen in). Negative means the exchange
+        timestamp is *after* local receipt time — either the two clocks are
+        not perfectly synced (normal, and usually small), or the timestamp is
+        wrong (not normal, and previously invisible: the old code clamped
+        this to zero and folded it into "latency", so a broken clock and a
+        perfectly fast feed were indistinguishable downstream).
+        """
+        raw = float(received_ts - exchange_ts)
+        self.clock_skew_ms[key] = raw
+        sample = raw if raw >= 0 else 0.0
         prior = self.latency_ms.get(key)
         self.latency_ms[key] = sample if prior is None else 0.8 * prior + 0.2 * sample
+        if raw >= 0:
+            return
+        skew = -raw
+        limit = self.settings.risk.max_clock_skew_ms
+        if skew <= limit:
+            return
+        self.clock_skew_violations += 1
+        self.health.record_error(
+            SERVICE,
+            f"{key[0]}:{key[1]} exchange timestamp {skew:.0f}ms ahead of receipt "
+            f"(limit {limit}ms)",
+        )
+        now = self.clock.now_ms()
+        last = self._clock_skew_reported_ms.get(key)
+        if last is not None and now - last < self.resync_request_interval_ms:
+            return
+        self._clock_skew_reported_ms[key] = now
+        await self._publish_system_event(
+            "CLOCK_SKEW",
+            Severity.WARNING,
+            f"{key[0]}:{key[1]} exchange timestamp is {skew:.0f}ms ahead of local "
+            f"receipt, past the {limit}ms tolerance",
+            {"venue": key[0], "symbol": key[1], "skew_ms": skew, "limit_ms": limit},
+        )
 
     async def on_snapshot(self, snapshot: OrderBookSnapshot) -> None:
         key = (snapshot.venue, snapshot.symbol)
         book = self._book(*key)
         book.apply_snapshot(snapshot)
         self.updates_since_checkpoint[key] = 0
-        self._record_latency(key, snapshot.exchange_ts, snapshot.received_ts)
+        await self._record_latency(key, snapshot.exchange_ts, snapshot.received_ts)
         self.connected.setdefault(snapshot.venue, True)
 
     async def on_delta(self, delta: BookDelta) -> None:
@@ -193,28 +248,49 @@ class Tidal:
             await self.request_resync(delta.venue, delta.symbol, str(exc))
             return
         self.updates_since_checkpoint[key] = self.updates_since_checkpoint.get(key, 0) + 1
-        self._record_latency(key, delta.exchange_ts, delta.received_ts)
+        await self._record_latency(key, delta.exchange_ts, delta.received_ts)
 
     async def on_trade(self, trade: TradeEvent) -> None:
         key = (trade.venue, trade.symbol)
         self._book(*key)
         self.flows[key].add(trade.received_ts, trade.aggressor, trade.notional)
-        self._record_latency(key, trade.exchange_ts, trade.received_ts)
+        await self._record_latency(key, trade.exchange_ts, trade.received_ts)
 
     # -- state assembly ----------------------------------------------------
 
     def _quality(self, book: LocalOrderBook, now: Millis) -> DataQuality:
+        """FRESH requires the data to be both recently *received* and recently
+        *observed at the exchange* — either one alone is not enough.
+
+        A feed delivering packets on schedule that describe a five-second-old
+        market looked FRESH before this fix, because only local receipt time
+        was checked (TIDAL-H3). A feed whose exchange timestamp cannot be
+        trusted — because it implausibly leads local receipt time — is
+        treated the same as one with no timestamp at all: UNAVAILABLE, not a
+        best-effort guess (TIDAL-H3 clock skew).
+        """
         if not book.synced or book.crossed or not book.bids or not book.asks:
             return DataQuality.UNAVAILABLE
         if not self.connected.get(book.venue, True):
             return DataQuality.UNAVAILABLE
-        if book.last_update_ts is None:
+        if book.last_update_ts is None or book.exchange_ts is None:
             return DataQuality.UNAVAILABLE
-        age = now - book.last_update_ts
+
+        # received_ts - exchange_ts for the last accepted message. Negative
+        # beyond tolerance means exchange_ts is implausibly ahead of receipt:
+        # the age figures below would be computed from a timestamp we cannot
+        # trust, so this fails closed rather than reporting a number derived
+        # from a broken clock.
+        skew = book.last_update_ts - book.exchange_ts
+        if -skew > self.settings.risk.max_clock_skew_ms:
+            return DataQuality.UNAVAILABLE
+
         limit = self.settings.risk.max_data_age_ms
-        if age > limit * 3:
+        local_silence_age = now - book.last_update_ts
+        exchange_age = now - book.exchange_ts
+        if local_silence_age > limit * 3 or exchange_age > limit * 3:
             return DataQuality.STALE
-        if age > limit:
+        if local_silence_age > limit or exchange_age > limit:
             return DataQuality.DEGRADED
         return DataQuality.FRESH
 
@@ -235,6 +311,7 @@ class Tidal:
             as_of=now,
             quality=self._quality(book, now),
             latency_ms=self.latency_ms.get(key),
+            clock_skew_ms=self.clock_skew_ms.get(key),
             connected=self.connected.get(venue, False),
             sequence_gaps=book.sequence_gaps,
             reconnects=self.reconnects.get(venue, 0),

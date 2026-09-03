@@ -115,7 +115,16 @@ class CrossVenueDetector:
                 continue
             opportunity = Opportunity(
                 created_at=now,
-                source_data_timestamp=market.source_data_timestamp,
+                # The oldest of this opportunity's own two legs, not the
+                # market-wide newest timestamp: an unrelated fresh venue (or
+                # even a fresh update on the same symbol's *other* leg) must
+                # never make a stale contributing leg look current (TIDAL-H4).
+                source_data_timestamp=market.source_data_timestamp_for(
+                    [
+                        (dislocation.buy_venue, symbol),
+                        (dislocation.sell_venue, symbol),
+                    ]
+                ),
                 kind=OpportunityKind.CROSS_VENUE_DISLOCATION,
                 strategy=STRATEGY,
                 symbol=symbol,

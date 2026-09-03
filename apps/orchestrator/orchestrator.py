@@ -674,7 +674,13 @@ class Orchestrator:
         now = self.clock.now_ms()
         return TradeIntent(
             created_at=now,
-            source_data_timestamp=market.source_data_timestamp,
+            # The oldest of this intent's own legs (TIDAL-H4) — not the
+            # market-wide newest timestamp, which could describe an unrelated
+            # symbol's freshest venue and would let a stale leg pass the risk
+            # gate's data-age check unnoticed.
+            source_data_timestamp=market.source_data_timestamp_for(
+                (leg.venue, leg.symbol) for leg in opportunity.legs
+            ),
             correlation_id=opportunity.opportunity_id,
             opportunity_id=opportunity.opportunity_id,
             strategy=opportunity.strategy,
@@ -830,7 +836,10 @@ class Orchestrator:
 
         exit_intent = TradeIntent(
             created_at=now,
-            source_data_timestamp=market.source_data_timestamp,
+            # Oldest of the legs actually being closed (TIDAL-H4).
+            source_data_timestamp=market.source_data_timestamp_for(
+                (leg.venue, leg.symbol) for leg in legs
+            ),
             correlation_id=record.opportunity.opportunity_id,
             opportunity_id=record.opportunity.opportunity_id,
             strategy=record.opportunity.strategy,
@@ -903,7 +912,10 @@ class Orchestrator:
             )
             hedge_intent = TradeIntent(
                 created_at=now,
-                source_data_timestamp=market.source_data_timestamp,
+                # The one leg the hedge actually trades (TIDAL-H4).
+                source_data_timestamp=market.source_data_timestamp_for(
+                    [(leg.venue, leg.symbol)]
+                ),
                 correlation_id=hedge.hedge_id,
                 opportunity_id=hedge.hedge_id,
                 strategy=STRATEGY,

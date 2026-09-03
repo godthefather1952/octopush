@@ -36,8 +36,14 @@ def _levels(raw: list[Any], *, descending: bool) -> list[PriceLevel]:
 def parse_snapshot(data: dict[str, Any], received_ts: Millis) -> OrderBookSnapshot:
     """``snapshot`` -> a checkpoint snapshot.
 
-    This feed has no sequence number on the snapshot; ordering is guaranteed
-    by the transport, and TIDAL falls back to timestamp monotonicity.
+    Neither this snapshot nor the ``l2update`` messages that follow it carry a
+    sequence number on the public ``level2_batch`` channel. ``LocalOrderBook``
+    falls back to comparing each update's exchange timestamp against the
+    newest one already applied, which is enough to drop a message that is
+    provably not newer than what the book already holds — but it is *not*
+    proof that no update was missed: a channel with no sequence numbers gives
+    no signal that could prove that. See ``agents/tidal/book.py``'s
+    ``_check_unordered`` and the Batch 3 report for the full account.
     """
     return OrderBookSnapshot(
         venue=VENUE,

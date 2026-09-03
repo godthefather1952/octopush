@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import itertools
 import math
+from collections.abc import Iterable
 
 from pydantic import Field, field_validator
 
@@ -142,8 +143,15 @@ class VenueMarketState(Base):
     #: Local time at which the state was assembled.
     as_of: Millis
     quality: DataQuality = DataQuality.UNAVAILABLE
-    #: Observed transport latency: received_ts - exchange_ts.
+    #: Smoothed, non-negative economic latency: max(0, received_ts -
+    #: exchange_ts). Floored so a downstream cost model always gets a usable
+    #: number; see ``clock_skew_ms`` for what the floor would otherwise hide.
     latency_ms: float | None = None
+    #: Unfloored received_ts - exchange_ts for the most recent update, so a
+    #: negative value (exchange timestamp ahead of local receipt) stays
+    #: visible instead of silently reading as zero latency (TIDAL-H3).
+    #: ``None`` before any message has been recorded.
+    clock_skew_ms: float | None = None
     connected: bool = False
     sequence_gaps: int = 0
     reconnects: int = 0
@@ -187,6 +195,38 @@ class MarketState(Envelope):
 
     def states_for(self, symbol: str) -> list[VenueMarketState]:
         return [s for s in self.venues.values() if s.symbol == symbol]
+
+    def source_data_timestamp_for(
+        self, legs: Iterable[tuple[str, str]]
+    ) -> Millis | None:
+        """Oldest exchange observation among the venues actually behind ``legs``.
+
+        A record derived from several legs (a cross-venue opportunity, the
+        intent built from it, an exit or a hedge) is only as fresh as its
+        stalest leg: a two-leg trade whose buy side is 100ms old and whose
+        sell side is 1,900ms old cannot honestly be called 100ms old, and a
+        fresh venue must never mask a stale one (TIDAL-H4). Using this
+        symbol's *overall* newest timestamp, or an unrelated symbol's, both
+        launder that staleness away.
+
+        Each pair is ``(venue, symbol)``. A leg whose venue state is missing
+        or carries no exchange observation makes the whole result unknown
+        (``None``) rather than silently skipped, so a caller that treats
+        ``None`` as fail-closed — as :func:`risk.limits.gate_data_age` does —
+        blocks rather than averaging over a hole in the data.
+
+        Uses ``exchange_ts`` — the exchange's own observation time, not local
+        receipt time — because that is what the corrected freshness model
+        (TIDAL-H3) treats as authoritative for how old a market observation
+        actually is.
+        """
+        timestamps: list[Millis] = []
+        for venue, symbol in legs:
+            state = self.venue_state(venue, symbol)
+            if state is None or state.exchange_ts is None:
+                return None
+            timestamps.append(state.exchange_ts)
+        return min(timestamps) if timestamps else None
 
 
 # There is deliberately no `MarketSnapshot` bundle. The specification named
