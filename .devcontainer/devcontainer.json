@@ -9,7 +9,10 @@
   // is verified by a CI job: the code uses no 3.12-only syntax or stdlib, and
   // the full suite passes on both. Narrowing a supported range that works is
   // a compatibility decision, not a consistency one.
-  "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
 
   "features": {
     // Docker-in-Docker rather than apt. The stack runs as containers
