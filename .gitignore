@@ -14,3 +14,6 @@ data/
 *.egg-info/
 dist/
 build/
+
+# Verification and startup logs written by scripts/ — diagnostics, not source.
+.verify-logs/

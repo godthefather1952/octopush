@@ -45,6 +45,9 @@ services:
       postgres:
         condition: service_healthy
     environment:
+      # Stated rather than left to the default: the stack agrees with the code
+      # instead of relying on one. Startup aborts on any other value.
+      TF_MODE: paper
       TF_ENVIRONMENT: docker
       TF_LOG_FORMAT: json
       # Change to "live" for public read-only exchange feeds.

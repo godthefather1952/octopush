@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# One entrypoint for the whole developer workflow.
+#
+#   ./trading-floor start     ./trading-floor status    ./trading-floor test
+#   ./trading-floor stop      ./trading-floor logs      ./trading-floor verify
+#   ./trading-floor restart   ./trading-floor setup
+#
+# Each subcommand delegates to the script of the same name in scripts/, which
+# is also runnable directly. This adds a memorable front door, not a second
+# implementation.
+
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+  cat <<'USAGE'
+
+  Trading Floor — paper mode
+
+  Usage:  ./trading-floor <command> [args...]
+
+    setup      install dependencies and check the environment
+    start      start PostgreSQL, Redis and the trading floor
+    stop       stop everything (add --volumes to erase recorded sessions)
+    restart    stop, then start
+    status     what each service is doing right now
+    logs       follow the logs  (./trading-floor logs trading-floor)
+    test       run the test suite
+    verify     run the Phase 0 Docker infrastructure verification
+
+  Every command runs in paper mode. There is no live-trading option.
+
+USAGE
+}
+
+cmd="${1:-}"
+[[ $# -gt 0 ]] && shift
+
+case "$cmd" in
+  setup)   exec bash "$HERE/scripts/setup-codespace.sh" "$@" ;;
+  start|up)   exec bash "$HERE/scripts/start-paper.sh" "$@" ;;
+  stop|down)  exec bash "$HERE/scripts/stop-paper.sh" "$@" ;;
+  restart)
+    bash "$HERE/scripts/stop-paper.sh"
+    exec bash "$HERE/scripts/start-paper.sh"
+    ;;
+  status)  exec bash "$HERE/scripts/status.sh" "$@" ;;
+  logs)    exec bash "$HERE/scripts/logs.sh" "$@" ;;
+  test)    exec bash "$HERE/scripts/test.sh" "$@" ;;
+  verify)  exec bash "$HERE/scripts/verify-phase0.sh" "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *)
+    printf '\n  Unknown command: %s\n' "$cmd"
+    usage
+    exit 2
+    ;;
+esac

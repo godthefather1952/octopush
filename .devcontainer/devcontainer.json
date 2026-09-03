@@ -1,0 +1,88 @@
+{
+  "name": "Multi-Agent Trading Floor (paper)",
+
+  // Official Microsoft Python image. 3.11 is the project's declared floor
+  // (pyproject: requires-python >= 3.11) and is what CI runs, so the
+  // Codespace matches the environment the test suite is validated against.
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.11-bookworm",
+
+  "features": {
+    // Docker-in-Docker rather than apt. The stack runs as containers
+    // (PostgreSQL, Redis, the app) and verify-phase0.sh builds an image, so
+    // the Codespace needs a real daemon of its own. This feature installs
+    // the CLI, the daemon and the compose plugin together and keeps them
+    // reproducible; a hand-written apt script in postCreate would reinstall
+    // on every rebuild and drift from whatever Docker ships that week.
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest",
+      "dockerDashComposeVersion": "v2"
+    },
+    "ghcr.io/devcontainers/features/git:1": {
+      "version": "latest"
+    }
+  },
+
+  // Idempotent: safe to run again after a rebuild, and safe to run by hand.
+  "postCreateCommand": "bash scripts/setup-codespace.sh",
+
+  // Printed in the terminal every time the Codespace is attached, so the
+  // next command is on screen rather than in the README.
+  "postAttachCommand": {
+    "hint": "bash -lc 'echo; echo \"  Trading Floor — paper mode.  Start everything with:  ./start-paper.sh\"; echo'"
+  },
+
+  "forwardPorts": [8080],
+
+  "portsAttributes": {
+    "8080": {
+      "label": "Trading Floor — dashboard & API",
+      "onAutoForward": "notify",
+      "protocol": "http"
+    },
+    // Declared so the labels are meaningful if a developer forwards them
+    // deliberately for a database client. Not auto-forwarded and not public:
+    // there is no browser-facing reason to expose a datastore, and both
+    // carry development credentials.
+    "5432": {
+      "label": "PostgreSQL (event store)",
+      "onAutoForward": "ignore"
+    },
+    "6379": {
+      "label": "Redis (event bus)",
+      "onAutoForward": "ignore"
+    }
+  },
+
+  "containerEnv": {
+    // The platform is paper-only by construction; setting it here means the
+    // Codespace agrees with the code rather than relying on a default.
+    "TF_MODE": "paper",
+    "PYTHONUNBUFFERED": "1",
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1"
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff",
+        "ms-azuretools.vscode-docker",
+        "tamasfe.even-better-toml"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.testing.pytestEnabled": true,
+        "python.testing.pytestArgs": ["tests"],
+        "[python]": {
+          "editor.defaultFormatter": "charliermarsh.ruff",
+          "editor.codeActionsOnSave": { "source.organizeImports.ruff": "explicit" }
+        },
+        "files.trimTrailingWhitespace": true,
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+
+  "remoteUser": "vscode"
+}

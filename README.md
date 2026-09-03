@@ -18,6 +18,108 @@ single model wired to an exchange.
 
 ---
 
+## Quick start — GitHub Codespaces
+
+No Docker experience needed. Nothing to install on your own machine.
+
+**1.** Open this repository on GitHub.
+
+**2.** Click the green **Code** button → the **Codespaces** tab →
+**Create codespace on main**.
+
+**3.** Wait. A browser version of VS Code opens and sets itself up: Python,
+Docker, and this project's dependencies. The first time takes a few minutes.
+You will see setup finish with `Setup complete.` in the terminal.
+
+**4.** In the terminal at the bottom of the window, type:
+
+```bash
+./start-paper.sh
+```
+
+**5.** Wait until every line reports `HEALTHY`. The first run also builds the
+application image, so give it a couple of minutes.
+
+**6.** A notification appears offering to open the forwarded port. Click
+**Open in Browser** for the dashboard. If you miss it, click the **PORTS**
+tab next to the terminal and then the globe icon on port 8080.
+
+**7.** Check the infrastructure is sound:
+
+```bash
+./verify-phase0.sh
+```
+
+Every line should read `[PASS]`, ending with
+`PHASE 0 DOCKER VERIFICATION: PASS`.
+
+**8.** Start testing. When you are finished:
+
+```bash
+./stop-paper.sh
+```
+
+### Everyday commands
+
+| Command | What it does |
+| --- | --- |
+| `./start-paper.sh` | Start PostgreSQL, Redis and the trading floor |
+| `./stop-paper.sh` | Stop everything (recorded sessions are kept) |
+| `./status.sh` | What each service is doing right now |
+| `./logs.sh` | Follow the logs — Ctrl-C to stop |
+| `./test.sh` | Run the test suite |
+| `./verify-phase0.sh` | Verify the Docker infrastructure |
+
+The same commands are available three ways, whichever you find easier to
+remember — they all run the same script:
+
+```bash
+./start-paper.sh          ./trading-floor start          make paper
+./stop-paper.sh           ./trading-floor stop           make stop
+./status.sh               ./trading-floor status         make status
+```
+
+**Every one of them runs in paper mode.** There is no flag, argument or
+setting that makes them start anything else: `./start-paper.sh` checks both
+your shell and your `.env`, and refuses to start if either asks for live,
+production or real mode.
+
+### If something goes wrong
+
+Each script tells you what failed, why, and the command to run next. The
+three most useful:
+
+```bash
+./status.sh                  # what each service reports about itself
+./logs.sh trading-floor      # why the application is unhealthy
+./stop-paper.sh && ./start-paper.sh    # a clean restart
+```
+
+If setup itself did not finish, run it again — it is safe to repeat and will
+not overwrite your `.env`:
+
+```bash
+bash scripts/setup-codespace.sh
+```
+
+If Docker is missing or unresponsive, rebuild the container: press **F1**,
+type `Codespaces: Rebuild Container`, and press Enter.
+
+### Running it on your own machine instead
+
+The same scripts work on Linux and macOS. You need Python 3.11+ and Docker
+installed already — `setup-codespace.sh` will tell you what is missing but
+will not change your system, because deciding what gets installed on your
+own machine is yours to make, not a setup script's.
+
+```bash
+git clone <this repository> && cd octopush
+bash scripts/setup-codespace.sh
+./start-paper.sh
+```
+
+---
+
 ## What it does today
 
 ```
