@@ -322,7 +322,11 @@ def build_platform(
     adapters: dict[str, VenueAdapter] = {}
     publishers: dict[str, VenueFeedPublisher] = {}
     for venue_config in settings.enabled_venues:
-        adapter = build_adapter(venue_config, clock, settings.symbols)
+        # Each venue subscribes to the instruments it actually lists. Passing
+        # the global strategy universe here was what forced every adapter to
+        # ask its venue for BTC-USD, which the Binance formatter then "fixed"
+        # by substituting BTC-USDT — the mechanism behind TIDAL-C3.
+        adapter = build_adapter(venue_config, clock, venue_config.symbols)
         publisher = VenueFeedPublisher(bus, clock, venue_config.name)
         adapter.bind(
             publisher.publish,
@@ -352,9 +356,21 @@ def build_platform(
         # The generator must start on the platform's own clock. Seeding it at
         # a fixed epoch while the clock reads wall time makes every synthetic
         # book look days stale, and TIDAL — correctly — refuses to use it.
+        # Generate exactly the instruments the simulated venues subscribe to,
+        # not the whole strategy universe: a generated symbol nobody
+        # subscribes to is wasted work, and a subscribed symbol nobody
+        # generates is a book that never appears.
+        simulated_symbols = sorted(
+            {
+                symbol
+                for venue_config in settings.enabled_venues
+                if venue_config.name in simulated
+                for symbol in venue_config.symbols
+            }
+        )
         generator = generator or default_market(
             seed=settings.execution.seed,
-            symbols=settings.symbols,
+            symbols=simulated_symbols,
             start_ms=clock.now_ms(),
         )
         sim_driver = SimulatedMarketDriver(generator, simulated, clock)

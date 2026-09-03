@@ -21,27 +21,76 @@ class TestSymbolNormalisation:
     @pytest.mark.parametrize(
         "raw,expected",
         [
-            ("BTCUSDT", "BTC-USD"),
+            # Spelling differences that do not change the instrument.
             ("BTC-USD", "BTC-USD"),
             ("btc-usd", "BTC-USD"),
+            ("BTCUSD", "BTC-USD"),
             ("XBT/USD", "BTC-USD"),
-            ("BTC_USDT", "BTC-USD"),
-            ("ETHUSDC", "ETH-USD"),
-            ("WETH-USD", "ETH-USD"),
+            ("BTC/USDT", "BTC-USDT"),
+            ("BTC_USDT", "BTC-USDT"),
             ("ETH-EUR", "ETH-EUR"),
+            # Quote assets that are NOT interchangeable. These four used to
+            # collapse onto BTC-USD, which is what let a Binance USDT quote be
+            # compared against a Coinbase USD quote (TIDAL-C3).
+            ("BTCUSDT", "BTC-USDT"),
+            ("BTCUSDC", "BTC-USDC"),
+            ("BTCBUSD", "BTC-BUSD"),
+            ("ETHUSDT", "ETH-USDT"),
+            ("ETHUSDC", "ETH-USDC"),
+            ("ETHBUSD", "ETH-BUSD"),
+            # Still a base alias, unchanged by this batch.
+            ("WETH-USD", "ETH-USD"),
         ],
     )
     def test_every_venue_format_maps_to_one_canonical_symbol(self, raw, expected):
         assert normalize(raw) == expected
+
+    @pytest.mark.parametrize("base", ["BTC", "ETH"])
+    def test_each_stablecoin_quote_is_its_own_instrument(self, base):
+        """The four dollar-ish quotes must produce four distinct instruments."""
+        canonical = {normalize(f"{base}{q}") for q in ("USD", "USDT", "USDC", "BUSD")}
+        assert canonical == {
+            f"{base}-USD",
+            f"{base}-USDT",
+            f"{base}-USDC",
+            f"{base}-BUSD",
+        }
+        assert len(canonical) == 4, "collapsing any two of these reintroduces TIDAL-C3"
 
     def test_unparseable_symbol_raises(self):
         with pytest.raises(UnknownSymbol):
             parse("NOTASYMBOL")
 
     def test_round_trip_to_venue_formats(self):
-        assert denormalize("BTC-USD", "concat_usdt") == "BTCUSDT"
+        assert denormalize("BTC-USD", "concat") == "BTCUSD"
+        assert denormalize("BTC-USDT", "concat") == "BTCUSDT"
+        assert denormalize("BTC-USDC", "concat") == "BTCUSDC"
         assert denormalize("BTC-USD", "dash") == "BTC-USD"
         assert denormalize("BTC-USD", "slash") == "BTC/USD"
+
+    @pytest.mark.parametrize(
+        "canonical", ["BTC-USD", "BTC-USDT", "BTC-USDC", "BTC-BUSD", "ETH-USDT"]
+    )
+    @pytest.mark.parametrize("style", ["concat", "dash", "slash"])
+    def test_formatting_never_changes_the_instrument(self, canonical, style):
+        """Every style is punctuation-only: format then re-parse is identity."""
+        assert normalize(denormalize(canonical, style)) == canonical
+
+    def test_the_quote_rewriting_style_is_gone(self):
+        """``concat_usdt`` rendered BTC-USD as BTCUSDT — a different asset.
+
+        Asserted by name so it cannot quietly come back: any style that
+        rewrites the quote belongs to venue configuration, not formatting.
+        """
+        with pytest.raises(ValueError, match="unknown symbol style"):
+            denormalize("BTC-USD", "concat_usdt")
+
+    def test_usd_never_formats_to_a_stablecoin(self):
+        for style in ("concat", "dash", "slash"):
+            rendered = denormalize("BTC-USD", style)
+            assert "USDT" not in rendered
+            assert "USDC" not in rendered
+            assert "BUSD" not in rendered
 
     def test_unknown_style_raises(self):
         with pytest.raises(ValueError, match="unknown symbol style"):
@@ -70,7 +119,7 @@ class TestVenueAParser:
             },
             START_MS + 5,
         )
-        assert delta.symbol == "BTC-USD"
+        assert delta.symbol == "BTC-USDT"
         assert delta.first_sequence == 101
         assert delta.sequence == 105
         assert delta.covers_range
@@ -93,7 +142,7 @@ class TestVenueAParser:
             START_MS,
         )
         assert snapshot.is_checkpoint and snapshot.sequence == 500
-        assert snapshot.symbol == "BTC-USD"
+        assert snapshot.symbol == "BTC-USDT"
 
     def test_unknown_event_types_are_ignored(self):
         assert parser_a.parse_message({"data": {"e": "kline"}}, START_MS) is None
@@ -113,12 +162,19 @@ class TestVenueAParser:
             },
             START_MS,
         )
-        assert parsed is not None and parsed.symbol == "BTC-USD"
+        assert parsed is not None and parsed.symbol == "BTC-USDT"
 
     def test_stream_names_cover_depth_and_trades(self):
-        names = parser_a.stream_names(["BTC-USD", "ETH-USD"])
+        names = parser_a.stream_names(["BTC-USDT", "ETH-USDT"])
         assert "btcusdt@depth@100ms" in names
         assert "ethusdt@trade" in names
+
+    def test_stream_names_follow_the_configured_quote(self):
+        """A USD-quoted instrument subscribes to the USD market, not USDT."""
+        assert parser_a.stream_names(["BTC-USD"]) == [
+            "btcusd@depth@100ms",
+            "btcusd@trade",
+        ]
 
 
 class TestVenueBParser:

@@ -46,11 +46,19 @@ def find_dislocation(
     The edge is measured between the venue whose *ask* is cheapest and the
     venue whose *bid* is richest, because those are the prices actually
     available — comparing mids would overstate the edge by a full spread.
+
+    Only states for ``symbol`` itself are considered. The caller in this
+    package already filters, so the guard is redundant there — but it is the
+    guard that makes the property true of the *function* rather than of one
+    call site, and the property matters: comparing ``BTC-USDT`` against
+    ``BTC-USD`` prices the stablecoin basis as a bitcoin edge (TIDAL-C3).
+    Two instruments sharing a base are not one instrument.
     """
     usable = [
         s
         for s in states
-        if s.quality.is_usable
+        if s.symbol == symbol
+        and s.quality.is_usable
         and s.metrics.best_ask is not None
         and s.metrics.best_bid is not None
     ]

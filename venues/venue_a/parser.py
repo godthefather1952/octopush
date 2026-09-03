@@ -15,7 +15,9 @@ from venues.base.messages import BookDelta
 from venues.base.symbols import normalize
 
 VENUE = "VENUE_A"
-SYMBOL_STYLE = "concat_usdt"
+#: Binance spells symbols with no separator. The quote is carried through
+#: unchanged: BTC-USDT -> BTCUSDT, BTC-USD -> BTCUSD.
+SYMBOL_STYLE = "concat"
 
 
 def _levels(raw: list[Any], *, descending: bool) -> list[PriceLevel]:

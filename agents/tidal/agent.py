@@ -300,11 +300,19 @@ class Tidal:
             state = self.venue_state(venue, symbol)
             if state is not None:
                 venues[f"{venue}:{symbol}"] = state
+        # Consolidate every instrument actually being received, not only those
+        # in the strategy universe. A venue book that exists but appears
+        # nowhere in consolidated state is invisible to monitoring and to the
+        # API, which is how a feed can look absent while running fine.
+        #
+        # Grouping is by exact canonical symbol, so BTC-USDT and BTC-USD form
+        # two separate views. Nothing here computes a price across quote
+        # assets, and a view with a single contributing venue is a normal,
+        # honest result rather than something to fill in.
         consolidated: dict[str, ConsolidatedView] = {}
-        for symbol in self.settings.symbols:
+        for symbol in sorted({s.symbol for s in venues.values()}):
             states = [s for s in venues.values() if s.symbol == symbol]
-            if states:
-                consolidated[symbol] = self.consolidate(symbol, states)
+            consolidated[symbol] = self.consolidate(symbol, states)
         newest = max(
             (s.last_update_ts for s in venues.values() if s.last_update_ts is not None),
             default=None,

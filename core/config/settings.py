@@ -101,6 +101,10 @@ class VenueConfig(BaseModel):
     #: book that keeps gapping cannot turn into a REST request storm.
     depth_sync_min_interval_s: float = Field(default=5.0, ge=0.0, le=600.0)
     enabled: bool = True
+    #: Canonical instruments **this venue** subscribes to. These are the
+    #: instruments the venue actually lists, in canonical ``BASE-QUOTE`` form;
+    #: the adapter renders them into the venue's own spelling and never
+    #: substitutes a different quote asset to find a listing.
     symbols: list[str] = Field(default_factory=lambda: ["BTC-USD", "ETH-USD"])
 
 
@@ -309,8 +313,19 @@ class Settings(BaseModel):
     redis_url: str = "redis://localhost:6379/0"
 
     paper_initial_balance: float = Field(default=100_000.0, gt=0)
-    #: Symbols the platform trades. Start small; the architecture takes more
-    #: without redesign.
+    #: The **strategy universe**: canonical instruments the platform evaluates,
+    #: hedges and reports on. Distinct from :attr:`VenueConfig.symbols`, which
+    #: is what a single venue subscribes to.
+    #:
+    #: The relationship is one-way. A venue subscribes to what it lists; this
+    #: list says which of those instruments the strategy layer considers. An
+    #: instrument here that only one venue carries simply yields no cross-venue
+    #: opportunity, which is the correct outcome — it is never a licence for an
+    #: adapter to substitute a different instrument that happens to be listed.
+    #:
+    #: Defaults to the union of the enabled venues' symbols, so the universe
+    #: describes the venues rather than contradicting them. Override with
+    #: ``TF_SYMBOLS`` to evaluate a narrower set.
     symbols: list[str] = Field(
         default_factory=lambda: ["BTC-USD", "ETH-USD"], min_length=1
     )
@@ -371,10 +386,22 @@ class Settings(BaseModel):
 
 
 def default_venues() -> list[VenueConfig]:
-    """The two venues the initial scope calls for.
+    """The two live public-data venues.
 
-    Both adapters are public-market-data only.  ``simulated`` is the offline
-    generator used by tests, replay development and the default local run.
+    Both adapters are public-market-data only.
+
+    The symbol lists differ, and that is the honest configuration rather than
+    an oversight: Binance's dollar-denominated bitcoin market settles in USDT,
+    Coinbase's settles in USD, and those are different instruments. The
+    platform used to paper over the difference by rewriting ``BTC-USD`` into
+    ``BTCUSDT`` inside the symbol formatter, which manufactured a cross-venue
+    pair out of two markets that do not share a settlement asset (TIDAL-C3).
+
+    The consequence is that this configuration has no same-instrument pair
+    across the two venues, so the cross-venue strategy finds nothing to trade
+    on live data. That is the correct result. Trading the USDT/USD basis is a
+    real strategy, but it needs a reference feed, a conversion leg and a depeg
+    model — not a string substitution.
     """
     return [
         VenueConfig(
@@ -385,6 +412,7 @@ def default_venues() -> list[VenueConfig]:
             rest_url="https://api.binance.com",
             fees=FeeSchedule(maker_bps=1.0, taker_bps=5.0),
             latency_ms=35,
+            symbols=["BTC-USDT", "ETH-USDT"],
         ),
         VenueConfig(
             name="VENUE_B",
@@ -394,12 +422,19 @@ def default_venues() -> list[VenueConfig]:
             rest_url="https://api.exchange.coinbase.com",
             fees=FeeSchedule(maker_bps=2.0, taker_bps=6.0),
             latency_ms=55,
+            symbols=["BTC-USD", "ETH-USD"],
         ),
     ]
 
 
 def simulated_venues() -> list[VenueConfig]:
-    """Offline venues backed by the synthetic market generator."""
+    """Offline venues backed by the synthetic market generator.
+
+    Both carry the *same* instruments on purpose. The simulator is where the
+    end-to-end cross-venue path is exercised, and that needs two venues
+    quoting one instrument. Nothing is being papered over here: these are
+    genuinely the same synthetic instrument on two synthetic venues.
+    """
     return [
         VenueConfig(
             name="VENUE_A",
@@ -407,6 +442,7 @@ def simulated_venues() -> list[VenueConfig]:
             adapter="simulated",
             fees=FeeSchedule(maker_bps=1.0, taker_bps=5.0),
             latency_ms=35,
+            symbols=["BTC-USD", "ETH-USD"],
         ),
         VenueConfig(
             name="VENUE_B",
@@ -414,6 +450,7 @@ def simulated_venues() -> list[VenueConfig]:
             adapter="simulated",
             fees=FeeSchedule(maker_bps=2.0, taker_bps=6.0),
             latency_ms=55,
+            symbols=["BTC-USD", "ETH-USD"],
         ),
     ]
 
@@ -440,6 +477,14 @@ def load_settings(**overrides: Any) -> Settings:
             f"{TradingMode.PAPER.value.lower()!r}."
         )
 
+    venue_configs = simulated_venues() if feed == "simulated" else default_venues()
+    # The strategy universe defaults to what the venues actually carry. Pinning
+    # it to a hardcoded ["BTC-USD", "ETH-USD"] was fine while every venue was
+    # forced to that pair by the symbol formatter; now that venues declare
+    # their real instruments, a fixed default would silently exclude the live
+    # Binance books from evaluation and reporting.
+    venue_symbols = sorted({s for v in venue_configs if v.enabled for s in v.symbols})
+
     base: dict[str, Any] = {
         "environment": _env("ENVIRONMENT", "local"),
         "log_level": _env("LOG_LEVEL", "INFO"),
@@ -447,15 +492,12 @@ def load_settings(**overrides: Any) -> Settings:
         "bus": _env("BUS", "memory"),
         "redis_url": _env("REDIS_URL", "redis://localhost:6379/0"),
         "paper_initial_balance": _env("PAPER_INITIAL_BALANCE", 100_000.0),
-        "symbols": _env("SYMBOLS", ["BTC-USD", "ETH-USD"]),
+        "symbols": _env("SYMBOLS", venue_symbols),
         "tick_interval_s": _env("TICK_INTERVAL_S", 0.25),
         "min_dislocation_bps": _env("MIN_DISLOCATION_BPS", 4.0),
         "api_host": _env("API_HOST", "0.0.0.0"),
         "api_port": _env("API_PORT", 8080),
-        "venues": [
-            v.model_dump()
-            for v in (simulated_venues() if feed == "simulated" else default_venues())
-        ],
+        "venues": [v.model_dump() for v in venue_configs],
         "storage": {
             "backend": _env("STORAGE_BACKEND", "sqlite"),
             "sqlite_path": _env("SQLITE_PATH", "./data/trading_floor.db"),

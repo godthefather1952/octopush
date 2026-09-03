@@ -520,8 +520,8 @@ class TestAdapterIntegration:
         adapter = OfflineVenueA(
             config,
             clock,
-            ["BTC-USD"],
-            {"BTC-USD": checkpoint(1000, bids=[(100.0, 1.0)], asks=[(101.0, 1.0)])},
+            ["BTC-USDT"],
+            {"BTC-USDT": checkpoint(1000, bids=[(100.0, 1.0)], asks=[(101.0, 1.0)])},
         )
         adapter.bind(out)
 
@@ -533,14 +533,14 @@ class TestAdapterIntegration:
         )
         await settle()
 
-        book = LocalOrderBook(venue=VENUE, symbol="BTC-USD", max_depth=10)
+        book = LocalOrderBook(venue=VENUE, symbol="BTC-USDT", max_depth=10)
         for message in out.messages:
             if isinstance(message, OrderBookSnapshot):
                 book.apply_snapshot(message)
             else:
                 book.apply_delta(message)
 
-        assert adapter.fetch_calls == ["BTC-USD"], "one checkpoint, not one per update"
+        assert adapter.fetch_calls == ["BTC-USDT"], "one checkpoint, not one per update"
         assert book.synced and book.usable
         assert book.sequence == 1006
         # 995..999 is entirely below the checkpoint and must not have been
@@ -551,15 +551,15 @@ class TestAdapterIntegration:
     async def test_a_resync_request_reaches_the_synchronizer(self, config):
         clock = ManualClock(START_MS)
         out = Recorder()
-        adapter = OfflineVenueA(config, clock, ["BTC-USD"], {"BTC-USD": checkpoint(1000)})
+        adapter = OfflineVenueA(config, clock, ["BTC-USDT"], {"BTC-USDT": checkpoint(1000)})
         adapter.bind(out)
         await adapter.handle_payload(depth_payload("BTCUSDT", 1001, 1002))
         await settle()
-        assert adapter.fetch_calls == ["BTC-USD"]
+        assert adapter.fetch_calls == ["BTC-USDT"]
 
-        await adapter.request_resync("BTC-USD", "sequence gap")
+        await adapter.request_resync("BTC-USDT", "sequence gap")
         await settle()
-        assert adapter.fetch_calls == ["BTC-USD", "BTC-USD"]
+        assert adapter.fetch_calls == ["BTC-USDT", "BTC-USDT"]
         assert adapter.stats.sequence_gaps == 1
 
     async def test_each_symbol_synchronises_independently(self, config):
@@ -568,8 +568,8 @@ class TestAdapterIntegration:
         adapter = OfflineVenueA(
             config,
             clock,
-            ["BTC-USD", "ETH-USD"],
-            {"BTC-USD": checkpoint(1000), "ETH-USD": checkpoint(7000, symbol="ETH-USD")},
+            ["BTC-USDT", "ETH-USDT"],
+            {"BTC-USDT": checkpoint(1000), "ETH-USDT": checkpoint(7000, symbol="ETH-USDT")},
         )
         adapter.bind(out)
 
@@ -578,27 +578,27 @@ class TestAdapterIntegration:
         await settle()
 
         states = {s: sync.state for s, sync in adapter.sync_stats.items()}
-        assert states == {"BTC-USD": SyncState.LIVE, "ETH-USD": SyncState.LIVE}
+        assert states == {"BTC-USDT": SyncState.LIVE, "ETH-USDT": SyncState.LIVE}
 
         # Resyncing BTC leaves ETH exactly where it was.
-        eth_before = adapter.sync_stats["ETH-USD"].snapshots_applied
-        await adapter.request_resync("BTC-USD", "gap")
+        eth_before = adapter.sync_stats["ETH-USDT"].snapshots_applied
+        await adapter.request_resync("BTC-USDT", "gap")
         await settle()
-        assert adapter.sync_stats["ETH-USD"].snapshots_applied == eth_before
-        assert adapter.sync_stats["ETH-USD"].resyncs == 0
-        assert adapter.sync_stats["BTC-USD"].resyncs == 1
+        assert adapter.sync_stats["ETH-USDT"].snapshots_applied == eth_before
+        assert adapter.sync_stats["ETH-USDT"].resyncs == 0
+        assert adapter.sync_stats["BTC-USDT"].resyncs == 1
 
     async def test_a_reconnect_restarts_every_book(self, config):
         clock = ManualClock(START_MS)
         out = Recorder()
-        adapter = OfflineVenueA(config, clock, ["BTC-USD"], {"BTC-USD": checkpoint(1000)})
+        adapter = OfflineVenueA(config, clock, ["BTC-USDT"], {"BTC-USDT": checkpoint(1000)})
         adapter.bind(out)
         await adapter.handle_payload(depth_payload("BTCUSDT", 1001, 1002))
         await settle()
-        assert adapter.sync_stats["BTC-USD"].state is SyncState.LIVE
+        assert adapter.sync_stats["BTC-USDT"].state is SyncState.LIVE
 
         await adapter.on_connected()
-        assert adapter.sync_stats["BTC-USD"].state is SyncState.IDLE, (
+        assert adapter.sync_stats["BTC-USDT"].state is SyncState.IDLE, (
             "a new socket is a new stream position; the old book cannot be kept"
         )
 
@@ -610,7 +610,7 @@ class TestAdapterIntegration:
 
         clock = ManualClock(START_MS)
         out = Recorder()
-        adapter = OfflineVenueA(config, clock, ["BTC-USD"], {"BTC-USD": checkpoint(1000)})
+        adapter = OfflineVenueA(config, clock, ["BTC-USDT"], {"BTC-USDT": checkpoint(1000)})
         adapter.bind(out)
         await adapter.handle_payload(
             json.dumps(
@@ -634,7 +634,7 @@ class TestAdapterIntegration:
 
     def test_the_checkpoint_limit_is_one_the_endpoint_accepts(self, config):
         clock = ManualClock(START_MS)
-        adapter = OfflineVenueA(config, clock, ["BTC-USD"], {})
+        adapter = OfflineVenueA(config, clock, ["BTC-USDT"], {})
         allowed = {5, 10, 20, 50, 100, 500, 1000, 5000}
         for levels in (1, 3, 25, 60, 400, 2500, 5000):
             adapter.config = config.model_copy(update={"book_depth_levels": levels})
