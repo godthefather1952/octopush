@@ -92,13 +92,22 @@ class TestBookMaintenance:
         book.apply_snapshot(make_book("VENUE_A", "BTC-USD", 100.0, levels=5, tick=1.0))
         assert book.synced and not book.needs_resync and book.usable
 
-    def test_depth_is_trimmed(self):
+    def test_depth_is_trimmed_on_read_not_in_storage(self):
+        """TIDAL-M1: trimming is a read boundary, not a storage limit.
+
+        The old behavior discarded anything past ``max_depth`` on every
+        write, so a level just outside the top-N was gone for good even
+        though the venue never deleted it. Storage must hold everything;
+        only ``levels()``/``snapshot()`` may cut it down.
+        """
         book = LocalOrderBook(venue="V", symbol="BTC-USD", max_depth=3)
         book.apply_snapshot(make_book("V", "BTC-USD", 100.0, levels=10, tick=1.0))
-        assert len(book.bids) == 3
-        assert len(book.asks) == 3
-        # The levels kept are the ones nearest the touch.
-        assert max(book.bids) == pytest.approx(99.99)
+        assert len(book.bids) == 10, "storage must keep every level the venue sent"
+        assert len(book.asks) == 10
+        assert len(book.levels(Side.BUY)) == 3, "reads still default to max_depth"
+        assert len(book.levels(Side.SELL)) == 3
+        # The levels a default read returns are the ones nearest the touch.
+        assert max(level.price for level in book.levels(Side.BUY)) == pytest.approx(99.99)
 
     def test_crossed_book_is_not_usable(self, book):
         book.asks = {99.0: 1.0}

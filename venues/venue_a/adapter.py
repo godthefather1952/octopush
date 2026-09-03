@@ -8,7 +8,7 @@ import logging
 from core.clock import Clock
 from core.config import VenueConfig
 from core.models.market import OrderBookSnapshot
-from venues.base.messages import BookDelta
+from venues.base.messages import BookDelta, MalformedVenueMessage
 from venues.base.symbols import denormalize
 from venues.base.ws import WebSocketAdapter
 from venues.venue_a import parser
@@ -69,12 +69,25 @@ class VenueAAdapter(WebSocketAdapter):
     async def handle_payload(self, payload: str) -> None:
         try:
             message = json.loads(payload)
-        except json.JSONDecodeError:
-            self.stats.errors += 1
+        except json.JSONDecodeError as exc:
+            self.stats.record_malformed(
+                MalformedVenueMessage(str(exc), venue=self.name),
+                book_invalidated=False,
+                resync_requested=False,
+            )
             return
-        parsed = parser.parse_message(message, self.clock.now_ms())
+        try:
+            parsed = parser.parse_message(message, self.clock.now_ms())
+        except MalformedVenueMessage as exc:
+            await self._contain(exc)
+            return
         if parsed is None:
             return
+        # Proof of life for backoff purposes (TIDAL-M5): a message this venue
+        # actually cares about, successfully parsed — not merely valid JSON,
+        # and (since unknown types return None above, before this line) not a
+        # message type this venue ignores either.
+        self.mark_healthy()
         if isinstance(parsed, BookDelta):
             synchronizer = self._sync.get(parsed.symbol)
             if synchronizer is None:
@@ -84,6 +97,27 @@ class VenueAAdapter(WebSocketAdapter):
             await synchronizer.on_delta(parsed)
             return
         await self.emit(parsed)
+
+    async def _contain(self, exc: MalformedVenueMessage) -> None:
+        """TIDAL-M4: isolate one malformed message without dropping the venue.
+
+        A malformed ``depthUpdate`` may have hidden a real book change that
+        this symbol's book will now never see — its continuity is uncertain
+        in exactly the way a sequence gap's is, so it gets the same recovery:
+        a resync request through the existing synchronizer, not a socket
+        reset. A malformed trade print, or an envelope too broken to even
+        name a message type, carries no book information either way, so
+        nothing beyond counting the error is warranted.
+        """
+        resync_requested = False
+        if exc.message_type == "depthUpdate" and exc.symbol is not None:
+            synchronizer = self._sync.get(exc.symbol)
+            if synchronizer is not None:
+                resync_requested = True
+                await synchronizer.request_resync(f"malformed depth message: {exc}")
+        self.stats.record_malformed(
+            exc, book_invalidated=False, resync_requested=resync_requested
+        )
 
     async def request_resync(self, symbol: str, reason: str = "") -> None:
         synchronizer = self._sync.get(symbol)

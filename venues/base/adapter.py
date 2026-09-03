@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 from core.clock import Clock
 from core.config import VenueConfig
-from venues.base.messages import RawMessage, VenueMessage
+from venues.base.messages import MalformedVenueMessage, RawMessage, VenueMessage
 
 Emit = Callable[[VenueMessage], Awaitable[None]]
 EmitRaw = Callable[[RawMessage], Awaitable[None]]
@@ -39,6 +39,38 @@ class VenueCapabilities:
     authenticated: bool = False
 
 
+@dataclass(frozen=True)
+class MalformedContext:
+    """What a malformed-message containment decision actually did.
+
+    Exists so an operator (or a test) can answer, without re-reading a raw
+    payload: which venue and symbol, what kind of message, why it was
+    rejected, and whether that rejection escalated into invalidating a book
+    or requesting a resync/reconnect (TIDAL-M4's error-visibility
+    requirement). Bounded and structured on purpose — no raw frame content.
+    """
+
+    venue: str
+    symbol: str | None
+    message_type: str | None
+    detail: str
+    book_invalidated: bool
+    resync_requested: bool
+
+
+class ContinuityUncertain(RuntimeError):
+    """Raised to force a reconnect when a malformed message leaves local book
+    state impossible to trust and there is no narrower recovery available.
+
+    Coinbase's public feed has no per-symbol resubscribe that reliably yields
+    a fresh snapshot (see the Batch 3 report) — a full reconnect is the only
+    verified way to re-establish one. Raising this from ``handle_payload``
+    lets it propagate out of ``_session()`` into the existing, already-tested
+    reconnect machinery in :meth:`WebSocketAdapter.run` rather than
+    duplicating disconnect/backoff/resubscribe logic at the call site.
+    """
+
+
 @dataclass
 class ConnectionStats:
     connected: bool = False
@@ -49,6 +81,23 @@ class ConnectionStats:
     errors: int = 0
     last_message_ts: int | None = None
     last_error: str | None = None
+    #: The most recent malformed-message containment decision. ``None`` until
+    #: the first one occurs.
+    last_malformed: MalformedContext | None = None
+
+    def record_malformed(
+        self, exc: MalformedVenueMessage, *, book_invalidated: bool, resync_requested: bool
+    ) -> None:
+        self.errors += 1
+        self.last_error = str(exc)[:300]
+        self.last_malformed = MalformedContext(
+            venue=exc.venue or "",
+            symbol=exc.symbol,
+            message_type=exc.message_type,
+            detail=str(exc)[:300],
+            book_invalidated=book_invalidated,
+            resync_requested=resync_requested,
+        )
 
 
 class VenueAdapter(ABC):

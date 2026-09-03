@@ -16,8 +16,14 @@ from core.models.common import Base, DataQuality, Envelope, Millis, Side
 
 
 class PriceLevel(Base):
-    price: float = Field(gt=0)
-    size: float = Field(ge=0)
+    #: ``allow_inf_nan=False`` closes TIDAL-M3: without it, ``gt=0``/``ge=0``
+    #: reject NaN and -inf (Python's ordering comparisons are false against
+    #: NaN, and -inf fails gt/ge 0) but let +inf through, since +inf > 0 and
+    #: +inf >= 0 are both true. An infinite price or size would make a level's
+    #: notional infinite and corrupt every sum built from it downstream —
+    #: exactly the "rely on downstream math to fail" this forbids.
+    price: float = Field(gt=0, allow_inf_nan=False)
+    size: float = Field(ge=0, allow_inf_nan=False)
 
     @property
     def notional(self) -> float:
@@ -87,8 +93,8 @@ class TradeEvent(Base):
     symbol: str
     exchange_ts: Millis
     received_ts: Millis
-    price: float = Field(gt=0)
-    size: float = Field(gt=0)
+    price: float = Field(gt=0, allow_inf_nan=False)
+    size: float = Field(gt=0, allow_inf_nan=False)
     #: Side of the aggressor.
     aggressor: Side
     trade_id: str | None = None

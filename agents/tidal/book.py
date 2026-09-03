@@ -21,7 +21,25 @@ class BookDesyncError(RuntimeError):
 
 @dataclass
 class LocalOrderBook:
-    """One venue's L2 book for one symbol."""
+    """One venue's L2 book for one symbol.
+
+    ``bids``/``asks`` hold the **full** locally known book — every level ever
+    inserted and not yet deleted, with no depth limit. ``max_depth`` is a read
+    boundary, applied only in :meth:`levels` (and, through it, in
+    :meth:`snapshot` and every metric that reads the book). It is not applied
+    to storage.
+
+    This used to trim the authoritative dicts to ``max_depth`` after every
+    delta. That silently discarded whatever was beyond the configured depth,
+    so a level sitting just outside the top-N was gone even though the venue
+    never told anyone it was deleted — and if the levels ahead of it later
+    vanished (a real, ordinary sequence of trades and cancels), it should have
+    resurfaced into the top-N with its real, already-known size. Instead it
+    reappeared only once a fresh update happened to touch it again, or not at
+    all until the next snapshot (TIDAL-M1). Trimming on write conflated "how
+    much of the book do I keep" with "how much of the book do I show", and
+    only the second question has a good reason for a fixed answer.
+    """
 
     venue: str
     symbol: str
@@ -64,7 +82,6 @@ class LocalOrderBook:
         self.needs_resync = False
         self.awaiting_first_delta = True
         self.updates_applied += 1
-        self._trim()
 
     def _desync(self, detail: str) -> BookDesyncError:
         self.sequence_gaps += 1
@@ -186,7 +203,6 @@ class LocalOrderBook:
         self.last_update_ts = delta.received_ts
         self.updates_applied += 1
         self.awaiting_first_delta = False
-        self._trim()
 
     @staticmethod
     def _set(side: dict[float, float], level: PriceLevel) -> None:
@@ -194,15 +210,6 @@ class LocalOrderBook:
             side.pop(level.price, None)
         else:
             side[level.price] = level.size
-
-    def _trim(self) -> None:
-        """Keep only the top ``max_depth`` levels per side."""
-        if len(self.bids) > self.max_depth:
-            keep = sorted(self.bids, reverse=True)[: self.max_depth]
-            self.bids = {p: self.bids[p] for p in keep}
-        if len(self.asks) > self.max_depth:
-            keep = sorted(self.asks)[: self.max_depth]
-            self.asks = {p: self.asks[p] for p in keep}
 
     def invalidate(self, reason: str = "") -> None:
         self.synced = False
@@ -229,10 +236,18 @@ class LocalOrderBook:
         return self.synced and not self.crossed and bool(self.bids) and bool(self.asks)
 
     def levels(self, side: Side, depth: int | None = None) -> list[PriceLevel]:
+        """Best-first levels on one side, trimmed to ``depth``.
+
+        ``depth=None`` (the default) trims to ``max_depth`` rather than
+        returning the whole book — every existing caller wants a bounded read,
+        and "no limit" is not a case anything here needs. The full book is
+        still reachable directly via ``self.bids``/``self.asks`` for the rare
+        caller that genuinely wants that (none does today).
+        """
         source = self.bids if side is Side.BUY else self.asks
         prices = sorted(source, reverse=side is Side.BUY)
-        if depth is not None:
-            prices = prices[:depth]
+        limit = self.max_depth if depth is None else depth
+        prices = prices[:limit]
         return [PriceLevel(price=p, size=source[p]) for p in prices]
 
     def snapshot(self, now_ms: Millis, *, depth: int | None = None) -> OrderBookSnapshot:
@@ -242,7 +257,7 @@ class LocalOrderBook:
             exchange_ts=self.exchange_ts or now_ms,
             received_ts=self.last_update_ts or now_ms,
             sequence=self.sequence,
-            bids=self.levels(Side.BUY, depth or self.max_depth),
-            asks=self.levels(Side.SELL, depth or self.max_depth),
+            bids=self.levels(Side.BUY, depth),
+            asks=self.levels(Side.SELL, depth),
             is_checkpoint=True,
         )

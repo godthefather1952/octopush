@@ -50,6 +50,36 @@ class BookDelta(Base):
         return self.first_sequence is not None and self.sequence is not None
 
 
+class MalformedVenueMessage(ValueError):
+    """One venue payload could not be turned into a trusted market-data record.
+
+    Raised by a venue parser and caught at the adapter boundary, never left to
+    propagate into ``_session()`` — a malformed message is this venue's
+    problem for one message, not a reason to drop the whole connection
+    (TIDAL-M4).
+
+    Carries whatever the parser had already established before the failure —
+    symbol, and which kind of message this was — so the adapter can decide
+    what the failure means for book continuity without re-parsing or
+    guessing. ``message_type`` uses each venue's own vocabulary for "what kind
+    of message was this" (Binance's ``e``, Coinbase's ``type``), since that is
+    what a venue-specific containment policy needs to key on.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        venue: str | None = None,
+        symbol: str | None = None,
+        message_type: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.venue = venue
+        self.symbol = symbol
+        self.message_type = message_type
+
+
 class ResyncRequest(Base):
     """A request to re-establish one book from a fresh venue checkpoint.
 
@@ -93,6 +123,7 @@ VenueMessage = OrderBookSnapshot | BookDelta | TradeEvent | VenueStatus
 
 __all__ = [
     "BookDelta",
+    "MalformedVenueMessage",
     "OrderBookSnapshot",
     "RawMessage",
     "ResyncRequest",

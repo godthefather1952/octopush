@@ -16,7 +16,12 @@ from typing import Any
 
 from core.clock import Clock
 from core.config import VenueConfig
-from venues.base.adapter import ReconnectPolicy, VenueAdapter, VenueCapabilities
+from venues.base.adapter import (
+    ContinuityUncertain,
+    ReconnectPolicy,
+    VenueAdapter,
+    VenueCapabilities,
+)
 from venues.base.messages import VenueStatus, VenueStatusKind
 
 log = logging.getLogger(__name__)
@@ -48,6 +53,23 @@ class WebSocketAdapter(VenueAdapter):
     async def handle_payload(self, payload: str) -> None:
         """Parse one raw frame and emit normalised messages."""
 
+    def mark_healthy(self) -> None:
+        """Declare the current connection has proven itself.
+
+        Call this from ``handle_payload`` once a message has been parsed into
+        a real market-data record — not merely valid JSON, and not a
+        heartbeat or other message this venue ignores; see the module
+        docstring on why that distinction matters (TIDAL-M5).
+
+        Resetting backoff unconditionally on a successful handshake — the old
+        behaviour — could not tell a connection that immediately closes
+        afterward from one that runs for an hour: both reset the delay to its
+        minimum, so a socket that is accepted and then instantly rejected
+        reconnects at roughly 1 Hz forever instead of backing off. Backoff now
+        resets only once this connection has actually delivered something.
+        """
+        self.reconnect.reset()
+
     # -- driver ------------------------------------------------------------
 
     async def run(self) -> None:
@@ -56,6 +78,16 @@ class WebSocketAdapter(VenueAdapter):
                 await self._session()
             except asyncio.CancelledError:
                 raise
+            except ContinuityUncertain as exc:
+                # The error itself was already counted at the point a
+                # containment decision chose to force this reconnect
+                # (TIDAL-M4); counting it again here would double it for what
+                # is really one problem surfacing through one mechanism.
+                self.stats.last_error = str(exc)
+                log.warning(
+                    "venue session reconnecting: continuity uncertain",
+                    extra={"venue": self.name, "error": str(exc)},
+                )
             except Exception as exc:
                 self.stats.errors += 1
                 self.stats.last_error = str(exc)
@@ -89,7 +121,6 @@ class WebSocketAdapter(VenueAdapter):
             self.stats.connects += 1
             if self.stats.connects > 1:
                 self.stats.reconnects += 1
-            self.reconnect.reset()
             await self.on_connected()
             await self.emit(
                 VenueStatus(
