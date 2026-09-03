@@ -34,8 +34,17 @@ class LocalOrderBook:
     synced: bool = False
     sequence_gaps: int = 0
     updates_applied: int = 0
+    #: Range-sequenced messages that re-covered ground already applied, outside
+    #: the one position after a snapshot where the protocol expects it. Lossless
+    #: (quantities are absolute) but not normal, so it is counted rather than
+    #: ignored.
+    overlapping_updates: int = 0
     #: Set when a gap is seen, cleared by the next checkpoint.
     needs_resync: bool = False
+    #: True between a snapshot and the first delta applied on top of it.
+    #: Range-sequenced feeds relax the continuity rule for exactly that one
+    #: update; see :meth:`apply_delta`.
+    awaiting_first_delta: bool = False
 
     # -- mutation ----------------------------------------------------------
 
@@ -47,8 +56,65 @@ class LocalOrderBook:
         self.last_update_ts = snapshot.received_ts
         self.synced = True
         self.needs_resync = False
+        self.awaiting_first_delta = True
         self.updates_applied += 1
         self._trim()
+
+    def _desync(self, detail: str) -> BookDesyncError:
+        self.sequence_gaps += 1
+        self.synced = False
+        self.needs_resync = True
+        return BookDesyncError(f"{self.venue}:{self.symbol} sequence gap: {detail}")
+
+    def _check_range(self, delta: BookDelta) -> bool:
+        """Validate a range-sequenced delta. False means "already covered".
+
+        ``first_sequence..sequence`` is the inclusive span of update ids this
+        one message carries, so the question is not "does it start exactly
+        where we stopped" but "does it contain the next id we still need".
+
+        Held id ``H``, so the next id needed is ``H + 1``:
+
+        * ``sequence < H + 1``      — the whole span is behind us. Drop it.
+        * ``first_sequence > H + 1`` — the span starts past what we need, so
+          the ids in between were never delivered. That is a real gap.
+        * otherwise the span straddles ``H + 1`` and applying it loses nothing.
+
+        Straddling is the normal shape of the first message after a snapshot
+        (Binance's ``U <= lastUpdateId + 1 <= u``), and is a protocol violation
+        afterwards. It is tolerated in both positions rather than only the
+        first because these deltas carry *absolute* level quantities, not
+        increments: re-covering ground already applied rewrites levels to the
+        same values it just wrote. Overlap cannot corrupt the book; only a gap
+        can, and a gap is still refused. Overlap outside the first position is
+        counted so it stays visible instead of merely tolerated.
+        """
+        assert delta.first_sequence is not None and delta.sequence is not None
+        if self.sequence is None:
+            return True
+        needed = self.sequence + 1
+        if delta.sequence < needed:
+            return False
+        if delta.first_sequence > needed:
+            raise self._desync(
+                f"have {self.sequence}, next message covers "
+                f"{delta.first_sequence}..{delta.sequence}"
+            )
+        if delta.first_sequence < needed and not self.awaiting_first_delta:
+            self.overlapping_updates += 1
+        return True
+
+    def _check_point(self, delta: BookDelta) -> bool:
+        """Validate a point-sequenced delta. False means "already covered"."""
+        if self.sequence is None or delta.sequence is None:
+            return True
+        if delta.sequence <= self.sequence:
+            # Duplicate or out-of-order replay of something already applied.
+            return False
+        expected = delta.prev_sequence
+        if expected is not None and expected != self.sequence:
+            raise self._desync(f"have {self.sequence}, update expects {expected}")
+        return True
 
     def apply_delta(self, delta: BookDelta) -> None:
         """Apply an incremental update.
@@ -59,19 +125,11 @@ class LocalOrderBook:
         """
         if not self.synced:
             raise BookDesyncError(f"{self.venue}:{self.symbol} has no snapshot yet")
-        if delta.sequence is not None and self.sequence is not None:
-            if delta.sequence <= self.sequence:
-                # Duplicate or out-of-order replay of something already applied.
-                return
-            expected = delta.prev_sequence
-            if expected is not None and expected != self.sequence:
-                self.sequence_gaps += 1
-                self.synced = False
-                self.needs_resync = True
-                raise BookDesyncError(
-                    f"{self.venue}:{self.symbol} sequence gap: "
-                    f"have {self.sequence}, update expects {expected}"
-                )
+        applicable = (
+            self._check_range(delta) if delta.covers_range else self._check_point(delta)
+        )
+        if not applicable:
+            return
         for level in delta.bids:
             self._set(self.bids, level)
         for level in delta.asks:
@@ -81,6 +139,7 @@ class LocalOrderBook:
         self.exchange_ts = delta.exchange_ts
         self.last_update_ts = delta.received_ts
         self.updates_applied += 1
+        self.awaiting_first_delta = False
         self._trim()
 
     @staticmethod
@@ -102,6 +161,7 @@ class LocalOrderBook:
     def invalidate(self, reason: str = "") -> None:
         self.synced = False
         self.needs_resync = True
+        self.awaiting_first_delta = False
 
     # -- reads -------------------------------------------------------------
 

@@ -49,7 +49,15 @@ class TestSymbolNormalisation:
 
 
 class TestVenueAParser:
-    def test_depth_update_becomes_a_delta_with_sequence_continuity(self):
+    def test_depth_update_keeps_the_whole_update_id_range(self):
+        """``U`` and ``u`` are a span, and both ends have to survive parsing.
+
+        This previously asserted ``prev_sequence == 100`` — the span collapsed
+        to the single point below ``U``. That threw away the width of the
+        range, and the width is exactly what the post-snapshot handshake
+        (``U <= lastUpdateId + 1 <= u``) is a test of, so the handshake could
+        never be satisfied (TIDAL-H1).
+        """
         delta = parser_a.parse_depth_update(
             {
                 "e": "depthUpdate",
@@ -63,9 +71,12 @@ class TestVenueAParser:
             START_MS + 5,
         )
         assert delta.symbol == "BTC-USD"
+        assert delta.first_sequence == 101
         assert delta.sequence == 105
-        # The delta expects to sit directly on top of update 100.
-        assert delta.prev_sequence == 100
+        assert delta.covers_range
+        # The point convention is not used by this feed, and asserting it is
+        # absent is what stops the collapse from being reintroduced.
+        assert delta.prev_sequence is None
         assert [level.price for level in delta.bids] == [110000.10, 110000.00]
         # A zero size survives parsing: it is a deletion, not noise.
         assert delta.bids[1].size == 0.0

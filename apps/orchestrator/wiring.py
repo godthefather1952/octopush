@@ -36,7 +36,13 @@ from storage import EventStore, Recorder, build_store
 from strategies.consensus import ConsensusEngine
 from strategies.cross_venue import CrossVenueDetector
 from venues.base.adapter import VenueAdapter
-from venues.base.messages import BookDelta, RawMessage, VenueStatus, VenueStatusKind
+from venues.base.messages import (
+    BookDelta,
+    RawMessage,
+    ResyncRequest,
+    VenueStatus,
+    VenueStatusKind,
+)
 from venues.registry import build_adapter
 from venues.simulated import SimulatedMarketDriver, SimulatedVenueAdapter
 
@@ -103,6 +109,35 @@ class VenueFeedPublisher:
         )
 
 
+class ResyncBridge:
+    """Routes a resync request from the bus to the adapter that owns the feed.
+
+    This is the whole of TIDAL's coupling to the venue layer: TIDAL publishes
+    "this book needs re-establishing" and something in the composition root —
+    the only place allowed to know both sides — hands it to the right adapter.
+    TIDAL never learns an adapter exists, and the adapter never learns the bus
+    exists.
+
+    A request naming an unknown venue is dropped rather than raised on: it can
+    only come from a recording made against a different venue set, and a
+    replay of that recording should not die on it.
+    """
+
+    def __init__(self, adapters: dict[str, VenueAdapter]) -> None:
+        self.adapters = adapters
+        self.forwarded = 0
+        self.unknown_venue = 0
+
+    async def __call__(self, event: Event) -> None:
+        request = ResyncRequest.model_validate(event.payload)
+        adapter = self.adapters.get(request.venue)
+        if adapter is None:
+            self.unknown_venue += 1
+            return
+        self.forwarded += 1
+        await adapter.request_resync(request.symbol, request.reason)
+
+
 @dataclass
 class Platform:
     """Every component, wired and ready to run."""
@@ -132,6 +167,7 @@ class Platform:
     publishers: dict[str, VenueFeedPublisher] = field(default_factory=dict)
     sim_driver: SimulatedMarketDriver | None = None
     market_generator: SyntheticMarket | None = None
+    resync_bridge: ResyncBridge | None = None
     _started: bool = False
     _recording: bool = False
 
@@ -295,6 +331,16 @@ def build_platform(
         adapters[venue_config.name] = adapter
         publishers[venue_config.name] = publisher
 
+    # Recovery path for a gapped book: TIDAL publishes the request, this hands
+    # it to the adapter that owns the feed. Registered after the adapters exist
+    # so the bridge sees the whole set.
+    resync_bridge = ResyncBridge(adapters)
+    bus.subscribe(
+        resync_bridge,
+        types=[EventType.BOOK_RESYNC_REQUESTED],
+        name="venue-resync",
+    )
+
     sim_driver = None
     simulated = {
         name: adapter
@@ -339,6 +385,7 @@ def build_platform(
         publishers=publishers,
         sim_driver=sim_driver,
         market_generator=generator,
+        resync_bridge=resync_bridge,
     )
 
 

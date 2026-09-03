@@ -89,6 +89,17 @@ class VenueConfig(BaseModel):
     cancel_latency_ms: int = Field(default=60, ge=0, le=60_000)
     #: Book depth to maintain per side, in price levels.
     book_depth_levels: int = Field(default=25, gt=0, le=5_000)
+    #: Depth updates held per symbol while a REST checkpoint is in flight.
+    #: Bounded on purpose: a buffer that grows without limit turns a slow
+    #: checkpoint into an out-of-memory failure. At ~10 depth messages a
+    #: second this is minutes of headroom.
+    depth_sync_max_buffer: int = Field(default=2_000, gt=0, le=200_000)
+    #: Checkpoint attempts before a symbol is declared unsynchronisable and
+    #: left unusable until the feed reconnects.
+    depth_sync_max_attempts: int = Field(default=8, gt=0, le=100)
+    #: Floor on the interval between checkpoint fetches for one symbol, so a
+    #: book that keeps gapping cannot turn into a REST request storm.
+    depth_sync_min_interval_s: float = Field(default=5.0, ge=0.0, le=600.0)
     enabled: bool = True
     symbols: list[str] = Field(default_factory=lambda: ["BTC-USD", "ETH-USD"])
 

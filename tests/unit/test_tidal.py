@@ -54,7 +54,13 @@ class TestBookMaintenance:
         book.apply_delta(delta(seq=2, prev=1, bids=[(99.99, 0.0)]))
         assert 99.99 not in book.bids
 
-    def test_sequence_gap_desyncs_and_requests_resync(self, book):
+    def test_sequence_gap_desyncs_the_book(self, book):
+        # Named for what it checks. It used to be called
+        # "..._and_requests_resync" while asserting only that a flag was set —
+        # and no resync was ever requested, which is how TIDAL-C2 survived. The
+        # recovery this name promised is now asserted end to end in
+        # tests/unit/test_resync_flow.py.
+        #
         # The update expects to sit on sequence 5, but we hold 1: applying it
         # would silently corrupt the book.
         with pytest.raises(BookDesyncError):

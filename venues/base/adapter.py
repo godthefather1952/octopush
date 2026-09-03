@@ -96,6 +96,23 @@ class VenueAdapter(ABC):
     async def run(self) -> None:
         """Stream until cancelled, reconnecting on failure."""
 
+    async def request_resync(self, symbol: str, reason: str = "") -> None:
+        """Re-establish one symbol's book from a fresh public checkpoint.
+
+        The default does nothing, which is the correct behaviour for a feed
+        that carries its own snapshots (it recovers on resubscribe) and for
+        one with no checkpoint endpoint at all.
+
+        This asks a venue for public market data and nothing else. It takes a
+        symbol, returns nothing, and has no counterpart that could act on an
+        account — the interface still declares no way to submit, amend or
+        cancel an order.
+        """
+        # Concrete and doing nothing, not abstract: a feed with no checkpoint
+        # endpoint has nothing to implement, and forcing it to write an empty
+        # override would say less than this does.
+        return None
+
     async def start(self) -> None:
         if self._task is not None:
             return

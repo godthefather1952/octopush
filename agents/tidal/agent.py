@@ -30,7 +30,7 @@ from core.models.market import (
 )
 from core.models.opportunity import Opportunity
 from core.models.ops import HealthStatus, Severity, SystemEvent
-from venues.base.messages import BookDelta, VenueStatus
+from venues.base.messages import BookDelta, ResyncRequest, VenueStatus
 
 log = logging.getLogger(__name__)
 
@@ -61,8 +61,17 @@ class Tidal:
         self.latency_ms: dict[tuple[str, str], float] = {}
         self.updates_since_checkpoint: dict[tuple[str, str], int] = {}
         self.desyncs = 0
+        self.resync_requests = 0
+        #: When a resync was last asked for, per book. A gap usually arrives as
+        #: a burst — every subsequent delta hits the same unsynchronised book —
+        #: and one request per message would be a request storm aimed at
+        #: whoever owns the feed.
+        self._resync_requested_ms: dict[tuple[str, str], Millis] = {}
         self.state: MarketState | None = None
         health.register(SERVICE, VERSION)
+
+    #: Floor on the interval between resync requests for one book, in ms.
+    resync_request_interval_ms: Millis = 5_000
 
     # -- wiring ------------------------------------------------------------
 
@@ -121,6 +130,37 @@ class Tidal:
                 if venue == status.venue:
                     book.invalidate("venue disconnected")
 
+    async def request_resync(self, venue: str, symbol: str, reason: str = "") -> None:
+        """Ask whoever owns this feed for a fresh checkpoint.
+
+        Published as an event rather than called on an adapter. TIDAL holds no
+        adapter reference and gains none here: it states that one book needs
+        re-establishing, and whatever owns that feed decides what to do about
+        it. That is the whole reason recovery is expressible at all — TIDAL
+        cannot reach the venue, and should not be able to.
+
+        Rate-limited per book, because a gap is reported by every delta that
+        follows it until a snapshot lands.
+        """
+        key = (venue, symbol)
+        now = self.clock.now_ms()
+        last = self._resync_requested_ms.get(key)
+        if last is not None and now - last < self.resync_request_interval_ms:
+            return
+        self._resync_requested_ms[key] = now
+        self.resync_requests += 1
+        await self.bus.publish(
+            Event(
+                type=EventType.BOOK_RESYNC_REQUESTED,
+                ts_ms=now,
+                source=SERVICE,
+                schema_name="ResyncRequest",
+                payload=ResyncRequest(
+                    venue=venue, symbol=symbol, requested_at=now, reason=reason
+                ).to_json_dict(),
+            )
+        )
+
     def _record_latency(
         self, key: tuple[str, str], exchange_ts: Millis, received_ts: Millis
     ) -> None:
@@ -150,6 +190,7 @@ class Tidal:
                 str(exc),
                 {"venue": delta.venue, "symbol": delta.symbol},
             )
+            await self.request_resync(delta.venue, delta.symbol, str(exc))
             return
         self.updates_since_checkpoint[key] = self.updates_since_checkpoint.get(key, 0) + 1
         self._record_latency(key, delta.exchange_ts, delta.received_ts)

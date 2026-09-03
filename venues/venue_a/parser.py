@@ -38,18 +38,19 @@ def _levels(raw: list[Any], *, descending: bool) -> list[PriceLevel]:
 def parse_depth_update(data: dict[str, Any], received_ts: Millis) -> BookDelta:
     """``depthUpdate`` -> :class:`BookDelta`.
 
-    Binance's ``U``/``u`` are the first and last update ids covered by the
-    message, so the previous book must be at ``U - 1`` for the delta to apply
-    cleanly.
+    ``U`` and ``u`` are the first and last update ids the message covers — a
+    span, not a point. Both are carried through so the book can apply the
+    documented rule against the whole span. This used to collapse to
+    ``prev_sequence = U - 1``, which asserted the span was always exactly one
+    id wide and made the post-snapshot handshake unsatisfiable (TIDAL-H1).
     """
-    first_id = int(data["U"])
     return BookDelta(
         venue=VENUE,
         symbol=normalize(data["s"]),
         exchange_ts=int(data.get("E") or data.get("T") or received_ts),
         received_ts=received_ts,
+        first_sequence=int(data["U"]),
         sequence=int(data["u"]),
-        prev_sequence=first_id - 1,
         bids=_levels(data.get("b", []), descending=True),
         asks=_levels(data.get("a", []), descending=False),
     )

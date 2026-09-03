@@ -23,6 +23,10 @@ class EventType(StrEnum):
     VENUE_CONNECTED = "VENUE_CONNECTED"
     VENUE_DISCONNECTED = "VENUE_DISCONNECTED"
     VENUE_SEQUENCE_GAP = "VENUE_SEQUENCE_GAP"
+    #: TIDAL asking whoever owns a feed to re-establish one book from a fresh
+    #: checkpoint. TIDAL holds no adapter reference, so recovery has to travel
+    #: the same way everything else does — as an event.
+    BOOK_RESYNC_REQUESTED = "BOOK_RESYNC_REQUESTED"
     FEED_STALE = "FEED_STALE"
 
     # --- analysis ---------------------------------------------------------
