@@ -10,13 +10,13 @@ the reported symptom: attribution rows of $2,000-$2,700 each while total
 account equity had only grown by about $430.
 
 The fix accumulates each opportunity's realized P&L one fill at a time, in
-``Orchestrator._on_fill``, as the *delta* in the position's cumulative counter
-since the last fill on that venue:symbol (``_track_realized_delta``) -- a
-value inherently scoped to the fill that produced it, fed only to the
-attribution builder that fill's own ``correlation_id`` names. The baseline is
-advanced on every fill regardless of whether a builder claims it, so an
-untracked (hedge/orphan) fill on the same venue:symbol cannot corrupt the next
-opportunity's delta either.
+``Orchestrator._on_fill``, from ``FillEvent.realized_pnl_delta`` -- captured
+by ``PaperAccount.apply_fill`` at the exact moment it applies that fill, and
+fed only to the attribution builder that fill's own ``correlation_id`` names.
+See ``tests/integration/test_attribution_dispatch_ordering.py`` for a related,
+narrower defect: an earlier version of this fix derived the delta from live
+account state inside the PAPER_FILL handler instead of capturing it at
+application time, which was itself vulnerable to bus dispatch order.
 """
 
 from __future__ import annotations

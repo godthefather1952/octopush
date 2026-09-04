@@ -714,3 +714,52 @@ commit) — recorded in the accompanying validation report rather than
 hardcoded here, since a commit cannot cite its own hash. All of section
 23.5's verification, including the real-Redis/real-Postgres full-suite run,
 was performed against that commit's working tree before it was committed.
+
+## 24. Attribution dispatch-order hardening (post-polish)
+
+Independent review raised a residual concern in the section 23.3 attribution
+fix: it derived each fill's realized-P&L delta *inside* the PAPER_FILL
+handler, by comparing the position's current cumulative `realized_pnl`
+against a remembered per-venue:symbol baseline. `PaperExecutor.poll()`
+applies every live order's fill to `PaperAccount` synchronously as it
+iterates, and `Orchestrator._settle()` calls `bus.drain()` only once, after
+`poll()` returns for the whole cycle — `InMemoryEventBus.publish()` enqueues
+an event, it does not dispatch it. So two fills on the same venue:symbol
+from two *different* opportunities can both mutate the shared position
+before either one's PAPER_FILL handler runs, and whichever handler happens
+to be dispatched first (FIFO order, not application order) would read
+current cumulative state that already reflects both fills.
+
+**Confirmed, not theoretical**: `tests/integration/test_attribution_dispatch_ordering.py`
+reproduces the exact scenario from the review (fill A takes cumulative
+realized P&L 0 → +10, fill B on the same symbol then takes it +10 → +25,
+both applied and queued before either handler runs) using the real
+`InMemoryEventBus`, with no `drain()` between the two fills. Under the
+section 23.3 implementation this attributed +25 to opportunity A and 0 to
+opportunity B — confirmed by mutation-testing (reverting to the baseline
+implementation reproduces 2 of 4 new test failures).
+
+**Fix**: `PaperAccount.apply_fill` now captures each fill's own realized-P&L
+delta (the exact value `PositionState.apply` already returns) directly onto
+the `FillEvent` as `realized_pnl_delta`, before the fill is ever published.
+`Orchestrator._on_fill` reads that value straight off the event instead of
+reconstructing it from live account state, so attribution no longer depends
+on bus dispatch order at all — it is fixed the moment the fill is applied,
+not when its handler happens to run. This also let
+`Orchestrator._track_realized_delta` and its `_realized_baseline` dict be
+removed entirely: the per-venue:symbol bookkeeping they existed for is no
+longer needed once each fill already carries its own answer.
+
+4 new tests cover: two different opportunities closing the same symbol
+without draining between fills; two fills belonging to the same opportunity;
+a hedge fill (no attribution builder) interleaved between two attributed
+fills; and idempotency under a duplicate PAPER_FILL delivery. Full
+re-verification: 1236 passed, 0 failed, 5 skipped (Docker only), with real
+Redis and PostgreSQL exercised; `ruff check .` and
+`mypy --ignore-missing-imports core` both clean. The accounting-proof
+script (section 23.6) was re-run and produced identical, still-reconciling
+numbers.
+
+`PHASE1_FINAL_POLISH_SHA` is the `HEAD` of `phase1-tidal-remediation`
+introduced by this hardening commit, recorded in the accompanying report for
+the same reason `PHASE1_POLISHED_SHA` is not hardcoded here.

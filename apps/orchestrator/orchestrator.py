@@ -123,12 +123,6 @@ class Orchestrator:
     #: inability to persist should.
     storage_failure_threshold: int = 3
     attributions: dict[str, AttributionBuilder] = field(default_factory=dict)
-    #: venue:symbol -> last-observed cumulative ``PositionState.realized_pnl``.
-    #: ``PositionState.realized_pnl`` is a lifetime counter per venue:symbol,
-    #: not per opportunity; the delta since the last fill on a key is that
-    #: fill's own, isolated realized contribution (see
-    #: ``_track_realized_delta``).
-    _realized_baseline: dict[str, float] = field(default_factory=dict)
     #: Opportunity id -> notional currently working, for strategy exposure.
     working_notional: dict[str, float] = field(default_factory=dict)
     #: Symbol -> hedge orders still in flight. OKAPI measures delta from the
@@ -182,34 +176,22 @@ class Orchestrator:
         if not self.state.add_fill(fill):
             return
         self.metrics.observe(M.SLIPPAGE_BPS, fill.slippage_bps, venue=fill.venue)
-        realized_delta = self._track_realized_delta(fill)
         builder = self.attributions.get(fill.correlation_id or "")
         if builder is not None:
             builder.add_fill(fill.notional, fill.fee, fill.slippage_bps)
-            builder.add_realized(realized_delta)
+            # fill.realized_pnl_delta was captured by PaperAccount.apply_fill
+            # at the moment it applied THIS fill -- not re-derived here from
+            # live account state. PAPER_FILL is queued at publish time, not
+            # delivered, so several fills on the same venue:symbol can land
+            # on the account before any of their handlers run; reading
+            # current cumulative state here would attribute whichever fills
+            # happened to apply first to whichever handler happens to run
+            # first, regardless of which fill actually produced it.
+            builder.add_realized(fill.realized_pnl_delta)
         record = self.state.opportunities.get(fill.correlation_id or "")
         if record is not None:
             record.fees += fill.fee
             record.filled_notional += fill.notional
-
-    def _track_realized_delta(self, fill: FillEvent) -> float:
-        """This fill's own contribution to realized P&L, isolated from every
-        other fill ever applied to the same venue:symbol.
-
-        ``PositionState.realized_pnl`` is a lifetime-cumulative counter per
-        venue:symbol: reading it at any one moment mixes in every prior
-        opportunity that ever traded the same symbol. The delta since the
-        last fill on this key is exactly this fill's own contribution. The
-        baseline is updated unconditionally -- whether or not an attribution
-        builder claims this fill -- so a hedge or orphan fill on the same
-        venue:symbol can never corrupt the next opportunity's delta.
-        """
-        key = f"{fill.venue}:{fill.symbol}"
-        position = self.veska.executor.account.positions.get(key)
-        current = position.realized_pnl if position is not None else 0.0
-        delta = current - self._realized_baseline.get(key, 0.0)
-        self._realized_baseline[key] = current
-        return delta
 
     # -- state machine -----------------------------------------------------
 
