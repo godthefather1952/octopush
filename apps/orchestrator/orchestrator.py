@@ -123,6 +123,12 @@ class Orchestrator:
     #: inability to persist should.
     storage_failure_threshold: int = 3
     attributions: dict[str, AttributionBuilder] = field(default_factory=dict)
+    #: venue:symbol -> last-observed cumulative ``PositionState.realized_pnl``.
+    #: ``PositionState.realized_pnl`` is a lifetime counter per venue:symbol,
+    #: not per opportunity; the delta since the last fill on a key is that
+    #: fill's own, isolated realized contribution (see
+    #: ``_track_realized_delta``).
+    _realized_baseline: dict[str, float] = field(default_factory=dict)
     #: Opportunity id -> notional currently working, for strategy exposure.
     working_notional: dict[str, float] = field(default_factory=dict)
     #: Symbol -> hedge orders still in flight. OKAPI measures delta from the
@@ -176,13 +182,34 @@ class Orchestrator:
         if not self.state.add_fill(fill):
             return
         self.metrics.observe(M.SLIPPAGE_BPS, fill.slippage_bps, venue=fill.venue)
+        realized_delta = self._track_realized_delta(fill)
         builder = self.attributions.get(fill.correlation_id or "")
         if builder is not None:
             builder.add_fill(fill.notional, fill.fee, fill.slippage_bps)
+            builder.add_realized(realized_delta)
         record = self.state.opportunities.get(fill.correlation_id or "")
         if record is not None:
             record.fees += fill.fee
             record.filled_notional += fill.notional
+
+    def _track_realized_delta(self, fill: FillEvent) -> float:
+        """This fill's own contribution to realized P&L, isolated from every
+        other fill ever applied to the same venue:symbol.
+
+        ``PositionState.realized_pnl`` is a lifetime-cumulative counter per
+        venue:symbol: reading it at any one moment mixes in every prior
+        opportunity that ever traded the same symbol. The delta since the
+        last fill on this key is exactly this fill's own contribution. The
+        baseline is updated unconditionally -- whether or not an attribution
+        builder claims this fill -- so a hedge or orphan fill on the same
+        venue:symbol can never corrupt the next opportunity's delta.
+        """
+        key = f"{fill.venue}:{fill.symbol}"
+        position = self.veska.executor.account.positions.get(key)
+        current = position.realized_pnl if position is not None else 0.0
+        delta = current - self._realized_baseline.get(key, 0.0)
+        self._realized_baseline[key] = current
+        return delta
 
     # -- state machine -----------------------------------------------------
 
@@ -240,6 +267,7 @@ class Orchestrator:
         market = await self._observe()
         await self._settle(now)
         portfolio = self._measure(market)
+        self._refresh_risk_utilization(portfolio)
 
         if not self.warmed_up:
             self.warmup_ticks += 1
@@ -373,6 +401,27 @@ class Orchestrator:
                 M.AGENT_UP, 1.0 if component.status is HealthStatus.HEALTHY else 0.0, agent=name
             )
         return portfolio
+
+    def _refresh_risk_utilization(self, portfolio: PortfolioState) -> None:
+        """Keep the published risk-utilization snapshot current every tick.
+
+        Before this fix, ``state.risk_utilization`` was set only inside
+        ``_risk_check()`` -- called only while evaluating a *new* trade
+        intent -- so it described the portfolio as of the last new-trade
+        risk evaluation, not the portfolio that exists now. A closed
+        position left stale nonzero exposure on the dashboard indefinitely,
+        until the next new opportunity happened to trigger another risk
+        check (which, with no capital at risk, might never happen again).
+
+        This runs unconditionally, right after ``_measure()`` has marked the
+        portfolio, using the exact same canonical calculation
+        (``RuneCore.utilization``) ``_risk_check`` uses -- one source of
+        truth, called from two places rather than two calculations.
+        """
+        unhedged = self.okapi.total_unhedged(portfolio)
+        self.state.risk_utilization = self.rune.core.utilization(
+            portfolio, unhedged, {STRATEGY: sum(self.working_notional.values())}
+        )
 
     def _storage_ok(self) -> bool:
         """Whether durable event storage is working.
@@ -731,7 +780,7 @@ class Orchestrator:
             hedge_available=self.okapi.hedge_available(intent.symbol, market),
         )
         self.state.risk_utilization = self.rune.core.utilization(
-            portfolio, ctx, {STRATEGY: sum(self.working_notional.values())}
+            portfolio, ctx.unhedged_notional, {STRATEGY: sum(self.working_notional.values())}
         )
         return await self.rune.evaluate(intent, ctx)
 
@@ -1046,13 +1095,10 @@ class Orchestrator:
         builder = self.attributions.pop(record.opportunity.opportunity_id, None)
         if builder is None:
             return
-        portfolio = self.veska.executor.account.snapshot()
-        realized = 0.0
-        for leg in record.opportunity.legs:
-            position = portfolio.positions.get(f"{leg.venue}:{leg.symbol}")
-            if position is not None:
-                realized += position.realized_pnl
-        builder.realized_pnl = realized - record.fees
+        # Realized P&L was already accumulated fill-by-fill, isolated to this
+        # opportunity's own correlation_id, in ``_on_fill`` -- not read here
+        # from a position's lifetime-cumulative counter, which would inherit
+        # every prior opportunity's contribution on the same venue:symbol.
         builder.closed_at = self.clock.now_ms()
         attribution = builder.build()
         record.realized_pnl = attribution.realized_pnl or 0.0

@@ -57,6 +57,18 @@ class TestApi:
         assert "# TYPE tf_events_processed_total counter" in text
         assert "tf_net_pnl" in text
 
+    def test_state_pnl_reconciles_to_the_corrected_portfolio_formula(self, client, platform):
+        """Phase 1 polish: the API must report the same corrected P&L
+        semantics as ``PortfolioState`` itself -- gross before fees, net
+        after -- not a stale or independently-computed value.
+        """
+        body = client.get("/api/state").json()["portfolio"]
+        snap = platform.state.portfolio
+        assert snap is not None
+        assert body["gross_pnl"] == pytest.approx(snap.gross_pnl)
+        assert body["net_pnl"] == pytest.approx(snap.net_pnl)
+        assert body["net_pnl"] == pytest.approx(body["gross_pnl"] - body["fees_paid"])
+
     def test_metrics_json_is_flat(self, client):
         body = client.get("/api/metrics").json()
         assert body
@@ -66,6 +78,16 @@ class TestApi:
         html = client.get("/").text
         assert "PAPER MODE" in html
         assert "Multi-Agent Trading Floor" in html
+
+    def test_dashboard_connection_failure_label_is_unambiguous(self, client):
+        """Phase 1 polish: on an API-fetch failure the dashboard used to show
+        the bare word "disconnected", easily misread as venue/exchange
+        connectivity (which is reported separately, per-venue, in the
+        consolidated table). It must say what actually disconnected.
+        """
+        html = client.get("/").text
+        assert "DASHBOARD DISCONNECTED FROM API" in html
+        assert '"disconnected"' not in html
 
     def test_kill_switch_endpoint_only_stops_things(self, client, platform):
         assert platform.state.kill_switch.trading_allowed

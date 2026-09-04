@@ -201,8 +201,24 @@ class RuneCore:
         return max(0.0, min(candidates))
 
     def utilization(
-        self, portfolio: PortfolioState, ctx: RiskContext, strategy_exposure: dict[str, float]
+        self,
+        portfolio: PortfolioState,
+        unhedged_notional: float,
+        strategy_exposure: dict[str, float],
     ) -> RiskUtilization:
+        """The one canonical risk-utilization snapshot.
+
+        Takes exactly the inputs it actually uses -- ``portfolio`` and
+        ``unhedged_notional`` -- rather than a whole :class:`RiskContext`
+        (which also carries kill-switch/health/consensus fields this
+        calculation never reads). That makes it callable on every tick from
+        current state alone, not only from inside a new-trade risk
+        evaluation: the orchestrator's per-tick refresh
+        (``Orchestrator._refresh_risk_utilization``) and ``_risk_check``'s
+        own call (via ``ctx.unhedged_notional``) both go through this same
+        method, so there is exactly one risk-utilization formula regardless
+        of which caller asks for it.
+        """
         return RiskUtilization(
             gross_exposure=portfolio.gross_exposure,
             max_gross_exposure=self.limits.max_gross_exposure,
@@ -212,7 +228,7 @@ class RuneCore:
             max_day_loss=self.limits.max_daily_loss,
             drawdown=portfolio.drawdown,
             max_drawdown=self.limits.max_drawdown,
-            unhedged_notional=abs(ctx.unhedged_notional),
+            unhedged_notional=abs(unhedged_notional),
             max_unhedged_notional=self.limits.max_unhedged_notional,
             venue_exposure=portfolio.exposure_by_venue(),
             max_venue_exposure=self.limits.max_venue_exposure,

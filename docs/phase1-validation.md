@@ -15,6 +15,16 @@ transient failure). Because that soak is a required condition for the
 declared complete by this session. See section 17 and the final report for
 the exact reasoning and what is needed to finish.
 
+A subsequent polish pass (section 23) fixed three accounting/observability
+defects found in a simulated paper run after the above validation, re-ran
+every deterministic gate (including real Redis and Postgres, this time both
+exercised in the same session as the full suite), and re-checked live
+connectivity once more. The live-soak blocker in section 17 is unchanged —
+still a proxy-level policy denial, re-confirmed rather than assumed — so the
+polish pass does not change this document's bottom line: no
+`phase1-validated` tag, Phase 1 code/data path is polished and green, live
+public-feed soak remains externally blocked.
+
 ## 1. Phase 1 scope
 
 Phase 1 hardens TIDAL — the market-data ingestion, book-synchronisation, and
@@ -439,3 +449,268 @@ data can only come from section 17.
 - No `phase1-validated` tag exists as of this document. See the final
   validation report for the exact reasoning.
 - Validation session date: 2026-09-04.
+
+## 23. Phase 1 polish (accounting and observability fixes)
+
+A simulated paper run after the validation above surfaced three defects in
+how P&L and risk were computed and reported — not in the underlying cash or
+position accounting, which was already correct, but in the derived values
+built on top of it. This section documents each defect, its fix, and the
+proof that the fix is correct, plus a dashboard wording fix and a full
+re-verification.
+
+### 23.1 Portfolio P&L semantics (`core/models/portfolio.py`)
+
+**Symptom:** a flat account with $100,430.48 equity (a $430.48 gain over the
+$100,000 initial balance, after $4,954.40 in fees) reported net P&L of
+$10,339.27 — more than 20x the account's actual gain.
+
+**Root cause:** `PortfolioState.gross_pnl` and `.net_pnl` had the fee
+adjustment backwards:
+
+```python
+gross_pnl = realized_pnl + unrealized_pnl + fees_paid   # added fees BACK on
+net_pnl   = realized_pnl + unrealized_pnl                # never subtracted them
+```
+
+`PositionState.apply()`'s realized-P&L return value, and `unrealized_pnl`,
+are both pre-fee trading P&L; fees are tracked separately in `fees_paid` and
+are already subtracted from cash exactly once, via `FillEvent.cash_delta`.
+The old `net_pnl` was therefore identical to pre-fee P&L (never subtracting
+fees at all), and `gross_pnl` overstated even that by adding the fee total
+back on top a second time. Cash accounting itself was never wrong — only
+these two read-only properties built on top of it.
+
+**Fix:**
+
+```python
+gross_pnl = realized_pnl + unrealized_pnl     # before fees
+net_pnl   = gross_pnl - fees_paid             # after fees -- reality
+```
+
+**Proof:** `tests/unit/test_portfolio_pnl_semantics.py` (9 tests) and one
+added test in `tests/integration/test_api.py`
+(`test_state_pnl_reconciles_to_the_corrected_portfolio_formula`) prove, with
+concrete numeric expectations: a flat profitable round trip, a flat losing
+round trip, an open position (gross includes unrealized, net still
+subtracts the full fee total exactly once), multiple partial fills, mixed
+maker/taker fees, zero fees, no double subtraction between cash and
+`net_pnl`, that the Prometheus `tf_gross_pnl`/`tf_net_pnl` gauges and the
+`/api/state` response use the corrected formula, and that MARIN's
+`recompute_from_fills` reconciliation still agrees. For every flat case,
+`equity - initial_balance == net_pnl` holds to floating-point tolerance —
+the identity the old formula broke. `/api/state` and the dashboard needed no
+code change: both read `PortfolioState.gross_pnl`/`.net_pnl` directly, so
+the fix propagates automatically.
+
+### 23.2 Risk-utilization freshness (`agents/rune/core.py`,
+`apps/orchestrator/orchestrator.py`)
+
+**Symptom:** after a position closed (portfolio gross/net exposure back to
+$0), the dashboard's risk-utilization panel kept showing the position's
+exposure as if it were still open (gross ≈ $50,025, unhedged ≈ $12).
+
+**Root cause:** `state.risk_utilization` was written only inside
+`Orchestrator._risk_check()` — invoked only while evaluating a *new* trade
+intent. It described the portfolio as of the last new-trade risk evaluation,
+not the portfolio that exists right now; once a position closed with no new
+opportunity following it, the stale snapshot could persist indefinitely.
+
+**Fix:** `RuneCore.utilization()` was narrowed to take exactly the inputs it
+uses — `(portfolio, unhedged_notional, strategy_exposure)` — rather than a
+full `RiskContext` (which also carries kill-switch/health/consensus fields
+this calculation never reads), making it callable from anywhere with just
+current state. `Orchestrator._refresh_risk_utilization()` now calls it
+unconditionally on every tick, immediately after the portfolio is marked, in
+addition to `_risk_check()`'s own call on the same method for new-trade
+evaluations. One calculation, two call sites — no second implementation was
+introduced.
+
+**Proof:** `tests/integration/test_risk_utilization_freshness.py` (6 tests):
+utilization reflects an open position; the very next tick after a close
+shows zero portfolio exposure *and* zero risk-utilization exposure, with no
+new trade or risk evaluation involved; unhedged notional tracks a position
+through partial closes down to zero; `/api/state`'s `risk` block matches the
+live snapshot; a 300-tick run shows no regression in RUNE's own gating
+(limits never breached). Mutation-tested: removing the
+`_refresh_risk_utilization` call reproduces 3 of the 6 failures; restoring
+it (verified byte-identical via `diff`) returns all 6 to green.
+
+### 23.3 Trade-attribution P&L leakage (`monitoring/attribution.py`,
+`apps/orchestrator/orchestrator.py`)
+
+**Symptom:** the attribution feed showed repeated trade rows of
+$2,000-$2,700 realized P&L each, while total account equity had grown by
+only about $430 over the whole session — attribution rows summed to many
+times the account's actual result.
+
+**Root cause, confirmed by reading the code (not assumed):**
+`Orchestrator._finish_attribution()` computed a closing opportunity's
+realized P&L by reading `PositionState.realized_pnl` for each leg's
+venue:symbol — but that field is a **lifetime-cumulative** counter per
+venue:symbol, not a per-opportunity one. A second (or later) opportunity
+that traded the same venue:symbol therefore inherited every prior
+opportunity's cumulative realized contribution on top of its own, and the
+inherited amount only grew as more same-symbol opportunities closed —
+exactly the reported symptom.
+
+**Fix (fill-grounded, narrowest correct mechanism — no portfolio-lot
+accounting framework was built):** `Orchestrator._on_fill()` now tracks a
+`dict[str, float]` baseline of the last-observed cumulative
+`PositionState.realized_pnl` per venue:symbol
+(`Orchestrator._realized_baseline`). On every fill, the delta since that
+key's last-seen value is computed — the isolated, per-fill realized
+contribution — and the baseline is advanced **unconditionally**, whether or
+not an attribution builder claims the fill, so a hedge or orphan fill on the
+same venue:symbol can never corrupt a later opportunity's delta. Only when a
+builder exists for the fill's own `correlation_id` is the delta fed to it,
+via a new `AttributionBuilder.add_realized(delta)` method, accumulating into
+a renamed `realized_pnl_gross` field (pre-fee, mirroring the section 23.1
+terminology). `AttributionBuilder.build()` now subtracts `fees` itself,
+moving that computation out of `_finish_attribution`, which no longer reads
+`portfolio.positions` at all.
+
+This design is also correct for **overlapping** opportunities on the same
+venue:symbol (two opportunities open concurrently, sharing one average-cost
+position): because attribution is keyed by which fill produced the P&L, not
+by a snapshot taken at some later close time, each opportunity still gets
+exactly its own contribution regardless of interleaving. No case was
+identified where exact attribution is impossible with fills alone, so no
+"fail closed / unsupported" path was needed.
+
+**Proof:** `tests/integration/test_trade_attribution_isolation.py` (10
+tests): two sequential profitable opportunities on the same venue:symbol
+(the second does not include the first); a profitable trade followed by a
+loss; five sequential same-symbol opportunities each reporting the same
+constant result regardless of how many closed before them; interleaved
+BTC/ETH opportunities that do not cross-contaminate; fees landing on the
+attribution exactly once; partial entry/exit fills all attributed correctly;
+attribution totals across fully-closed non-overlapping opportunities
+reconciling exactly to the account's own net realized result; two
+concurrently-open opportunities on the same symbol each getting their exact
+share of a shared position's realized result; the scorecard recording the
+corrected value; and a direct regression test mirroring the reported bug
+(eight sequential same-symbol trades, each reporting the same small
+constant result rather than a growing cumulative one). Mutation-tested:
+reverting `_finish_attribution` to the old cumulative-read logic reproduces
+9 of the 10 failures; restoring the fix (verified byte-identical) returns
+all 10 to green.
+
+### 23.4 Dashboard connection-label wording (`apps/dashboard/index.html`)
+
+**Symptom:** on a failed `fetch` to the API, the dashboard's "last updated"
+field showed the bare word `"disconnected"`, which reads as venue/exchange
+connectivity (reported separately, per-venue, in the consolidated table) —
+not what actually happened.
+
+**Fix:** presentation-only change to `"DASHBOARD DISCONNECTED FROM API"`.
+No venue-connectivity logic was touched.
+`tests/integration/test_api.py::test_dashboard_connection_failure_label_is_unambiguous`
+asserts the new wording is present in the served HTML and the old bare
+string is gone.
+
+### 23.5 Verification
+
+- Focused suites (portfolio, paper account/executor, orchestrator, risk,
+  MARIN, attribution, API/dashboard, all new Phase 1 polish tests): all
+  green.
+- `pytest -q tests/contract/test_event_bus_contract.py`: 27 passed, 27
+  skipped (Redis suite skipped without `TF_TEST_REDIS_URL`).
+- `pytest -q tests/contract/test_developer_tooling.py`: 64 passed, 5
+  skipped (Docker unavailable).
+- `ruff check .`: all checks passed.
+- `mypy --ignore-missing-imports core`: no issues found in 24 source files.
+- `pytest -q tests`: **1163 passed, 0 failed, 74 skipped** (skips are all
+  Redis/Postgres/Docker infrastructure gates, not evaluated by default).
+- With a native Redis (`redis-server --port 6399`) and native PostgreSQL 16
+  service both running and `TF_TEST_REDIS_URL`/`TF_TEST_POSTGRES_DSN` set:
+  `pytest -q tests` → **1232 passed, 0 failed, 5 skipped** (the 5 remaining
+  skips are exclusively "no Docker daemon" — Docker Hub's blob CDN is
+  blocked in this sandbox, identical to Phase 0's own documented
+  limitation). Zero failures with real infrastructure exercised, matching
+  the mandate's requirement to run the Redis/Postgres contract variants
+  where the environment permits.
+
+### 23.6 Simulated accounting-proof evidence
+
+`scripts/phase1_accounting_proof.py` drives a fully offline, deterministic
+1,500-tick paper session (in-memory bus/store, `ManualClock`, the default
+synthetic market's recurring cross-venue dislocations) and reconciles every
+identity the mandate requires. Output from one run:
+
+```
+ticks run:                 1500
+closed opportunities:      32
+open positions:            2 (NOT FLAT)
+initial_balance:           100,000.00
+cash:                      100,407.71
+equity:                    100,399.87
+gross_pnl:                 2,217.54
+fees_paid:                 1,817.67
+net_pnl:                   399.87
+realized_pnl:              2,227.85
+unrealized_pnl:            -10.31
+gross_exposure:            49,942.70
+net_exposure:              -7.84
+sum(attribution.realized_pnl) over 32 closed trades: 452.69
+```
+
+Reconciliation (all differences below 1e-6, i.e. floating-point-exact):
+
+- `equity - initial_balance` (399.872417) == `net_pnl` (399.872417) —
+  RECONCILES. (The account was not flat at the end — two positions were
+  still open — so this identity also equals `net_pnl` because `net_pnl`
+  already includes `unrealized_pnl`.)
+- `gross_pnl - fees_paid` (399.872417) == `net_pnl` (399.872417) —
+  RECONCILES.
+- `realized_pnl + unrealized_pnl - fees_paid` (399.872417) == `net_pnl`
+  (399.872417) — RECONCILES.
+
+**Attribution total does not equal `realized_pnl - fees_paid` directly, and
+that is expected, not a bug** — the mandate explicitly warns against
+comparing these blindly when hedge or non-opportunity fills exist. Replaying
+the fill log with the exact per-fill delta logic
+`Orchestrator._track_realized_delta` uses, bucketed by category:
+
+| category | gross | fees | net |
+|---|---|---|---|
+| closed opportunities (32) | 2,227.854594 | 1,775.160061 | 452.694534 |
+| still-open opportunities (pending, not yet in `scorecard.trades`) | 0.000000 | 27.501470 | -27.501470 |
+| hedges / fills outside any tracked opportunity | 0.000000 | 15.006958 | -15.006958 |
+
+- closed-category net (452.694534) == `sum(attribution.realized_pnl)`
+  (452.694534) — RECONCILES exactly.
+- sum of all three categories (410.186106) == `realized_pnl - fees_paid`
+  (410.186106) — RECONCILES exactly.
+
+Every identity the mandate requires holds to floating-point precision. The
+remaining two categories (still-open opportunities and OKAPI hedge fills)
+are legitimate, separately-accounted categories, not missing or leaked P&L:
+an open opportunity's contribution simply has not been finalized into
+`scorecard.trades` yet, and a hedge fill is never registered against an
+opportunity attribution builder in the first place (by design — OKAPI's
+standing hedge loop is not itself an "opportunity").
+
+### 23.7 Live-soak status (re-checked)
+
+Connectivity to Binance and Coinbase was re-checked once, as the mandate
+requires, without retrying or bypassing the proxy:
+
+```
+$ curl https://api.binance.com/api/v3/ping          → CONNECT tunnel failed, HTTP 403 (connect_rejected)
+$ curl https://api.exchange.coinbase.com/time       → CONNECT tunnel failed, HTTP 403 (connect_rejected)
+```
+
+Unchanged from section 17: a deliberate proxy-level policy denial, not a
+transient failure. **PHASE 1 LIVE PUBLIC-FEED SOAK = PENDING EXTERNAL
+ENVIRONMENT.** No `phase1-validated` tag was created or moved as a result of
+this polish pass, consistent with section 17's unmet condition.
+
+### 23.8 Polished commit
+
+`PHASE1_POLISHED_SHA` is the `HEAD` of `phase1-tidal-remediation` introduced
+by this polish pass's commit (`git rev-parse HEAD` on this branch after that
+commit) — recorded in the accompanying validation report rather than
+hardcoded here, since a commit cannot cite its own hash. All of section
+23.5's verification, including the real-Redis/real-Postgres full-suite run,
+was performed against that commit's working tree before it was committed.

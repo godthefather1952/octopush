@@ -35,7 +35,11 @@ class AttributionBuilder:
     expected_net_edge_bps: float
     expected_costs_bps: float
     decision: RiskDecision
-    realized_pnl: float = 0.0
+    #: Pre-fee realized P&L, accumulated one fill at a time via
+    #: :meth:`add_realized` -- never read from a position's lifetime-cumulative
+    #: counter, which would mix in every other opportunity ever traded on the
+    #: same venue:symbol (see ``Orchestrator._track_realized_delta``).
+    realized_pnl_gross: float = 0.0
     fees: float = 0.0
     filled_notional: float = 0.0
     slippage_samples: list[float] = field(default_factory=list)
@@ -45,6 +49,14 @@ class AttributionBuilder:
         self.filled_notional += notional
         self.fees += fee
         self.slippage_samples.append(slippage_bps)
+
+    def add_realized(self, delta: float) -> None:
+        """Add one fill's own contribution to this trade's realized P&L.
+
+        ``delta`` must already be isolated to this fill alone -- the caller is
+        responsible for not handing this method a cumulative or shared value.
+        """
+        self.realized_pnl_gross += delta
 
     def build(self) -> TradeAttribution:
         return TradeAttribution(
@@ -66,7 +78,7 @@ class AttributionBuilder:
             signals={c.agent_id: c.signal for c in self.consensus.contributions},
             confidences={c.agent_id: c.confidence for c in self.consensus.contributions},
             risk_verdict=self.decision.verdict.value,
-            realized_pnl=self.realized_pnl,
+            realized_pnl=self.realized_pnl_gross - self.fees,
             fees=self.fees,
             slippage_bps=(
                 sum(self.slippage_samples) / len(self.slippage_samples)

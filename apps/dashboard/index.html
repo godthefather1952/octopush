@@ -122,7 +122,10 @@ async function refresh() {
       fetch("/api/attributions?limit=12").then(r => r.json()),
     ]);
   } catch (e) {
-    document.getElementById("updated").textContent = "disconnected";
+    // This is the dashboard's own fetch to the API failing -- it says
+    // nothing about venue/exchange connectivity, which is reported
+    // separately in the venues table below.
+    document.getElementById("updated").textContent = "DASHBOARD DISCONNECTED FROM API";
     return;
   }
 

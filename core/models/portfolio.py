@@ -109,12 +109,32 @@ class PortfolioState(Envelope):
 
     @property
     def gross_pnl(self) -> float:
-        """P&L before fees."""
-        return self.realized_pnl + self.unrealized_pnl + self.fees_paid
+        """P&L before fees.
+
+        ``realized_pnl`` (accumulated from :meth:`PositionState.apply`'s
+        return value) and ``unrealized_pnl`` are both already pre-fee
+        trading P&L — fees are tracked separately in ``fees_paid`` and are
+        already subtracted from ``cash`` via ``FillEvent.cash_delta``. Gross
+        is therefore simply the sum of the two pre-fee components, not that
+        sum with fees added back on top (Phase 1 polish: the previous
+        formula added ``fees_paid`` here, overstating gross by 2x the fee
+        drag and making "gross" larger than it would be if fees had never
+        existed at all).
+        """
+        return self.realized_pnl + self.unrealized_pnl
 
     @property
     def net_pnl(self) -> float:
-        return self.realized_pnl + self.unrealized_pnl
+        """P&L after fees -- what actually happened to the account.
+
+        For a flat account this must reconcile to ``equity -
+        initial_balance`` within numerical tolerance, since cash already
+        has every fee subtracted exactly once (``FillEvent.cash_delta``).
+        The previous formula omitted the fee subtraction entirely, so "net"
+        was identical to pre-fee P&L and the dashboard overstated
+        performance by the full fee total.
+        """
+        return self.gross_pnl - self.fees_paid
 
     @property
     def equity(self) -> float:
