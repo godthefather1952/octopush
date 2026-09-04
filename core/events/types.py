@@ -67,6 +67,18 @@ class EventType(StrEnum):
     SYSTEM_EVENT = "SYSTEM_EVENT"
     ERROR = "ERROR"
 
+    # --- replay control -----------------------------------------------------
+    #: A durable marker for one original orchestrator tick's exact position
+    #: in the recorded timeline. Recorded like any other event (the Recorder
+    #: is bus middleware) but deliberately excluded from
+    #: ``MARKET_INPUT_TYPES``: it carries no market data and must never be
+    #: fed back into the pipeline as if it were an input. Its sole purpose is
+    #: letting replay recover *when* each tick happened relative to the
+    #: market events around it, rather than inferring a tick cadence from the
+    #: number of market events -- which depends on feed/network timing, not
+    #: the platform's own decision cadence.
+    ORCHESTRATOR_TICK = "ORCHESTRATOR_TICK"
+
 
 #: Topics whose payloads are replayed as market inputs by the replay engine.
 MARKET_INPUT_TYPES: frozenset[EventType] = frozenset(

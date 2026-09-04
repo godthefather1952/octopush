@@ -1,4 +1,7 @@
 from replay.engine import (
+    LEGACY_REPLAY_UNVERIFIED_TIMELINE,
+    TICK_MARKER_TYPE,
+    LegacyTimelineRequired,
     ReplayMode,
     ReplaySession,
     ReplayStats,
@@ -7,6 +10,9 @@ from replay.engine import (
 )
 
 __all__ = [
+    "LEGACY_REPLAY_UNVERIFIED_TIMELINE",
+    "TICK_MARKER_TYPE",
+    "LegacyTimelineRequired",
     "ReplayMode",
     "ReplaySession",
     "ReplayStats",

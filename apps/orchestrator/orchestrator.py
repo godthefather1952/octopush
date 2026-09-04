@@ -241,6 +241,13 @@ class Orchestrator:
         self.ticks += 1
         now = self.clock.now_ms()
 
+        # Mark this tick's exact position in the recorded timeline before
+        # anything else runs, so replay can recover it later instead of
+        # inferring a tick cadence from the number of market events (see
+        # _mark_tick_boundary). Unconditional -- a warm-up tick or one that
+        # produces no trades is still a real tick boundary.
+        await self._mark_tick_boundary(now)
+
         # First, not last: the warm-up branch below can return early, and a
         # tick that skipped persistence would reintroduce exactly the quiet
         # period this is here to close.
@@ -288,6 +295,37 @@ class Orchestrator:
         await self._publish_state(portfolio)
         self._prune()
         self._heartbeat()
+
+    async def _mark_tick_boundary(self, now: Millis) -> None:
+        """Publish a durable timeline marker for this tick's logical position.
+
+        Replay used to run one orchestrator tick per replayed market-input
+        event -- a stand-in for the real tick cadence that happened to work
+        only because nothing checked it. The true cadence (e.g. 20 book
+        events between two 250ms ticks live) is a fact about the original
+        run, not something derivable from how many market events a replay
+        happens to read back.
+
+        Publishing this here, as the very first thing every tick does,
+        relies on nothing more than the bus's own existing global sequence
+        counter (``Event.sort_key()`` / storage's ``ORDER BY ts_ms,
+        COALESCE(seq, 0), event_id``): this marker's sequence number lands
+        after every market event that was published before this tick call
+        and before every one published after it, with no separate
+        coordination needed. ``ORCHESTRATOR_TICK`` is deliberately excluded
+        from ``MARKET_INPUT_TYPES`` -- replay reads it as a control marker,
+        never republishes it onto the bus as data, and it does not
+        participate in the pipeline the way a real input does.
+        """
+        await self.bus.publish(
+            Event(
+                type=EventType.ORCHESTRATOR_TICK,
+                ts_ms=now,
+                source=SERVICE,
+                schema_name="OrchestratorTick",
+                payload={"tick": self.ticks, "warmed_up": self.warmed_up},
+            )
+        )
 
     async def _persist(self) -> None:
         """Give the recorder a chance to flush on age, not only on traffic.

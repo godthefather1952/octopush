@@ -203,34 +203,45 @@ class TestDeterminism:
         assert economic_summary(a) != economic_summary(b)
 
 
+async def _record_session(settings, ticks: int = 150):
+    platform = fresh_platform(settings)
+    await run_platform(platform, ticks)
+    await platform.recorder.flush()
+    return platform
+
+
+async def _replay_session(settings, store, session_id: str):
+    clock = ManualClock(START_MS)
+    bus = InMemoryEventBus(raise_on_handler_error=True)
+    platform = build_platform(
+        settings.model_copy(update={"venues": simulated_venues()}),
+        clock=clock,
+        bus=bus,
+        store=InMemoryEventStore(),
+        raise_on_handler_error=True,
+    )
+    # Feeds stay off: the recording is the market.
+    await platform.start(record=False, feeds=False)
+    session = ReplaySession(store=store, bus=bus, clock=clock, session_id=session_id)
+    with session:
+        await session.open()
+        while True:
+            event = await session.step()
+            if event is None:
+                break
+            if event.type is EventType.ORCHESTRATOR_TICK:
+                # Tick at the SAME logical boundaries the original run
+                # ticked at -- never one tick per market event.
+                await platform.orchestrator.tick()
+    return platform, session
+
+
 class TestReplaySession:
     async def _record(self, settings, ticks: int = 150):
-        platform = fresh_platform(settings)
-        await run_platform(platform, ticks)
-        await platform.recorder.flush()
-        return platform
+        return await _record_session(settings, ticks)
 
     async def _replay(self, settings, store, session_id: str):
-        clock = ManualClock(START_MS)
-        bus = InMemoryEventBus(raise_on_handler_error=True)
-        platform = build_platform(
-            settings.model_copy(update={"venues": simulated_venues()}),
-            clock=clock,
-            bus=bus,
-            store=InMemoryEventStore(),
-            raise_on_handler_error=True,
-        )
-        # Feeds stay off: the recording is the market.
-        await platform.start(record=False, feeds=False)
-        session = ReplaySession(store=store, bus=bus, clock=clock, session_id=session_id)
-        with session:
-            await session.open()
-            while True:
-                event = await session.step()
-                if event is None:
-                    break
-                await platform.orchestrator.tick()
-        return platform, session
+        return await _replay_session(settings, store, session_id)
 
     async def test_replay_reproduces_market_state(self, settings):
         recorded = await self._record(settings, ticks=100)
@@ -304,7 +315,103 @@ class TestReplaySession:
         stats = await session.run()
         assert session.finished
         assert stats.span_ms > 0
-        assert stats.events_published == stats.events_read
+        # events_read also includes ORCHESTRATOR_TICK boundary markers,
+        # which are read but never published to the bus as data.
+        assert stats.events_published + stats.ticks_read == stats.events_read
+        assert stats.ticks_read == 50
+
+
+def replay_equivalence_summary(platform) -> dict:
+    """Structural fingerprint for an ORIGINAL-run-vs-REPLAY comparison.
+
+    Normalizes away only what is intentionally nondeterministic between a
+    live run and its replay: literal identifier VALUES. A live run mints
+    random ids and a replay installs a deterministic generator derived from
+    the session (see ``core/ids.py``) -- by design, neither is meant to
+    match the other string-for-string, and asserting on the raw id strings
+    here would be asserting on something nobody claims replay reproduces.
+
+    Everything else -- every economic field, and the STRUCTURAL order
+    opportunities/orders/fills occurred in -- is preserved and compared
+    positionally rather than dropped: both runs process the same recorded
+    market events in the same order, so the Nth order/fill/opportunity in
+    one run corresponds exactly to the Nth in the other. Silently comparing
+    only aggregate totals would hide a defect that reorders or substitutes
+    individual trades while leaving sums unchanged.
+    """
+    portfolio = platform.account.snapshot()
+    records = list(platform.state.opportunities.values())
+    return {
+        "ticks": platform.orchestrator.ticks,
+        "opportunity_states": [r.state.value for r in records],
+        "risk_verdicts": [
+            r.decision.verdict.value for r in records if r.decision is not None
+        ],
+        "orders": [
+            (o.venue, o.symbol, o.side.value, round(o.quantity, 9), o.status.value)
+            for o in platform.oms.orders.values()
+        ],
+        "fills": [
+            (
+                f.venue,
+                f.symbol,
+                f.side.value,
+                round(f.quantity, 9),
+                round(f.price, 9),
+                round(f.fee, 9),
+            )
+            for f in platform.account.fill_log
+        ],
+        "positions": {
+            key: [
+                round(p.quantity, 9),
+                round(p.average_entry_price, 9),
+                round(p.realized_pnl, 6),
+            ]
+            for key, p in sorted(portfolio.positions.items())
+        },
+        "cash": round(portfolio.cash, 6),
+        "equity": round(portfolio.equity, 6),
+        "realized_pnl": round(portfolio.realized_pnl, 6),
+        "unrealized_pnl": round(portfolio.unrealized_pnl, 6),
+        "gross_pnl": round(portfolio.gross_pnl, 6),
+        "net_pnl": round(portfolio.net_pnl, 6),
+        "drawdown": round(portfolio.drawdown, 6),
+        "kill_switch_engaged": platform.kill_switch.state.engaged,
+        "kill_switch_triggered_by": sorted(platform.kill_switch.state.triggered_by),
+    }
+
+
+class TestReplayEconomicEquivalence:
+    """The invariant the mandate actually cares about.
+
+    ``test_replay_is_repeatable`` (above) only proves replay is repeatable
+    with ITSELF -- both runs share the exact same tick-cadence bug if one
+    exists, so it cannot catch a wrong cadence. ``test_replay_reproduces_market_state``
+    only proves market-DATA reconstruction, which is decision-independent
+    (TIDAL applies book deltas the same way no matter how many orchestrator
+    ticks ran in between). Neither is proof that replay reproduces what the
+    ORIGINAL run actually decided. This test compares replay directly
+    against the run it replayed.
+    """
+
+    async def test_replayed_run_reproduces_the_original_runs_decisions(self, settings):
+        recorded = await _record_session(settings, ticks=800)
+        replayed, session = await _replay_session(settings, recorded.store, recorded.session_id)
+
+        assert session.stats.timeline_fidelity is None, (
+            "a session recorded with tick markers must replay as verified, "
+            "not fall back to legacy semantics"
+        )
+        assert session.stats.ticks_read == recorded.orchestrator.ticks
+        assert session.stats.ticks_read == replayed.orchestrator.ticks
+
+        original = replay_equivalence_summary(recorded)
+        reproduced = replay_equivalence_summary(replayed)
+        assert original["fills"], (
+            "the scenario must actually produce trades for this to prove anything"
+        )
+        assert reproduced == original
 
 
 async def _noop() -> None:

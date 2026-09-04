@@ -4,7 +4,7 @@ Takes a recorded session and feeds it back through the platform.  Replay is a
 product feature: it is how "strategy v1.2 vs v1.3 on exactly the same market"
 becomes a meaningful sentence.
 
-Determinism comes from three rules:
+Determinism comes from four rules:
 
 1. Time comes from a :class:`ManualClock` driven by the recorded timestamps,
    so nothing observes wall-clock time.
@@ -13,6 +13,11 @@ Determinism comes from three rules:
 3. Only *market inputs* are replayed.  Everything the platform derived is
    recomputed, which is the whole point: if the derived output differs, the
    code changed.
+4. Orchestrator ticks happen at the SAME logical boundaries they happened at
+   in the original run, recovered from a durable ``ORCHESTRATOR_TICK``
+   marker recorded once per tick — not one tick per replayed market event.
+   A session recorded before this marker existed has no verified tick
+   cadence at all; see ``ReplaySession.legacy_timeline``.
 """
 
 from __future__ import annotations
@@ -33,7 +38,29 @@ from storage.base import EventStore
 #: Distinguishes "nothing was bound" from "None was bound".
 _UNBOUND = object()
 
+#: The one event type replay treats as a tick boundary rather than data.
+#: Never included in ``MARKET_INPUT_TYPES``; never republished onto the bus.
+TICK_MARKER_TYPE: EventType = EventType.ORCHESTRATOR_TICK
+
+#: Reported on :class:`ReplayStats` when a session predates tick-boundary
+#: markers and was replayed anyway via ``legacy_timeline=True``. Distinct
+#: from ``None`` (verified: every tick boundary came from a real marker) so
+#: nothing can mistake a legacy replay for an exact one.
+LEGACY_REPLAY_UNVERIFIED_TIMELINE = "LEGACY_REPLAY_UNVERIFIED_TIMELINE"
+
 log = logging.getLogger(__name__)
+
+
+class LegacyTimelineRequired(RuntimeError):
+    """Raised when a session has no recorded tick-boundary markers.
+
+    Replaying such a session by falling back to one tick per market event
+    would silently reintroduce the exact defect this marker exists to fix,
+    under the name "replay". Pass ``legacy_timeline=True`` to
+    :class:`ReplaySession` to accept that explicitly and proceed anyway --
+    the result is then reported as ``LEGACY_REPLAY_UNVERIFIED_TIMELINE``,
+    never as a verified reproduction of the original tick cadence.
+    """
 
 
 class ReplayMode(StrEnum):
@@ -50,8 +77,14 @@ class ReplayStats:
     events_read: int = 0
     events_published: int = 0
     events_skipped: int = 0
+    #: Tick-boundary markers read. Zero for a legacy (marker-less) session.
+    ticks_read: int = 0
     first_ts: Millis | None = None
     last_ts: Millis | None = None
+    #: ``None`` once the session's tick cadence is verified from real
+    #: markers; ``LEGACY_REPLAY_UNVERIFIED_TIMELINE`` if it was replayed
+    #: under ``legacy_timeline=True`` because no markers exist.
+    timeline_fidelity: str | None = None
 
     @property
     def span_ms(self) -> int:
@@ -84,6 +117,10 @@ class ReplaySession:
     #: Extra seed material, so the same session can be replayed under different
     #: id streams when comparing two code versions side by side.
     id_seed: str = ""
+    #: Required to replay a session recorded before ORCHESTRATOR_TICK markers
+    #: existed. Without it, ``open()`` raises ``LegacyTimelineRequired``
+    #: rather than silently falling back to one tick per market event.
+    legacy_timeline: bool = False
     _id_generator: IdGenerator | None = None
     _previous_ids: IdGenerator | None = None
     stats: ReplayStats = field(default_factory=ReplayStats)
@@ -104,9 +141,30 @@ class ReplaySession:
             self._id_generator = DeterministicIdGenerator(seed)
             self._previous_ids = set_id_generator(self._id_generator)
         await self.store.open()
+
+        has_tick_markers = False
+        async for _ in self.store.read(self.session_id, types=[TICK_MARKER_TYPE]):
+            has_tick_markers = True
+            break
+
+        read_types = set(self.input_types)
+        if has_tick_markers:
+            read_types.add(TICK_MARKER_TYPE)
+        elif not self.legacy_timeline:
+            raise LegacyTimelineRequired(
+                f"session {self.session_id!r} has no recorded ORCHESTRATOR_TICK "
+                "markers -- it predates tick-boundary recording. Replaying it "
+                "would have to fall back to one tick per market event, which "
+                "is not a verified reproduction of the original tick cadence. "
+                "Pass legacy_timeline=True to ReplaySession to replay it "
+                "anyway, explicitly accepting unverified timeline fidelity."
+            )
+        else:
+            self.stats.timeline_fidelity = LEGACY_REPLAY_UNVERIFIED_TIMELINE
+
         self._iterator = self.store.read(
             self.session_id,
-            types=sorted(self.input_types, key=lambda t: t.value),
+            types=sorted(read_types, key=lambda t: t.value),
             start_ms=self.start_ms,
             end_ms=self.end_ms,
         ).__aiter__()
@@ -131,7 +189,19 @@ class ReplaySession:
         self.close()
 
     async def step(self) -> Event | None:
-        """Publish exactly one recorded event. Returns ``None`` at the end."""
+        """Advance replay by exactly one stored item. Returns ``None`` at the
+        end.
+
+        The returned item is either a market-input event -- already
+        published to the bus and drained before this returns -- or an
+        ``ORCHESTRATOR_TICK`` boundary marker, which is NOT published (it is
+        not data). Callers that need tick fidelity check
+        ``event.type is TICK_MARKER_TYPE`` and call the platform's own
+        ``orchestrator.tick()`` in response; callers that only care about
+        market data (e.g. anything reading ``MARKET_INPUT_TYPES`` payloads)
+        can ignore the distinction entirely, since a marker never reaches the
+        bus for them to see.
+        """
         if self._iterator is None:
             await self.open()
         assert self._iterator is not None
@@ -150,6 +220,12 @@ class ReplaySession:
         # the difference between this and the original session.
         if event.ts_ms > self.clock.now_ms():
             self.clock.set(event.ts_ms)
+
+        if event.type is TICK_MARKER_TYPE:
+            self.stats.ticks_read += 1
+            if self.on_event is not None:
+                self.on_event(event)
+            return event
 
         replayed = event.model_copy(deep=True)
         replayed.id = event.id

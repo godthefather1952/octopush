@@ -420,7 +420,12 @@ class TestReplaySafety:
             name="venue-resync",
         )
 
-        session = ReplaySession(store=store, bus=bus, clock=clock, session_id=session_id)
+        # Hand-built session, never produced by a real Orchestrator.tick(),
+        # so it carries no ORCHESTRATOR_TICK markers -- irrelevant to what
+        # this test checks (resync safety, not tick cadence).
+        session = ReplaySession(
+            store=store, bus=bus, clock=clock, session_id=session_id, legacy_timeline=True
+        )
         await session.open()
         stats = await session.run()
         session.close()

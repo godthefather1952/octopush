@@ -20,8 +20,9 @@ from apps.orchestrator.wiring import build_platform
 from core.bus import InMemoryEventBus
 from core.clock import ManualClock
 from core.config import load_settings
+from core.events import EventType
 from core.logging import configure_logging
-from replay.engine import ReplayMode, ReplaySession
+from replay.engine import LegacyTimelineRequired, ReplayMode, ReplaySession
 from storage import build_store
 
 log = logging.getLogger("replay")
@@ -82,16 +83,30 @@ async def replay(args: argparse.Namespace) -> None:
         clock=clock,
         session_id=args.session,
         mode=ReplayMode.STEP if args.step else ReplayMode.FAST,
+        legacy_timeline=args.legacy_timeline,
     )
-    await session.open()
+    try:
+        await session.open()
+    except LegacyTimelineRequired as exc:
+        raise SystemExit(str(exc)) from exc
 
+    # NOTE: session.close() is deliberately not called here -- that is a
+    # separate, already-identified defect (global id-generator/log-clock
+    # state leak) out of scope for this batch (see the Phase 2 audit
+    # report's P2-4; CLI cleanup is its own later batch).
     processed = 0
     while True:
         event = await session.step()
         if event is None:
             break
+        if event.type is EventType.ORCHESTRATOR_TICK:
+            # A tick boundary, not a market input: replay the original
+            # cadence exactly, one orchestrator.tick() per marker -- never
+            # one per market event (that was the defect this marker exists
+            # to fix).
+            await platform.orchestrator.tick()
+            continue
         processed += 1
-        await platform.orchestrator.tick()
         if args.step and processed >= args.step:
             break
         if args.max_events and processed >= args.max_events:
@@ -103,6 +118,8 @@ async def replay(args: argparse.Namespace) -> None:
         "session": args.session,
         "config_hash_recorded": info.config_hash,
         "events_replayed": session.stats.events_published,
+        "ticks_replayed": session.stats.ticks_read,
+        "timeline_fidelity": session.stats.timeline_fidelity,
         "span_ms": session.stats.span_ms,
         "ticks": platform.orchestrator.ticks,
         "opportunities": len(platform.state.opportunities),
@@ -127,6 +144,15 @@ def main() -> None:
     parser.add_argument("--max-events", type=int, default=0, help="stop after N events")
     parser.add_argument(
         "--record-output", action="store_true", help="record the replay as its own session"
+    )
+    parser.add_argument(
+        "--legacy-timeline",
+        action="store_true",
+        help=(
+            "replay a session recorded before ORCHESTRATOR_TICK markers existed, "
+            "accepting that its tick cadence is unverified rather than an exact "
+            "reproduction of the original run"
+        ),
     )
     args = parser.parse_args()
     if args.list:
