@@ -175,7 +175,9 @@ class Tidal:
                 self.reconnects[status.venue] += 1
             self.reconnects.setdefault(status.venue, 0)
         elif event.type is EventType.OPPORTUNITY_DETECTED:
-            opinion = self.evaluate(Opportunity.model_validate(event.payload))
+            opinion = self.evaluate(
+                Opportunity.model_validate(event.payload), event.ts_ms
+            )
             if opinion is not None:
                 await self.publish_opinion(opinion)
         elif event.type is EventType.VENUE_DISCONNECTED:
@@ -393,12 +395,22 @@ class Tidal:
             return DataQuality.DEGRADED
         return DataQuality.FRESH
 
-    def venue_state(self, venue: str, symbol: str) -> VenueMarketState | None:
+    def venue_state(
+        self, venue: str, symbol: str, now_ms: Millis | None = None
+    ) -> VenueMarketState | None:
+        """Build one venue's state as of ``now_ms`` (default: the clock).
+
+        ``now_ms`` exists so an entire :meth:`build_state` snapshot shares ONE
+        instant (Phase 2 Batch 1.4 -- P2-15). ``as_of`` and the freshness
+        classification are both derived from it, and a snapshot whose venues
+        were aged against different instants is a snapshot replay cannot
+        reproduce.
+        """
         key = (venue, symbol)
         book = self.books.get(key)
         if book is None:
             return None
-        now = self.clock.now_ms()
+        now = self.clock.now_ms() if now_ms is None else now_ms
         metrics = compute_metrics(book, now, self.flows.get(key), self.mids.get(key))
         return VenueMarketState(
             venue=venue,
@@ -416,7 +428,12 @@ class Tidal:
             reconnects=self.reconnects.get(venue, 0),
         )
 
-    def consolidate(self, symbol: str, states: list[VenueMarketState]) -> ConsolidatedView:
+    def consolidate(
+        self,
+        symbol: str,
+        states: list[VenueMarketState],
+        now_ms: Millis | None = None,
+    ) -> ConsolidatedView:
         """Cross-venue view.
 
         The reference here is a *depth-weighted mid*, deliberately simple: it
@@ -434,7 +451,7 @@ class Tidal:
         showing it for monitoring with a single contributor is truthful —
         the blend of one input is just that input.
         """
-        now = self.clock.now_ms()
+        now = self.clock.now_ms() if now_ms is None else now_ms
         usable = [s for s in states if s.quality.is_usable and s.metrics.mid is not None]
         view = ConsolidatedView(
             symbol=symbol,
@@ -481,11 +498,25 @@ class Tidal:
         view.max_deviation_venue = worst_state.venue
         return view
 
-    def build_state(self) -> MarketState:
-        now = self.clock.now_ms()
+    def build_state(self, now_ms: Millis | None = None) -> MarketState:
+        """Assemble the whole market snapshot at ONE instant.
+
+        That instant becomes ``MarketState.created_at``, every
+        ``VenueMarketState.as_of`` and every ``ConsolidatedView.as_of``, and
+        -- because the orchestrator adopts it as the tick's canonical time
+        (Phase 2 Batch 1.4 -- P2-15) -- the ``ORCHESTRATOR_TICK`` marker
+        timestamp too. Replay pins its clock to that marker before re-running
+        the tick, so this call then reads back exactly the same instant and
+        reconstructs an identical snapshot. Reading the clock separately per
+        venue, or letting the tick adopt a *later* time than the snapshot it
+        is reasoning about, both break that: the age of the very same book
+        would differ between the original run and its replay, and with it
+        ``DataQuality`` -- FRESH in one, DEGRADED in the other.
+        """
+        now = self.clock.now_ms() if now_ms is None else now_ms
         venues: dict[str, VenueMarketState] = {}
         for (venue, symbol) in self.books:
-            state = self.venue_state(venue, symbol)
+            state = self.venue_state(venue, symbol, now)
             if state is not None:
                 venues[f"{venue}:{symbol}"] = state
         # Consolidate every instrument actually being received, not only those
@@ -500,7 +531,7 @@ class Tidal:
         consolidated: dict[str, ConsolidatedView] = {}
         for symbol in sorted({s.symbol for s in venues.values()}):
             states = [s for s in venues.values() if s.symbol == symbol]
-            consolidated[symbol] = self.consolidate(symbol, states)
+            consolidated[symbol] = self.consolidate(symbol, states, now)
         newest = max(
             (s.last_update_ts for s in venues.values() if s.last_update_ts is not None),
             default=None,
@@ -514,8 +545,8 @@ class Tidal:
         self.state = state
         return state
 
-    async def publish_state(self) -> MarketState:
-        state = self.build_state()
+    async def publish_state(self, now_ms: Millis | None = None) -> MarketState:
+        state = self.build_state(now_ms)
         # Frozen here, at the exact moment book state was read for ``state``
         # -- not read later by the caller, since ``processed_input_sequence``
         # can keep advancing (e.g. during the orchestrator's own
@@ -540,15 +571,25 @@ class Tidal:
         state = self.venue_state(venue, symbol)
         return state.metrics if state is not None else None
 
-    def evaluate(self, opportunity: Opportunity) -> AgentOpinion | None:
+    def evaluate(
+        self, opportunity: Opportunity, now_ms: Millis
+    ) -> AgentOpinion | None:
         """Score an opportunity on microstructure alone.
 
         TIDAL is not valuing the asset and not costing the trade — the other
         agents do that.  It answers a narrower question: does the *shape of
         the book* support each leg, or is the dislocation an artefact of a
         thin, wide, fast-moving market?
+
+        ``now_ms`` is the request's logical time -- the tick that asked for
+        this opinion, carried on the OPPORTUNITY_DETECTED event -- never a
+        clock read taken when this subscriber happened to be scheduled
+        (Phase 2 Batch 1.4). The opinion's ``created_at``/``expires_at``
+        decide its freshness at every later tick, so a live-clock read here
+        would let an opinion outlive its replayed twin purely because
+        dispatch was slower in one run than in the other.
         """
-        now = self.clock.now_ms()
+        now = now_ms
         supports: list[float] = []
         reasons: list[str] = []
         detail: dict[str, float | int | str | bool | None] = {}

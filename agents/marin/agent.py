@@ -22,7 +22,7 @@ from core.bus import EventBus
 from core.clock import Clock
 from core.events import Event, EventType
 from core.health import HealthRegistry
-from core.models.common import MONEY_EPSILON, QTY_EPSILON
+from core.models.common import MONEY_EPSILON, QTY_EPSILON, Millis
 from core.models.execution import OrderStatus
 from core.models.ops import (
     HealthStatus,
@@ -65,8 +65,8 @@ class Marin:
     def __post_init__(self) -> None:
         self.health.register(SERVICE, VERSION)
 
-    def reconcile(self) -> ReconciliationResult:
-        now = self.clock.now_ms()
+    def reconcile(self, now_ms: Millis | None = None) -> ReconciliationResult:
+        now = self.clock.now_ms() if now_ms is None else now_ms
         mismatches: list[Mismatch] = []
 
         oms_fills = {fill.fill_id: fill for fill in self.oms.all_fills()}
@@ -284,8 +284,8 @@ class Marin:
         self.orders_archived += archived
         return sealed, archived
 
-    async def run(self) -> ReconciliationResult:
-        result = self.reconcile()
+    async def run(self, now_ms: Millis | None = None) -> ReconciliationResult:
+        result = self.reconcile(now_ms)
         if result.ok:
             self.compact()
         await self.bus.publish(

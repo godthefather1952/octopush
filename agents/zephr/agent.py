@@ -16,7 +16,7 @@ from core.config import Settings
 from core.events import Event, EventType
 from core.health import HealthRegistry
 from core.models.agent import AgentOpinion
-from core.models.common import AgentId, Side
+from core.models.common import AgentId, Millis, Side
 from core.models.market import MarketState, PriceLevel
 from core.models.opportunity import Opportunity
 from core.models.ops import HealthStatus
@@ -56,7 +56,9 @@ class Zephr:
             self.market = MarketState.model_validate(event.payload)
             self._heartbeat()
         elif event.type is EventType.OPPORTUNITY_DETECTED:
-            opinion = self.evaluate(Opportunity.model_validate(event.payload))
+            opinion = self.evaluate(
+                Opportunity.model_validate(event.payload), event.ts_ms
+            )
             if opinion is not None:
                 await self.publish(opinion)
 
@@ -97,7 +99,19 @@ class Zephr:
             max_notional=self.settings.risk.max_order_notional,
         )
 
-    def evaluate(self, opportunity: Opportunity) -> AgentOpinion | None:
+    def evaluate(
+        self, opportunity: Opportunity, now_ms: Millis
+    ) -> AgentOpinion | None:
+        """Score the opportunity on its executable cost curve.
+
+        ``now_ms`` is the request's logical time -- the tick that asked for
+        this opinion, carried on the OPPORTUNITY_DETECTED event -- never a
+        clock read taken when this subscriber happened to be scheduled
+        (Phase 2 Batch 1.4). The opinion's ``created_at``/``expires_at``
+        decide its freshness at every later tick, so a live-clock read here
+        would let an opinion outlive its replayed twin purely because
+        dispatch was slower in one run than in the other.
+        """
         curve = self.build_curve(opportunity)
         if curve is None:
             # ZEPHR could not price the opportunity. The orchestrator sees a
@@ -105,7 +119,7 @@ class Zephr:
             return None
         self.curves[opportunity.opportunity_id] = curve
         self.evaluations += 1
-        now = self.clock.now_ms()
+        now = now_ms
 
         reasons: list[str] = []
         detail: dict[str, float | int | str | bool | None] = {

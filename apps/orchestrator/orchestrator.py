@@ -291,26 +291,33 @@ class Orchestrator:
 
         market = await self._observe()
 
-        # THE tick time, captured once, HERE: right after _observe()'s
-        # snapshot, not at the top of the tick.
+        # THE tick time: the exact instant TIDAL assembled the snapshot this
+        # tick reasons about -- NOT a fresh clock read taken once _observe()
+        # returns (Phase 2 Batch 1.4 -- P2-15).
         #
-        # For the marker (Phase 2 Batch 1.2) this is the only moment that
-        # correctly answers "what had TIDAL actually applied when this tick's
-        # MarketState was built": under an asynchronous bus, publication
-        # order and dispatch order are not the same thing (see
-        # _mark_tick_boundary), and `_persist()` above can await real durable
-        # I/O during which an input is published *and applied* with a later
-        # timestamp. EventStore orders events timestamp-primary
-        # (`Event.sort_key()`), so a marker stamped with the stale
-        # top-of-tick time would sort BEFORE an input it explicitly claims to
-        # have already applied, breaking the deferred-input release replay
-        # depends on (see ReplaySession._pump_one).
+        # _observe() awaits the market-state publication and the bus drain
+        # that follows it, and a live feed advances the clock throughout. A
+        # clock read afterwards is therefore later than the snapshot: the
+        # original tick would decide at that later time while its recorded
+        # MarketState carried the earlier one. Replay pins its clock to the
+        # marker and rebuilds the snapshot there, so the very same book would
+        # be aged against two different instants across the two runs -- FRESH
+        # in one, DEGRADED in the other, with everything DataQuality gates
+        # (opportunity generation, RUNE's data-age check, health) diverging
+        # behind it.
         #
-        # For everything else (Phase 2 Batch 1.3) it is the single logical
-        # time this tick's decisions are made at -- see this method's "TICK
-        # TIME" note. The marker records it, so it is precisely the value
-        # replay restores before re-running this tick.
-        self._tick_time = self.clock.now_ms()
+        # Adopting market.created_at closes that: the snapshot instant, the
+        # tick's decision time and the ORCHESTRATOR_TICK marker are one
+        # value, in the original run and in replay alike, and replay's own
+        # build_state() reads that same instant straight back.
+        #
+        # This is also still the correct marker timestamp for Batch 1.2's
+        # ordering invariant. The watermark covers exactly the inputs TIDAL
+        # had applied when build_state() ran, and every one of those was
+        # published before it -- so each sorts at or before the marker, with
+        # the sequence tiebreaker settling any shared millisecond (the marker
+        # is published later, so it carries the higher sequence).
+        self._tick_time = market.created_at
         try:
             await self._tick_body(market)
         finally:
@@ -333,10 +340,10 @@ class Orchestrator:
             if self.marin.last_result is None:
                 # Establish the reconciliation baseline (and MARIN's health)
                 # against an empty account before any trading is possible.
-                await self.marin.run()
-            self.state.health = self.health.snapshot()
+                await self.marin.run(self.tick_time)
+            self.state.health = self.health.snapshot(self.tick_time)
             ok, bad = self.health.all_healthy(
-                [c for c in REQUIRED_COMPONENTS if c != SERVICE]
+                [c for c in REQUIRED_COMPONENTS if c != SERVICE], self.tick_time
             )
             if ok:
                 self.warmed_up = True
@@ -495,7 +502,7 @@ class Orchestrator:
         self.rune.heartbeat()
         self.marin.heartbeat()
         self._recorder_heartbeat()
-        self.state.health = self.health.snapshot()
+        self.state.health = self.health.snapshot(self.tick_time)
 
         self.metrics.set(M.NET_PNL, portfolio.net_pnl)
         self.metrics.set(M.GROSS_PNL, portfolio.gross_pnl)
@@ -548,7 +555,7 @@ class Orchestrator:
         # Reconcile on the first protected tick and every N thereafter, so
         # MARIN's health is established before anything depends on it.
         if self.marin.last_result is None or self.ticks % self.reconcile_every == 0:
-            result = await self.marin.run()
+            result = await self.marin.run(self.tick_time)
             reconciliation_ok = result.ok
             for mismatch in result.mismatches:
                 self.metrics.inc(M.RECONCILIATION_MISMATCHES, kind=mismatch.kind.value)
@@ -626,8 +633,8 @@ class Orchestrator:
 
     async def _seek(self, market: MarketState, portfolio: PortfolioState) -> None:
         """Detect new opportunities and drive them to a decision."""
-        for opportunity in self.detector.detect(market):
-            record = self.state.add_opportunity(opportunity)
+        for opportunity in self.detector.detect(market, self.tick_time):
+            record = self.state.add_opportunity(opportunity, self.tick_time)
             self.metrics.inc(M.OPPORTUNITIES_DETECTED, symbol=opportunity.symbol)
             await self.bus.publish(
                 Event(
@@ -706,12 +713,14 @@ class Orchestrator:
             opportunity.opportunity_id,
             opportunity.symbol,
             degraded_grace_ms=self.settings.consensus.degraded_grace_ms,
+            now_ms=self.tick_time,
         )
         return self.consensus.combine(
             symbol=opportunity.symbol,
             strategy=opportunity.strategy,
             opinions=opinions,
             correlation_id=opportunity.opportunity_id,
+            now_ms=self.tick_time,
         )
 
     async def _publish_consensus(self, result: ConsensusResult) -> None:
@@ -887,7 +896,7 @@ class Orchestrator:
         self.state.risk_utilization = self.rune.core.utilization(
             portfolio, ctx.unhedged_notional, {STRATEGY: sum(self.working_notional.values())}
         )
-        return await self.rune.evaluate(intent, ctx)
+        return await self.rune.evaluate(intent, ctx, self.tick_time)
 
     def _error_rate(self) -> float:
         """Rolling share of bus deliveries that raised."""
@@ -1043,7 +1052,7 @@ class Orchestrator:
         """
         if self.veska.executor.execution_disabled:
             return
-        intents = self.okapi.build_hedges(portfolio, market)
+        intents = self.okapi.build_hedges(portfolio, market, self.tick_time)
         if not intents:
             return
         now = self.tick_time
@@ -1236,7 +1245,7 @@ class Orchestrator:
 
     def _heartbeat(self) -> None:
         ok, bad = self.health.all_healthy(
-            [c for c in REQUIRED_COMPONENTS if c != SERVICE]
+            [c for c in REQUIRED_COMPONENTS if c != SERVICE], self.tick_time
         )
         status = HealthStatus.HEALTHY if ok else HealthStatus.DEGRADED
         if self.state.kill_switch.engaged:

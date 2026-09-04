@@ -17,7 +17,7 @@ from core.clock import Clock
 from core.config import Settings
 from core.events import Event, EventType
 from core.health import HealthRegistry
-from core.models.common import Side
+from core.models.common import Millis, Side
 from core.models.market import MarketState
 from core.models.ops import DeltaReport, HealthStatus, HedgeIntent
 from core.models.portfolio import PortfolioState
@@ -50,8 +50,10 @@ class Okapi:
 
     # -- measurement -------------------------------------------------------
 
-    def delta_reports(self, portfolio: PortfolioState) -> list[DeltaReport]:
-        now = self.clock.now_ms()
+    def delta_reports(
+        self, portfolio: PortfolioState, now_ms: Millis | None = None
+    ) -> list[DeltaReport]:
+        now = self.clock.now_ms() if now_ms is None else now_ms
         tolerance = self.settings.hedge_tolerance_notional
         reports: list[DeltaReport] = []
         actuals = portfolio.net_delta_by_symbol()
@@ -107,11 +109,16 @@ class Okapi:
         )
 
     def build_hedges(
-        self, portfolio: PortfolioState, market: MarketState
+        self,
+        portfolio: PortfolioState,
+        market: MarketState,
+        now_ms: Millis | None = None,
     ) -> list[HedgeIntent]:
-        now = self.clock.now_ms()
+        # A hedge intent's created_at/deadline are gated by RUNE, so this is
+        # economic time, not metadata (Phase 2 Batch 1.4).
+        now = self.clock.now_ms() if now_ms is None else now_ms
         intents: list[HedgeIntent] = []
-        for report in self.delta_reports(portfolio):
+        for report in self.delta_reports(portfolio, now):
             if report.within_tolerance or abs(report.unhedged_delta) <= 0:
                 continue
             # Long too much -> sell; short too much -> buy.

@@ -16,7 +16,7 @@ from __future__ import annotations
 from core.clock import Clock
 from core.config import ConsensusConfig
 from core.models.agent import AgentContribution, ConsensusResult
-from core.models.common import AgentId, DataQuality
+from core.models.common import AgentId, DataQuality, Millis
 from core.state import OpinionSlot
 
 
@@ -41,8 +41,12 @@ class ConsensusEngine:
         opinions: dict[AgentId, OpinionSlot],
         correlation_id: str | None = None,
         required: list[AgentId] | None = None,
+        now_ms: Millis | None = None,
     ) -> ConsensusResult:
-        now = self.clock.now_ms()
+        # A tick supplies its own canonical time so the result it computes is
+        # stamped with the instant it decided at, not a later clock read
+        # (Phase 2 Batch 1.4).
+        now = self.clock.now_ms() if now_ms is None else now_ms
         required_agents = required if required is not None else self.config.required_agents
 
         contributions: list[AgentContribution] = []

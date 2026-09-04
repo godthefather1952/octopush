@@ -57,7 +57,9 @@ class RuneCore:
         self.evaluations = 0
         self.rejections = 0
 
-    def evaluate(self, intent: TradeIntent, ctx: RiskContext) -> RiskDecision:
+    def evaluate(
+        self, intent: TradeIntent, ctx: RiskContext, now_ms: Millis | None = None
+    ) -> RiskDecision:
         """Size the intent to fit every limit, then gate the sized intent.
 
         Order matters.  Sizing first means a trade that is merely *too large*
@@ -66,7 +68,13 @@ class RuneCore:
         size-based gate can therefore only fail if the reduction could not
         make it pass, which is exactly when rejection is the right answer.
         """
-        now: Millis = self.clock.now_ms()
+        # Risk gating is economic control flow: the data-age and deadline
+        # gates below decide whether the trade happens at all. The tick
+        # supplies its canonical time so the answer depends only on the
+        # logical instant the tick is deciding at, never on how far a
+        # concurrent feed happened to advance the clock first (Phase 2
+        # Batch 1.4).
+        now: Millis = self.clock.now_ms() if now_ms is None else now_ms
 
         headroom = self._headroom(intent, ctx)
         sized = (

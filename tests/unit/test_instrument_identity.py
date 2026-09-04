@@ -160,7 +160,7 @@ class TestNoCrossQuoteComparison:
         detector = CrossVenueDetector(
             settings.model_copy(update={"symbols": ["BTC-USD", "BTC-USDT"]}), clock
         )
-        assert detector.detect(market) == []
+        assert detector.detect(market, clock.now_ms()) == []
 
     def test_a_usdt_only_universe_produces_no_opportunity_from_one_venue(
         self, settings, clock
@@ -170,7 +170,7 @@ class TestNoCrossQuoteComparison:
         detector = CrossVenueDetector(
             settings.model_copy(update={"symbols": ["BTC-USDT"]}), clock
         )
-        assert detector.detect(market) == []
+        assert detector.detect(market, clock.now_ms()) == []
 
 
 # ======================================================================
@@ -202,7 +202,7 @@ class TestSameInstrumentStillCompares:
         detector = CrossVenueDetector(
             settings.model_copy(update={"symbols": [symbol]}), clock
         )
-        opportunities = detector.detect(market)
+        opportunities = detector.detect(market, clock.now_ms())
         assert len(opportunities) == 1
         assert opportunities[0].symbol == symbol
         assert {leg.venue for leg in opportunities[0].legs} == {"VENUE_A", "VENUE_B"}
@@ -356,7 +356,7 @@ class TestLiveFeedCannotAliasInstruments:
 
         market = tidal.build_state()
         detector = CrossVenueDetector(settings, clock)
-        assert detector.detect(market) == [], (
+        assert detector.detect(market, clock.now_ms()) == [], (
             "a live feed must not manufacture a cross-venue pair out of two "
             "different settlement assets"
         )

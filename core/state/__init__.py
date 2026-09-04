@@ -89,7 +89,12 @@ class SystemState:
         self.opinions[key] = opinion
 
     def opinion(
-        self, subject: str, agent: AgentId, *, degraded_grace_ms: int = 0
+        self,
+        subject: str,
+        agent: AgentId,
+        *,
+        degraded_grace_ms: int = 0,
+        now_ms: Millis | None = None,
     ) -> OpinionSlot | None:
         """Return the agent's opinion with its quality, or ``None`` if absent.
 
@@ -99,19 +104,30 @@ class SystemState:
         opinion = self.opinions.get((subject, agent))
         if opinion is None:
             return None
-        quality = opinion.quality_at(self.clock.now_ms(), degraded_grace_ms)
+        now = self.clock.now_ms() if now_ms is None else now_ms
+        quality = opinion.quality_at(now, degraded_grace_ms)
         return OpinionSlot(opinion=opinion, quality=quality)
 
     def opinions_for(
-        self, *subjects: str, degraded_grace_ms: int = 0
+        self,
+        *subjects: str,
+        degraded_grace_ms: int = 0,
+        now_ms: Millis | None = None,
     ) -> dict[AgentId, OpinionSlot]:
         """Collect opinions across subjects, earlier subjects winning.
 
         Callers pass the opportunity id first and the symbol second, so a
         per-opportunity opinion takes precedence over a symbol-scoped one.
+
+        ``now_ms`` is the instant the quality of each opinion is judged at.
+        A tick supplies its own canonical time so two calls inside one
+        logical tick cannot disagree about whether an opinion is FRESH,
+        DEGRADED or STALE -- those classifications carry different consensus
+        weights, so a live clock ticking past an expiry mid-tick would change
+        the decision (Phase 2 Batch 1.4).
         """
         out: dict[AgentId, OpinionSlot] = {}
-        now = self.clock.now_ms()
+        now = self.clock.now_ms() if now_ms is None else now_ms
         for subject in subjects:
             for (subj, agent), opinion in self.opinions.items():
                 if subj != subject or agent in out:
@@ -129,9 +145,15 @@ class SystemState:
 
     # -- opportunities -----------------------------------------------------
 
-    def add_opportunity(self, opportunity: Opportunity) -> OpportunityRecord:
+    def add_opportunity(
+        self, opportunity: Opportunity, now_ms: Millis | None = None
+    ) -> OpportunityRecord:
+        # The opportunity's own creation time, not a later clock read: the
+        # state machine's timestamps must not shift with scheduling delay
+        # (Phase 2 Batch 1.4).
         record = OpportunityRecord(
-            opportunity=opportunity, updated_at=self.clock.now_ms()
+            opportunity=opportunity,
+            updated_at=opportunity.created_at if now_ms is None else now_ms,
         )
         self.opportunities[opportunity.opportunity_id] = record
         self._trim_opportunities()

@@ -14,6 +14,7 @@ from core.clock import Clock
 from core.config import Settings
 from core.events import Event, EventType
 from core.health import HealthRegistry
+from core.models.common import Millis
 from core.models.opportunity import TradeIntent
 from core.models.ops import HealthStatus
 from core.models.risk import RiskDecision
@@ -41,9 +42,11 @@ class Rune:
         self.decisions: list[RiskDecision] = []
         health.register(SERVICE, VERSION)
 
-    async def evaluate(self, intent: TradeIntent, ctx: RiskContext) -> RiskDecision:
+    async def evaluate(
+        self, intent: TradeIntent, ctx: RiskContext, now_ms: Millis | None = None
+    ) -> RiskDecision:
         """Run the deterministic gates and publish the decision."""
-        decision = self.core.evaluate(intent, ctx)
+        decision = self.core.evaluate(intent, ctx, now_ms)
 
         commentary: RiskCommentary | None = self.ai.latest if self.ai is not None else None
         if commentary is not None and commentary.ok:

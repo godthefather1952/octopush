@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from core.clock import Clock
 from core.config import Settings
-from core.models.common import Side
+from core.models.common import Millis, Side
 from core.models.market import MarketState, VenueMarketState, safe_bps
 from core.models.opportunity import Opportunity, OpportunityKind, OpportunityLeg
 
@@ -97,8 +97,17 @@ class CrossVenueDetector:
         #: persistent dislocation is not re-detected every tick.
         self.active: dict[str, str] = {}
 
-    def detect(self, market: MarketState) -> list[Opportunity]:
-        now = self.clock.now_ms()
+    def detect(self, market: MarketState, now_ms: Millis) -> list[Opportunity]:
+        """Detect opportunities as of ``now_ms``.
+
+        The time is supplied, never read from the clock here (Phase 2 Batch
+        1.4): an opportunity's ``created_at``/``expires_at`` are economic --
+        they decide whether a later tick still considers it valid -- and the
+        clock can advance between the tick's market snapshot and the moment
+        _seek() actually runs. Born at a live-clock instant, an opportunity
+        would outlive its replayed twin.
+        """
+        now = now_ms
         out: list[Opportunity] = []
         for symbol in self.settings.symbols:
             if symbol in self.active:

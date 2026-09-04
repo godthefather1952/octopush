@@ -15,7 +15,7 @@ from core.config import Settings
 from core.events import Event, EventType
 from core.health import HealthRegistry
 from core.models.agent import AgentOpinion
-from core.models.common import AgentId, Side
+from core.models.common import AgentId, Millis, Side
 from core.models.market import MarketState
 from core.models.opportunity import Opportunity
 from core.models.ops import HealthStatus
@@ -56,7 +56,9 @@ class Noro:
         if event.type is EventType.MARKET_STATE:
             self.on_market_state(MarketState.model_validate(event.payload))
         elif event.type is EventType.OPPORTUNITY_DETECTED:
-            opinion = self.evaluate(Opportunity.model_validate(event.payload))
+            opinion = self.evaluate(
+                Opportunity.model_validate(event.payload), event.ts_ms
+            )
             if opinion is not None:
                 await self.publish(opinion)
 
@@ -75,18 +77,28 @@ class Noro:
 
     # -- evaluation --------------------------------------------------------
 
-    def evaluate(self, opportunity: Opportunity) -> AgentOpinion | None:
+    def evaluate(
+        self, opportunity: Opportunity, now_ms: Millis
+    ) -> AgentOpinion | None:
         """Score how well fair value confirms the opportunity's direction.
 
         Returns ``None`` when NORO cannot form a view — the orchestrator then
         sees a *missing* agent, which suspends the strategy.  It never sees a
         fabricated neutral opinion.
+
+        ``now_ms`` is the request's logical time -- the tick that asked for
+        this opinion, carried on the OPPORTUNITY_DETECTED event -- never a
+        clock read taken when this subscriber happened to be scheduled
+        (Phase 2 Batch 1.4). The opinion's ``created_at``/``expires_at``
+        decide its freshness at every later tick, so a live-clock read here
+        would let an opinion outlive its replayed twin purely because
+        dispatch was slower in one run than in the other.
         """
         fair = self.fair_values.get(opportunity.symbol)
         if fair is None or self.market is None:
             return None
 
-        now = self.clock.now_ms()
+        now = now_ms
         reasons: list[str] = []
         confirmations: list[float] = []
         detail: dict[str, float | int | str | bool | None] = {

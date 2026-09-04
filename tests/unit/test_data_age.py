@@ -147,7 +147,7 @@ class TestOpportunityUsesOldestLeg:
         detector = CrossVenueDetector(
             settings.model_copy(update={"symbols": ["BTC-USD"]}), clock
         )
-        opportunities = detector.detect(market)
+        opportunities = detector.detect(market, clock.now_ms())
         assert len(opportunities) == 1
         opp = opportunities[0]
         assert opp.source_data_timestamp == START_MS - 1_900
@@ -165,7 +165,7 @@ class TestOpportunityUsesOldestLeg:
         detector = CrossVenueDetector(
             settings.model_copy(update={"symbols": ["BTC-USD", "ETH-USD"]}), clock
         )
-        opportunities = detector.detect(market)
+        opportunities = detector.detect(market, clock.now_ms())
         assert len(opportunities) == 1
         assert opportunities[0].source_data_timestamp == START_MS - 200
 
