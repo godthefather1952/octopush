@@ -105,6 +105,24 @@ class LegacyInputVisibilityRequired(LegacyTimelineRequired):
     """
 
 
+class InvalidTickMarkerWatermark(RuntimeError):
+    """Raised mid-replay when a tick marker's watermark cannot be trusted.
+
+    ``open()`` establishes ``_input_visibility_verified`` from the FIRST
+    tick marker in range alone -- that only proves the session's build
+    recorded watermarks at all, not that every later marker's watermark is
+    sane. A marker with a missing/non-integer watermark, one lower than an
+    earlier marker's (watermarks must be monotonically non-decreasing --
+    TIDAL's applied-input count never goes backwards), or one claiming to
+    have applied a higher ``Event.sequence`` than any event this session's
+    range ever recorded (a ceiling proven once, by a full scan, in
+    ``open()``) means the recorded timeline cannot be trusted to release
+    inputs to the tick that actually saw them. Replay must stop loudly at
+    the offending marker rather than silently keep going on the strength of
+    a check performed only once, at the start, against a different marker.
+    """
+
+
 class PartialReplayUnsupported(RuntimeError):
     """Raised when ``start_ms`` skips part of a session's true beginning.
 
@@ -204,11 +222,26 @@ class ReplaySession:
     #: Sentinel-guarded so "no clock was bound" is distinguishable from
     #: "None was bound", which close() must restore faithfully.
     _previous_log_clock: Any = _UNBOUND
-    #: True once ``open()`` has confirmed every tick marker in range carries
-    #: a real input-visibility watermark. When False, ``step()`` falls back
-    #: to applying inputs immediately as they are read (Batch-1 semantics)
-    #: instead of the deferred-release mechanism below.
+    #: True once ``open()`` has confirmed the FIRST tick marker in range
+    #: carries a real input-visibility watermark. When False, ``step()``
+    #: falls back to applying inputs immediately as they are read (Batch-1
+    #: semantics) instead of the deferred-release mechanism below. Every
+    #: SUBSEQUENT marker is still checked as it is read (see
+    #: ``InvalidTickMarkerWatermark``) -- this flag only gates whether that
+    #: checking (and the deferred-release mechanism) applies at all.
     _input_visibility_verified: bool = False
+    #: Highest watermark validated so far, for monotonicity. Watermarks are
+    #: a running count of applied inputs, so -1 (below the lowest possible
+    #: real watermark of 0) is the correct "nothing validated yet" floor.
+    _last_watermark: int = -1
+    #: The highest ``Event.sequence`` recorded anywhere in this session's
+    #: replay range, of ANY event type -- computed once, by a full scan, in
+    #: ``open()``. A marker claiming a watermark above this is claiming to
+    #: have applied an input that was never even recorded, which is
+    #: impossible regardless of how ``ts_ms`` and ``sequence`` order
+    #: relate to each other elsewhere in the range. ``None`` when input
+    #: visibility is not being verified at all (the scan is skipped).
+    _max_possible_sequence: int | None = None
     #: Market-input events read but not yet applied, in the order read
     #: (which is sequence order): each is held back until a tick marker's
     #: own watermark covers its sequence, so a tick can never be handed an
@@ -291,6 +324,20 @@ class ReplaySession:
                 self.stats.timeline_fidelity = LEGACY_REPLAY_UNVERIFIED_INPUT_VISIBILITY
             else:
                 self._input_visibility_verified = True
+                # A one-time, full-range scan proving a real ceiling for
+                # every later marker's watermark (Phase 2 Batch 1.2,
+                # Section 10) -- not merely trusting the first marker and
+                # never checking again. Unfiltered by type: the ceiling
+                # must hold against every sequence this range ever
+                # recorded, not only the market-input/marker subset this
+                # session's own read stream (below) is restricted to.
+                max_seq = -1
+                async for event in self.store.read(
+                    self.session_id, start_ms=self.start_ms, end_ms=self.end_ms
+                ):
+                    if event.sequence is not None and event.sequence > max_seq:
+                        max_seq = event.sequence
+                self._max_possible_sequence = max_seq
 
         if partial_range and self.stats.timeline_fidelity is None:
             self.stats.timeline_fidelity = PARTIAL_REPLAY_UNVERIFIED_STARTING_STATE
@@ -371,6 +418,40 @@ class ReplaySession:
         if event.type is TICK_MARKER_TYPE:
             if self._input_visibility_verified:
                 watermark = _watermark_of(event)
+                # Every marker is checked here, not only the first one
+                # open() inspected to decide _input_visibility_verified --
+                # a session can carry a mix of valid and broken markers,
+                # and the first being valid says nothing about the rest.
+                if watermark is None:
+                    raise InvalidTickMarkerWatermark(
+                        f"session {self.session_id!r}: tick marker at "
+                        f"sequence={event.sequence} (tick "
+                        f"{event.payload.get('tick')!r}) has a missing or "
+                        f"non-integer {WATERMARK_KEY!r}; the first marker "
+                        "in this range had a valid watermark, so every "
+                        "later one must too."
+                    )
+                if watermark < self._last_watermark:
+                    raise InvalidTickMarkerWatermark(
+                        f"session {self.session_id!r}: tick marker at "
+                        f"sequence={event.sequence} has watermark "
+                        f"{watermark}, lower than an earlier marker's "
+                        f"{self._last_watermark} -- watermarks must be "
+                        "monotonically non-decreasing."
+                    )
+                if (
+                    self._max_possible_sequence is not None
+                    and watermark > self._max_possible_sequence
+                ):
+                    raise InvalidTickMarkerWatermark(
+                        f"session {self.session_id!r}: tick marker at "
+                        f"sequence={event.sequence} claims "
+                        f"{WATERMARK_KEY}={watermark}, higher than the "
+                        f"highest sequence recorded anywhere in this "
+                        f"range ({self._max_possible_sequence}) -- not a "
+                        "logically possible watermark."
+                    )
+                self._last_watermark = watermark
                 # Release exactly the inputs THIS tick's original snapshot
                 # had actually applied -- not merely everything published
                 # before this marker. Pending inputs are held in read

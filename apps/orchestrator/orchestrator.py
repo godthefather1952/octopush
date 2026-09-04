@@ -255,7 +255,20 @@ class Orchestrator:
         # applied when this tick's MarketState was built" is immediately
         # after that snapshot was taken. Unconditional -- a warm-up tick or
         # one that produces no trades is still a real tick boundary.
-        await self._mark_tick_boundary(now)
+        #
+        # The marker's own ts_ms is read fresh here too (Phase 2 Batch 1.2),
+        # not reused from the stale top-of-tick `now`: `_persist()` above can
+        # await real durable I/O, during which a market input can be
+        # published *and applied* with a later timestamp, and still be
+        # covered by this tick's watermark. EventStore orders events
+        # timestamp-primary (`Event.sort_key()`), so a marker stamped with
+        # the stale, earlier `now` would sort BEFORE an input it explicitly
+        # claims to have already applied -- silently breaking the
+        # deferred-input release replay depends on (see
+        # ReplaySession._pump_one). `now` itself is left untouched for
+        # _settle() below: only the marker's timeline position needs to
+        # track when it was actually built.
+        await self._mark_tick_boundary(self.clock.now_ms())
 
         await self._settle(now)
         portfolio = self._measure(market)

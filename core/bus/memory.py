@@ -108,6 +108,69 @@ closes that race regardless of how many publishers race concurrently: the
 true bound enforced everywhere is ``len(self._queue) + self._reserved``, not
 ``len(self._queue)`` alone, so a reservation "holds the publisher's place in
 line" for the entire duration middleware takes to run.
+
+ORDERED COMMIT (Phase 2 Batch 1.2 -- P2-13)
+============================================
+Reserving a capacity slot atomically (above) makes admission race-free, but
+it does not by itself make *commit order* (append-to-``_queue`` order) match
+*admission order*. Middleware runs with the capacity lock released — it must,
+since it can be slow real I/O and must not stall every other publisher's
+admission decision — and two concurrent publishers' middleware calls can
+finish in either order. Before this section existed, whichever publisher's
+middleware happened to finish first was appended first, regardless of which
+was admitted first: publisher A (admitted first, assigned the lower
+``Event.sequence``) could still be slower through middleware than publisher
+B (admitted second), so B's event could reach ``_queue`` — and so be
+dispatched to TIDAL — before A's, even though A logically came first. Any
+watermark or ordering claim built on ``Event.sequence`` being the true
+delivery order (replay's own tick-visibility cut, most directly) is false
+under that behaviour.
+
+The fix is a second, purely internal counter — ``_admission_seq`` —
+assigned to every ``publish()`` call at the exact moment it is admitted
+(inside the same locked section as the reservation, so its assignment order
+is itself race-free). It is deliberately NOT ``Event.sequence``: a caller
+(replay, most notably) can pre-set ``Event.sequence`` to a value carried over
+from a completely different bus instance's history, so ``Event.sequence``
+cannot be trusted to reflect *this* instance's own admission order. Once an
+event's middleware completes (or aborts — raises, or its task is cancelled),
+it is placed in ``_ready`` keyed by its own admission id, and
+``_flush_ready_locked`` appends the longest *contiguous prefix* of admission
+ids, starting from ``_next_commit``, that has already resolved — abort or
+success — releasing each one's reservation as it commits. A later-finishing
+publisher's event physically cannot overtake an earlier one still in
+middleware: it is held in ``_ready`` until every earlier admission id has
+resolved, then flushed in the same call that finally unblocks the logjam
+(whether that is its own completion or an earlier admission's).
+
+This guarantees, for every event that reaches this bus instance's ``_queue``
+at all: admission order == queue order == dispatch order. A permanently
+stuck earlier publisher (middleware that never resolves at all — never
+returns, never raises, never gets cancelled) still blocks every later one
+from committing; nothing can fix that without abandoning the ordering
+guarantee entirely, and it is no worse than today's behaviour, in which that
+same stuck publisher already blocks callers waiting on ``drain()``/
+``wait_idle()`` from ever correctly observing quiescence. See "IDLE
+CORRECTNESS" below for the related fix to ``drain()``/``wait_idle()`` needed
+once ``_reserved`` can be nonzero for a *committed* (not just mid-middleware)
+duration.
+
+IDLE CORRECTNESS (Phase 2 Batch 1.2)
+=====================================
+``_run()``'s and ``drain()``'s "is there still work outstanding" check used
+to test ``self._queue`` alone. That was already an approximation before this
+section existed: a publisher that had reserved capacity but not yet finished
+middleware left ``_queue`` empty while genuinely more work was still coming,
+so ``wait_idle()`` (hence ``drain()`` under a running background dispatcher)
+could return while a publish was still in flight and about to append. Now
+that ordered commit can hold a *finished* middleware's event in ``_ready``
+behind an earlier, still-unresolved admission, that same gap would silently
+widen. The fix: "idle" means ``not self._queue and self._reserved == 0`` —
+nothing queued and nothing admitted-but-uncommitted, whether mid-middleware
+or waiting in ``_ready`` for its commit turn — and every place that changes
+either quantity notifies ``self._capacity`` so waiters (``drain()`` without a
+background dispatcher now waits on the condition variable rather than
+busy-looping) observe the change immediately rather than on a polling delay.
 """
 
 from __future__ import annotations
@@ -245,6 +308,22 @@ class InMemoryEventBus(EventBus):
         #: reservation is released and this is counted so the condition is
         #: observable rather than a silent capacity leak.
         self.reservation_released = 0
+        #: Internal admission-order counter -- see "ORDERED COMMIT" above.
+        #: Deliberately distinct from ``_seq``/``Event.sequence``: assigned
+        #: fresh to every publish() call on THIS bus instance, regardless of
+        #: whether the event's own ``Event.sequence`` was pre-set by a
+        #: caller (replay) carrying it over from a different bus instance's
+        #: history.
+        self._admission_seq = itertools.count(1)
+        #: The next admission id whose resolution (success or abort) is
+        #: still needed before anything can be appended to ``_queue``.
+        self._next_commit = 1
+        #: Admission id -> event, for a middleware that finished but is
+        #: still waiting for every earlier admission id to resolve first.
+        self._ready: dict[int, Event] = {}
+        #: Admission ids whose middleware raised or was cancelled -- skipped
+        #: (not appended) when their turn in commit order arrives.
+        self._aborted: set[int] = set()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -275,10 +354,18 @@ class InMemoryEventBus(EventBus):
     async def _run(self) -> None:
         while self._running:
             if not self._queue:
-                self._idle.set()
+                # "Idle" means nothing queued AND nothing admitted-but-not-
+                # yet-committed (see "IDLE CORRECTNESS" in the module
+                # docstring) -- a publish still mid-middleware, or held in
+                # `_ready` waiting for an earlier admission's commit turn,
+                # both still represent work that is genuinely coming.
+                if self._reserved == 0:
+                    self._idle.set()
                 self._work.clear()
-                # Wake on the next publication; the timeout only bounds how
-                # long stop() waits.
+                # Wake on the next publication (or the next commit, if
+                # something is only waiting on `_reserved`); the timeout
+                # only bounds how long stop() waits and how promptly a
+                # reserved-but-not-yet-queued commit is re-checked.
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._work.wait(), timeout=0.05)
                 continue
@@ -339,20 +426,31 @@ class InMemoryEventBus(EventBus):
             # event counts against every other publisher's admission check
             # even though it has not been appended to ``_queue`` yet.
             self._reserved += 1
+            self._idle.clear()
+            # Admission id: this bus instance's own record of the order in
+            # which publish() calls were admitted -- see "ORDERED COMMIT" in
+            # the module docstring. Assigned in the same locked section as
+            # the reservation, so its order is race-free the same way
+            # admission itself is.
+            admission_id = next(self._admission_seq)
 
         # Middleware runs with the lock released: it can be slow (real I/O,
         # in the recorder's case) and must not stall every other publisher's
         # admission decision while it does. The reservation above already
         # accounts for this event, so that staying unlocked here cannot
-        # reopen the concurrent-admission race.
+        # reopen the concurrent-admission race. Because commit is ordered by
+        # admission id (below), a slower-middleware publisher admitted
+        # earlier still cannot be overtaken by a faster one admitted later.
         try:
             for mw in self._middleware:
                 await mw(event)
         except BaseException:
-            # The event never reaches the queue: release the reservation so
-            # it stops counting against capacity, and wake anyone waiting for
-            # room. Whether an individual middleware's own side effect (e.g.
-            # a recorder having already buffered the event before a *later*
+            # The event never reaches the queue. Its reservation is released
+            # as part of the ordered commit (below), not immediately: a
+            # later admission id may already be sitting in ``_ready`` behind
+            # this one, and skipping this slot is what lets it proceed.
+            # Whether an individual middleware's own side effect (e.g. a
+            # recorder having already buffered the event before a *later*
             # middleware raised) is itself undone is that middleware's own
             # responsibility -- this bus guarantees only that an event which
             # never reaches ANY middleware (rejected or abandoned at
@@ -360,17 +458,49 @@ class InMemoryEventBus(EventBus):
             # actually attaches (``Recorder.record``) never raises in normal
             # operation; this path exists chiefly for task cancellation.
             async with self._capacity:
-                self._reserved -= 1
+                self._aborted.add(admission_id)
                 self.reservation_released += 1
+                appended = self._flush_ready_locked()
                 self._capacity.notify_all()
+            if appended:
+                self._work.set()
             raise
 
         async with self._capacity:
-            self._reserved -= 1
-            self.published_count += 1
-            self._queue.append(event)
-        self._idle.clear()
-        self._work.set()
+            self._ready[admission_id] = event
+            appended = self._flush_ready_locked()
+            self._capacity.notify_all()
+        if appended:
+            self._work.set()
+
+    def _flush_ready_locked(self) -> bool:
+        """Append the longest already-resolved prefix, in admission order.
+
+        Must be called with ``self._capacity`` held. Releases each
+        committed admission id's reservation as it resolves -- whether by
+        being appended (success) or skipped (abort) -- so a permanently
+        stuck earlier admission is the only thing that can leave later,
+        already-``_ready`` events waiting forever; anything that eventually
+        resolves (success, exception, or cancellation) unblocks every
+        admission id behind it. Returns whether anything was appended (the
+        caller sets ``self._work`` only then, outside the lock).
+        """
+        appended = False
+        while True:
+            if self._next_commit in self._aborted:
+                self._aborted.discard(self._next_commit)
+                self._next_commit += 1
+                self._reserved -= 1
+                continue
+            if self._next_commit in self._ready:
+                self._queue.append(self._ready.pop(self._next_commit))
+                self._next_commit += 1
+                self._reserved -= 1
+                self.published_count += 1
+                appended = True
+                continue
+            break
+        return appended
 
     def subscribe(
         self,
@@ -433,16 +563,32 @@ class InMemoryEventBus(EventBus):
         to reproduce identically before TIDAL-M7 touched this file.
 
         ``_idle`` is the correct signal instead: ``publish()`` clears it the
-        moment anything is enqueued, and only ``_run()``'s own loop sets it
-        again, and only once it re-checks the queue and finds it empty *after*
-        a dispatch (including the handler) has fully completed. Waiting on it
-        here means drain() cannot return while a dispatch is still in flight.
+        moment anything is admitted (not merely enqueued -- see "IDLE
+        CORRECTNESS" in the module docstring), and only ``_run()``'s own loop
+        sets it again, and only once both the queue and ``_reserved`` are
+        empty *after* a dispatch (including the handler) has fully
+        completed. Waiting on it here means drain() cannot return while a
+        dispatch, or a concurrent publish still admitted-but-uncommitted, is
+        still in flight.
+
+        Without a background dispatcher, this loop drives dispatch itself,
+        but must still wait -- on the same condition variable ``publish()``
+        notifies, never a fixed sleep -- whenever the queue is momentarily
+        empty but ``_reserved`` is not: that means a concurrent publish() is
+        still mid-middleware or waiting in ``_ready`` for its commit turn
+        (ordered commit, see the module docstring), and will append more
+        shortly.
         """
         if self._task is not None:
             await self.wait_idle()
             return
         cycles = 0
-        while self._queue:
+        while True:
+            async with self._capacity:
+                await self._capacity.wait_for(lambda: bool(self._queue) or self._reserved == 0)
+                should_dispatch = bool(self._queue)
+            if not should_dispatch:
+                break
             await self._dispatch_one()
             cycles += 1
             if cycles > max_cycles:
