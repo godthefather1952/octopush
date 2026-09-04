@@ -15,7 +15,7 @@ from agents.tidal.metrics import MidWindow, TradeFlowWindow, compute_metrics
 from core.bus import EventBus
 from core.clock import Clock
 from core.config import Settings
-from core.events import Event, EventType
+from core.events import MARKET_INPUT_TYPES, Event, EventType
 from core.health import HealthRegistry
 from core.models.agent import AgentOpinion
 from core.models.common import AgentId, DataQuality, Millis
@@ -93,6 +93,23 @@ class Tidal:
         #: correction) -- see ``_persistent_overflow_threshold``.
         self._snapshot_overflow_streak: dict[tuple[str, str], int] = {}
         self.state: MarketState | None = None
+        #: Highest ``Event.sequence`` among market-input events actually
+        #: applied to book state so far. Publication order (when
+        #: ``bus.publish()`` assigns a sequence number) and dispatch order
+        #: (when a subscriber's handler actually runs) are NOT the same
+        #: moment under an asynchronous bus -- an event can be published,
+        #: recorded, and even sit ahead of a later tick boundary in the
+        #: stored timeline, while still not yet applied here. This is the
+        #: one place that knows the difference, updated only after a
+        #: handler has actually mutated book state (see ``on_event``).
+        self.processed_input_sequence: int = -1
+        #: ``processed_input_sequence`` captured at the exact moment of the
+        #: most recent ``build_state()`` call (see ``publish_state``) --
+        #: frozen there deliberately, since ``processed_input_sequence``
+        #: itself can keep advancing afterward (e.g. during the
+        #: orchestrator's own post-snapshot ``bus.drain()``) without that
+        #: advance being reflected in the ``MarketState`` already returned.
+        self.last_snapshot_input_sequence: int = -1
         health.register(SERVICE, VERSION)
 
     #: Floor on the interval between resync requests for one book, in ms.
@@ -169,6 +186,16 @@ class Tidal:
             for (venue, _symbol), book in self.books.items():
                 if venue == status.venue:
                     book.invalidate("venue disconnected")
+
+        # Recorded AFTER the branch above has actually mutated state, and
+        # only for genuine market inputs -- OPPORTUNITY_DETECTED is handled
+        # here too but is not a market input replay ever needs to cut on.
+        if (
+            event.type in MARKET_INPUT_TYPES
+            and event.sequence is not None
+            and event.sequence > self.processed_input_sequence
+        ):
+            self.processed_input_sequence = event.sequence
 
     async def request_resync(self, venue: str, symbol: str, reason: str = "") -> None:
         """Ask whoever owns this feed for a fresh checkpoint.
@@ -489,6 +516,12 @@ class Tidal:
 
     async def publish_state(self) -> MarketState:
         state = self.build_state()
+        # Frozen here, at the exact moment book state was read for ``state``
+        # -- not read later by the caller, since ``processed_input_sequence``
+        # can keep advancing (e.g. during the orchestrator's own
+        # post-snapshot ``bus.drain()``) without that later advance being
+        # reflected in the ``state`` already computed above.
+        self.last_snapshot_input_sequence = self.processed_input_sequence
         await self.bus.publish(
             Event(
                 type=EventType.MARKET_STATE,

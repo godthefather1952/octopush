@@ -22,7 +22,12 @@ from core.clock import ManualClock
 from core.config import load_settings
 from core.events import EventType
 from core.logging import configure_logging
-from replay.engine import LegacyTimelineRequired, ReplayMode, ReplaySession
+from replay.engine import (
+    LegacyTimelineRequired,
+    PartialReplayUnsupported,
+    ReplayMode,
+    ReplaySession,
+)
 from storage import build_store
 
 log = logging.getLogger("replay")
@@ -84,10 +89,13 @@ async def replay(args: argparse.Namespace) -> None:
         session_id=args.session,
         mode=ReplayMode.STEP if args.step else ReplayMode.FAST,
         legacy_timeline=args.legacy_timeline,
+        legacy_input_visibility=args.legacy_input_visibility,
+        allow_partial_range=args.allow_partial_range,
     )
     try:
         await session.open()
-    except LegacyTimelineRequired as exc:
+    except (LegacyTimelineRequired, PartialReplayUnsupported) as exc:
+        # LegacyInputVisibilityRequired is a LegacyTimelineRequired subclass.
         raise SystemExit(str(exc)) from exc
 
     # NOTE: session.close() is deliberately not called here -- that is a
@@ -149,9 +157,30 @@ def main() -> None:
         "--legacy-timeline",
         action="store_true",
         help=(
-            "replay a session recorded before ORCHESTRATOR_TICK markers existed, "
-            "accepting that its tick cadence is unverified rather than an exact "
-            "reproduction of the original run"
+            "replay a session (or range) recorded before ORCHESTRATOR_TICK markers "
+            "existed, accepting that its tick cadence is unverified rather than an "
+            "exact reproduction of the original run"
+        ),
+    )
+    parser.add_argument(
+        "--legacy-input-visibility",
+        action="store_true",
+        help=(
+            "replay a session whose tick markers predate the input-visibility "
+            "watermark, accepting that the exact market-input cut each tick "
+            "observed is unverified even though the tick cadence is not"
+        ),
+    )
+    parser.add_argument(
+        "--allow-partial-range",
+        action="store_true",
+        help=(
+            "replay a ReplaySession range that starts after the session's true "
+            "beginning, accepting that every component starts empty with no "
+            "checkpoint of whatever state had accumulated before that point in "
+            "the original run (this CLI does not itself expose a start-ms option; "
+            "this flag matters only to callers constructing a ReplaySession "
+            "programmatically with one)"
         ),
     )
     args = parser.parse_args()

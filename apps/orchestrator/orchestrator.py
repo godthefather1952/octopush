@@ -241,19 +241,22 @@ class Orchestrator:
         self.ticks += 1
         now = self.clock.now_ms()
 
-        # Mark this tick's exact position in the recorded timeline before
-        # anything else runs, so replay can recover it later instead of
-        # inferring a tick cadence from the number of market events (see
-        # _mark_tick_boundary). Unconditional -- a warm-up tick or one that
-        # produces no trades is still a real tick boundary.
-        await self._mark_tick_boundary(now)
-
         # First, not last: the warm-up branch below can return early, and a
         # tick that skipped persistence would reintroduce exactly the quiet
         # period this is here to close.
         await self._persist()
 
         market = await self._observe()
+
+        # Marked HERE, right after _observe()'s snapshot, not at the top of
+        # the tick: under an asynchronous bus, publication order and
+        # dispatch order are not the same thing (see _mark_tick_boundary),
+        # so the only moment that correctly answers "what had TIDAL actually
+        # applied when this tick's MarketState was built" is immediately
+        # after that snapshot was taken. Unconditional -- a warm-up tick or
+        # one that produces no trades is still a real tick boundary.
+        await self._mark_tick_boundary(now)
+
         await self._settle(now)
         portfolio = self._measure(market)
         self._refresh_risk_utilization(portfolio)
@@ -304,18 +307,29 @@ class Orchestrator:
         only because nothing checked it. The true cadence (e.g. 20 book
         events between two 250ms ticks live) is a fact about the original
         run, not something derivable from how many market events a replay
-        happens to read back.
-
-        Publishing this here, as the very first thing every tick does,
-        relies on nothing more than the bus's own existing global sequence
-        counter (``Event.sort_key()`` / storage's ``ORDER BY ts_ms,
-        COALESCE(seq, 0), event_id``): this marker's sequence number lands
-        after every market event that was published before this tick call
-        and before every one published after it, with no separate
-        coordination needed. ``ORCHESTRATOR_TICK`` is deliberately excluded
+        happens to read back. ``ORCHESTRATOR_TICK`` is deliberately excluded
         from ``MARKET_INPUT_TYPES`` -- replay reads it as a control marker,
-        never republishes it onto the bus as data, and it does not
-        participate in the pipeline the way a real input does.
+        never republishes it onto the bus as data.
+
+        The marker's OWN position in the recorded timeline (its sequence
+        number) is not, by itself, sufficient to say which market inputs
+        this tick actually saw: under an asynchronous bus, an input can be
+        published (and recorded) well before this marker while still not
+        having been *dispatched* to TIDAL yet, and conversely an input
+        published after this marker's own ``bus.publish()`` call can race
+        ahead and be applied before it, if the event loop happens to
+        interleave that way. Publication order is not delivery order.
+
+        ``processed_input_sequence`` is the actual fact replay needs:
+        TIDAL's own record of the highest market-input sequence number it
+        had *applied* to book state at the exact moment this tick's
+        ``MarketState`` was built (``Tidal.last_snapshot_input_sequence``,
+        frozen in ``publish_state()`` -- not read fresh here, since it can
+        keep advancing during this tick's own post-snapshot ``bus.drain()``
+        without that being reflected in the market state already computed).
+        Replay uses this value to defer applying any input whose sequence
+        exceeds it until whichever later tick's watermark does cover it,
+        rather than assuming "published earlier" means "seen by this tick".
         """
         await self.bus.publish(
             Event(
@@ -323,7 +337,11 @@ class Orchestrator:
                 ts_ms=now,
                 source=SERVICE,
                 schema_name="OrchestratorTick",
-                payload={"tick": self.ticks, "warmed_up": self.warmed_up},
+                payload={
+                    "tick": self.ticks,
+                    "warmed_up": self.warmed_up,
+                    "processed_input_sequence": self.tidal.last_snapshot_input_sequence,
+                },
             )
         )
 

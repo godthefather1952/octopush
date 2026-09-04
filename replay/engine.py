@@ -4,7 +4,7 @@ Takes a recorded session and feeds it back through the platform.  Replay is a
 product feature: it is how "strategy v1.2 vs v1.3 on exactly the same market"
 becomes a meaningful sentence.
 
-Determinism comes from four rules:
+Determinism comes from five rules:
 
 1. Time comes from a :class:`ManualClock` driven by the recorded timestamps,
    so nothing observes wall-clock time.
@@ -18,11 +18,23 @@ Determinism comes from four rules:
    marker recorded once per tick — not one tick per replayed market event.
    A session recorded before this marker existed has no verified tick
    cadence at all; see ``ReplaySession.legacy_timeline``.
+5. Each tick sees EXACTLY the market inputs the original tick's snapshot
+   had actually applied — not merely every input published before it. A
+   market-input event's own sequence number says when it was *published*;
+   under an asynchronous bus that is not the same moment it was *applied*
+   to TIDAL's book (see ``Tidal.processed_input_sequence``). Each
+   ``ORCHESTRATOR_TICK`` marker therefore carries the exact watermark of
+   applied inputs as of that tick's snapshot, and replay defers publishing
+   any input whose sequence exceeds the current tick's watermark until
+   whichever later tick's watermark does cover it. A session recorded
+   before this watermark existed has a verified CADENCE but not a verified
+   input-visibility CUT; see ``ReplaySession.legacy_input_visibility``.
 """
 
 from __future__ import annotations
 
 import logging
+from collections import deque
 from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -42,17 +54,34 @@ _UNBOUND = object()
 #: Never included in ``MARKET_INPUT_TYPES``; never republished onto the bus.
 TICK_MARKER_TYPE: EventType = EventType.ORCHESTRATOR_TICK
 
+#: The tick-marker payload key carrying ``Tidal.last_snapshot_input_sequence``.
+WATERMARK_KEY = "processed_input_sequence"
+
 #: Reported on :class:`ReplayStats` when a session predates tick-boundary
-#: markers and was replayed anyway via ``legacy_timeline=True``. Distinct
-#: from ``None`` (verified: every tick boundary came from a real marker) so
-#: nothing can mistake a legacy replay for an exact one.
+#: markers entirely (or the requested start_ms/end_ms range excludes every
+#: one the full session has) and was replayed anyway via
+#: ``legacy_timeline=True``. Distinct from ``None`` (verified) so nothing
+#: can mistake a legacy replay for an exact one.
 LEGACY_REPLAY_UNVERIFIED_TIMELINE = "LEGACY_REPLAY_UNVERIFIED_TIMELINE"
+
+#: Reported when tick markers exist but predate the input-visibility
+#: watermark (recorded by a Batch-1-only build) and were replayed anyway via
+#: ``legacy_input_visibility=True``. The tick CADENCE is verified; the exact
+#: market-input CUT each tick observed is not.
+LEGACY_REPLAY_UNVERIFIED_INPUT_VISIBILITY = "LEGACY_REPLAY_UNVERIFIED_INPUT_VISIBILITY"
+
+#: Reported when ``start_ms`` skips part of the session's true beginning and
+#: the caller explicitly accepted that via ``allow_partial_range=True``. Every
+#: component (TIDAL's books included) starts empty at ``start_ms`` with no
+#: checkpoint of whatever state had accumulated before it in the original run.
+PARTIAL_REPLAY_UNVERIFIED_STARTING_STATE = "PARTIAL_REPLAY_UNVERIFIED_STARTING_STATE"
 
 log = logging.getLogger(__name__)
 
 
 class LegacyTimelineRequired(RuntimeError):
-    """Raised when a session has no recorded tick-boundary markers.
+    """Raised when a session (or the requested replay range) has no recorded
+    tick-boundary markers.
 
     Replaying such a session by falling back to one tick per market event
     would silently reintroduce the exact defect this marker exists to fix,
@@ -61,6 +90,40 @@ class LegacyTimelineRequired(RuntimeError):
     the result is then reported as ``LEGACY_REPLAY_UNVERIFIED_TIMELINE``,
     never as a verified reproduction of the original tick cadence.
     """
+
+
+class LegacyInputVisibilityRequired(LegacyTimelineRequired):
+    """Raised when tick markers exist but carry no input-visibility watermark.
+
+    Such a session was recorded by a build that fixed tick CADENCE but not
+    the finer publication-vs-delivery race: a market input published before
+    a tick marker is not guaranteed to have been applied to TIDAL by the
+    time that tick's snapshot was taken. Pass
+    ``legacy_input_visibility=True`` to replay it anyway, explicitly
+    accepting that the exact input cut each tick saw is unverified --
+    reported as ``LEGACY_REPLAY_UNVERIFIED_INPUT_VISIBILITY``.
+    """
+
+
+class PartialReplayUnsupported(RuntimeError):
+    """Raised when ``start_ms`` skips part of a session's true beginning.
+
+    Replay always constructs a fresh platform -- TIDAL's books start empty.
+    Replaying from the true start of a session, that is correct: the
+    original session's books were empty too. Replaying from some later
+    ``start_ms`` is not: the original session's books were NOT empty at that
+    point, and there is no checkpoint here to reconstruct that state from.
+    Pretending a fresh platform started at an arbitrary ``start_ms`` is
+    equivalent to the original session would be silently wrong. Pass
+    ``allow_partial_range=True`` to proceed anyway, explicitly accepting
+    that the starting state is unverified -- reported as
+    ``PARTIAL_REPLAY_UNVERIFIED_STARTING_STATE``.
+    """
+
+
+def _watermark_of(marker: Event) -> int | None:
+    value = marker.payload.get(WATERMARK_KEY)
+    return value if isinstance(value, int) else None
 
 
 class ReplayMode(StrEnum):
@@ -81,9 +144,10 @@ class ReplayStats:
     ticks_read: int = 0
     first_ts: Millis | None = None
     last_ts: Millis | None = None
-    #: ``None`` once the session's tick cadence is verified from real
-    #: markers; ``LEGACY_REPLAY_UNVERIFIED_TIMELINE`` if it was replayed
-    #: under ``legacy_timeline=True`` because no markers exist.
+    #: ``None`` once every fidelity check below is satisfied; otherwise the
+    #: single worst applicable constant among ``LEGACY_REPLAY_UNVERIFIED_TIMELINE``,
+    #: ``LEGACY_REPLAY_UNVERIFIED_INPUT_VISIBILITY``, and
+    #: ``PARTIAL_REPLAY_UNVERIFIED_STARTING_STATE``.
     timeline_fidelity: str | None = None
 
     @property
@@ -117,10 +181,21 @@ class ReplaySession:
     #: Extra seed material, so the same session can be replayed under different
     #: id streams when comparing two code versions side by side.
     id_seed: str = ""
-    #: Required to replay a session recorded before ORCHESTRATOR_TICK markers
-    #: existed. Without it, ``open()`` raises ``LegacyTimelineRequired``
-    #: rather than silently falling back to one tick per market event.
+    #: Required to replay a session (or requested range) with no recorded
+    #: ORCHESTRATOR_TICK markers. Without it, ``open()`` raises
+    #: ``LegacyTimelineRequired`` rather than silently falling back to one
+    #: tick per market event.
     legacy_timeline: bool = False
+    #: Required to replay a session whose tick markers predate the
+    #: input-visibility watermark (a Batch-1-only recording). Without it,
+    #: ``open()`` raises ``LegacyInputVisibilityRequired`` rather than
+    #: silently assuming publication order is delivery order.
+    legacy_input_visibility: bool = False
+    #: Required when ``start_ms`` skips part of the session's true
+    #: beginning. Without it, ``open()`` raises ``PartialReplayUnsupported``
+    #: rather than silently starting every component empty at an arbitrary
+    #: mid-session point with no checkpoint of what came before it.
+    allow_partial_range: bool = False
     _id_generator: IdGenerator | None = None
     _previous_ids: IdGenerator | None = None
     stats: ReplayStats = field(default_factory=ReplayStats)
@@ -129,6 +204,22 @@ class ReplaySession:
     #: Sentinel-guarded so "no clock was bound" is distinguishable from
     #: "None was bound", which close() must restore faithfully.
     _previous_log_clock: Any = _UNBOUND
+    #: True once ``open()`` has confirmed every tick marker in range carries
+    #: a real input-visibility watermark. When False, ``step()`` falls back
+    #: to applying inputs immediately as they are read (Batch-1 semantics)
+    #: instead of the deferred-release mechanism below.
+    _input_visibility_verified: bool = False
+    #: Market-input events read but not yet applied, in the order read
+    #: (which is sequence order): each is held back until a tick marker's
+    #: own watermark covers its sequence, so a tick can never be handed an
+    #: input its ORIGINAL snapshot had not actually applied yet, even if
+    #: that input was published (and so appears in the stream) earlier.
+    _pending_inputs: deque[Event] = field(default_factory=deque)
+    #: Items ready to hand back from ``step()``. A single underlying stream
+    #: item can produce several of these in one internal pump (a tick
+    #: marker releasing a batch of previously-deferred inputs ahead of
+    #: itself), while ``step()``'s own contract still returns one at a time.
+    _output_queue: deque[Event] = field(default_factory=deque)
 
     async def open(self) -> None:
         # Bind the replay clock for logging, so log lines carry replay time
@@ -142,25 +233,67 @@ class ReplaySession:
             self._previous_ids = set_id_generator(self._id_generator)
         await self.store.open()
 
+        info = await self.store.session(self.session_id)
+        partial_range = (
+            self.start_ms is not None and info is not None and self.start_ms > info.started_at
+        )
+        if partial_range and not self.allow_partial_range:
+            raise PartialReplayUnsupported(
+                f"session {self.session_id!r}: start_ms={self.start_ms} is after "
+                f"the session's true start ({info.started_at}). Replay always "
+                "constructs a fresh platform, so every component (TIDAL's books "
+                "included) would start empty at start_ms, at a point where the "
+                "original session already had accumulated state -- there is no "
+                "checkpoint here to reconstruct that state from. Pass "
+                "allow_partial_range=True to proceed anyway, explicitly "
+                "accepting that the starting state is unverified."
+            )
+
         has_tick_markers = False
-        async for _ in self.store.read(self.session_id, types=[TICK_MARKER_TYPE]):
+        first_marker: Event | None = None
+        async for marker in self.store.read(
+            self.session_id, types=[TICK_MARKER_TYPE], start_ms=self.start_ms, end_ms=self.end_ms
+        ):
             has_tick_markers = True
+            first_marker = marker
             break
 
         read_types = set(self.input_types)
-        if has_tick_markers:
-            read_types.add(TICK_MARKER_TYPE)
-        elif not self.legacy_timeline:
-            raise LegacyTimelineRequired(
-                f"session {self.session_id!r} has no recorded ORCHESTRATOR_TICK "
-                "markers -- it predates tick-boundary recording. Replaying it "
-                "would have to fall back to one tick per market event, which "
-                "is not a verified reproduction of the original tick cadence. "
-                "Pass legacy_timeline=True to ReplaySession to replay it "
-                "anyway, explicitly accepting unverified timeline fidelity."
-            )
-        else:
+        if not has_tick_markers:
+            if not self.legacy_timeline:
+                raise LegacyTimelineRequired(
+                    f"session {self.session_id!r} has no recorded ORCHESTRATOR_TICK "
+                    "markers in the requested range -- either it predates "
+                    "tick-boundary recording entirely, or the requested "
+                    "start_ms/end_ms excludes every marker the full session has. "
+                    "Replaying it would have to fall back to one tick per market "
+                    "event, which is not a verified reproduction of the original "
+                    "tick cadence. Pass legacy_timeline=True to ReplaySession to "
+                    "replay it anyway, explicitly accepting unverified timeline "
+                    "fidelity."
+                )
             self.stats.timeline_fidelity = LEGACY_REPLAY_UNVERIFIED_TIMELINE
+        else:
+            read_types.add(TICK_MARKER_TYPE)
+            assert first_marker is not None
+            if _watermark_of(first_marker) is None:
+                if not self.legacy_input_visibility:
+                    raise LegacyInputVisibilityRequired(
+                        f"session {self.session_id!r} has tick-boundary markers "
+                        "but they carry no recorded input-visibility watermark "
+                        f"({WATERMARK_KEY!r}) -- it was recorded before that "
+                        "existed. Replay can reproduce the original tick CADENCE "
+                        "but not necessarily the exact market-input CUT each "
+                        "tick observed. Pass legacy_input_visibility=True to "
+                        "replay it anyway, explicitly accepting unverified "
+                        "input-visibility fidelity."
+                    )
+                self.stats.timeline_fidelity = LEGACY_REPLAY_UNVERIFIED_INPUT_VISIBILITY
+            else:
+                self._input_visibility_verified = True
+
+        if partial_range and self.stats.timeline_fidelity is None:
+            self.stats.timeline_fidelity = PARTIAL_REPLAY_UNVERIFIED_STARTING_STATE
 
         self._iterator = self.store.read(
             self.session_id,
@@ -188,9 +321,90 @@ class ReplaySession:
     def __exit__(self, *exc) -> None:
         self.close()
 
+    async def _apply_and_queue(self, event: Event) -> None:
+        """Publish one market-input event, drain it, and queue it for return.
+
+        The one place that actually applies an input to the bus (hence to
+        TIDAL). Called either immediately as an input is read (when the
+        session's input-visibility is unverified -- Batch-1 semantics) or
+        later, once a tick marker's watermark confirms this input belongs
+        before that tick (see ``step()``).
+        """
+        if event.ts_ms > self.clock.now_ms():
+            self.clock.set(event.ts_ms)
+        replayed = event.model_copy(deep=True)
+        replayed.id = event.id
+        replayed.sequence = event.sequence
+        await self.bus.publish(replayed)
+        await self.bus.drain()
+        self.stats.events_published += 1
+        if self.on_event is not None:
+            self.on_event(replayed)
+        self._output_queue.append(replayed)
+
+    async def _pump_one(self) -> bool:
+        """Advance the underlying stream by exactly one stored item.
+
+        Returns ``False`` only once the stream is exhausted AND every
+        deferred input has been flushed (nothing left to ever release);
+        returns ``True`` otherwise, whether or not this particular pump
+        produced anything in ``_output_queue`` yet (a buffered input
+        produces nothing until its release point).
+        """
+        assert self._iterator is not None
+        try:
+            event = await self._iterator.__anext__()
+        except StopAsyncIteration:
+            # Nothing left to gate these on: apply whatever is still
+            # pending, in the order it was read, rather than silently
+            # dropping it.
+            while self._pending_inputs:
+                await self._apply_and_queue(self._pending_inputs.popleft())
+            self._finished = True
+            return False
+
+        self.stats.events_read += 1
+        if self.stats.first_ts is None:
+            self.stats.first_ts = event.ts_ms
+        self.stats.last_ts = event.ts_ms
+
+        if event.type is TICK_MARKER_TYPE:
+            if self._input_visibility_verified:
+                watermark = _watermark_of(event)
+                # Release exactly the inputs THIS tick's original snapshot
+                # had actually applied -- not merely everything published
+                # before this marker. Pending inputs are held in read
+                # (sequence) order, so this is a simple prefix release.
+                while (
+                    self._pending_inputs
+                    and watermark is not None
+                    and self._pending_inputs[0].sequence is not None
+                    and self._pending_inputs[0].sequence <= watermark
+                ):
+                    await self._apply_and_queue(self._pending_inputs.popleft())
+            # The replay clock is the recorded clock. Nothing downstream can
+            # tell the difference between this and the original session.
+            if event.ts_ms > self.clock.now_ms():
+                self.clock.set(event.ts_ms)
+            self.stats.ticks_read += 1
+            if self.on_event is not None:
+                self.on_event(event)
+            self._output_queue.append(event)
+            return True
+
+        if self._input_visibility_verified:
+            # Held back until a tick marker's watermark says the original
+            # tick had actually applied it -- publishing (hence recording)
+            # order is not applying (hence TIDAL-visible) order.
+            self._pending_inputs.append(event)
+            return True
+
+        await self._apply_and_queue(event)
+        return True
+
     async def step(self) -> Event | None:
-        """Advance replay by exactly one stored item. Returns ``None`` at the
-        end.
+        """Advance replay by exactly one logical item. Returns ``None`` at
+        the end.
 
         The returned item is either a market-input event -- already
         published to the bus and drained before this returns -- or an
@@ -201,41 +415,24 @@ class ReplaySession:
         market data (e.g. anything reading ``MARKET_INPUT_TYPES`` payloads)
         can ignore the distinction entirely, since a marker never reaches the
         bus for them to see.
+
+        A single call can do more work internally than "read one stored
+        item": when input-visibility is verified, a market input read here
+        may not become the return value of THIS call at all -- it can sit
+        deferred across any number of ``step()`` calls until the tick marker
+        whose watermark covers it is reached, at which point it (and any
+        other inputs deferred alongside it) are applied and surface through
+        subsequent calls before that marker itself does.
         """
         if self._iterator is None:
             await self.open()
         assert self._iterator is not None
-        try:
-            event = await self._iterator.__anext__()
-        except StopAsyncIteration:
-            self._finished = True
-            return None
-
-        self.stats.events_read += 1
-        if self.stats.first_ts is None:
-            self.stats.first_ts = event.ts_ms
-        self.stats.last_ts = event.ts_ms
-
-        # The replay clock is the recorded clock. Nothing downstream can tell
-        # the difference between this and the original session.
-        if event.ts_ms > self.clock.now_ms():
-            self.clock.set(event.ts_ms)
-
-        if event.type is TICK_MARKER_TYPE:
-            self.stats.ticks_read += 1
-            if self.on_event is not None:
-                self.on_event(event)
-            return event
-
-        replayed = event.model_copy(deep=True)
-        replayed.id = event.id
-        replayed.sequence = event.sequence
-        await self.bus.publish(replayed)
-        await self.bus.drain()
-        self.stats.events_published += 1
-        if self.on_event is not None:
-            self.on_event(replayed)
-        return replayed
+        while not self._output_queue:
+            if not await self._pump_one():
+                if not self._output_queue:
+                    return None
+                break
+        return self._output_queue.popleft()
 
     async def run(self, max_events: int | None = None) -> ReplayStats:
         """Replay to the end (or ``max_events``)."""

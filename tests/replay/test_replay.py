@@ -291,6 +291,18 @@ class TestReplaySession:
         assert all(e.type in MARKET_INPUT_TYPES for e in published)
 
     async def test_step_mode_advances_exactly_one_event(self, settings):
+        """``step()`` always returns exactly one item -- but with
+        input-visibility verified, a single call can now do more internal
+        work than "read one stored item": every market input preceding the
+        first tick marker is held back (deferred) until that marker's
+        watermark releases it, and all of them become ready together the
+        moment the first call reaches that marker. So the first ``step()``
+        call can legitimately apply several inputs internally (each still
+        one of THIS tick's own, per its watermark) before returning the
+        first of them; ``events_published == 1`` no longer holds, but
+        ``events_published <= events_read`` and "one call returns one
+        event" both still do.
+        """
         recorded = await self._record(settings, ticks=30)
         clock = ManualClock(START_MS)
         session = ReplaySession(
@@ -300,8 +312,10 @@ class TestReplaySession:
             session_id=recorded.session_id,
         )
         await session.open()
-        assert await session.step() is not None
-        assert session.stats.events_published == 1
+        first = await session.step()
+        assert first is not None
+        assert first.type not in (EventType.ORCHESTRATOR_TICK,)
+        assert 1 <= session.stats.events_published <= session.stats.events_read
 
     async def test_replay_finishes_and_reports_its_span(self, settings):
         recorded = await self._record(settings, ticks=50)
