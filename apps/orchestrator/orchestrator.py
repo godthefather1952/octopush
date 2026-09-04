@@ -438,7 +438,8 @@ class Orchestrator:
         if failures >= self.storage_failure_threshold:
             status, detail = HealthStatus.OFFLINE, (
                 f"{failures} consecutive flush failures; "
-                f"{recorder.events_lost} events unpersisted"
+                f"{recorder.unpersisted} events awaiting confirmation, "
+                f"{recorder.events_lost} permanently lost"
             )
         elif failures:
             status, detail = HealthStatus.DEGRADED, f"{failures} recent flush failures"

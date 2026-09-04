@@ -45,7 +45,7 @@ from core.events import MARKET_INPUT_TYPES, Event, EventType
 from core.ids import DeterministicIdGenerator, IdGenerator, set_id_generator
 from core.logging import bind_clock
 from core.models.common import Millis, StrEnum
-from storage.base import EventStore
+from storage.base import EventStore, SessionInfo, SessionStatus
 
 #: Distinguishes "nothing was bound" from "None was bound".
 _UNBOUND = object()
@@ -69,6 +69,12 @@ LEGACY_REPLAY_UNVERIFIED_TIMELINE = "LEGACY_REPLAY_UNVERIFIED_TIMELINE"
 #: ``legacy_input_visibility=True``. The tick CADENCE is verified; the exact
 #: market-input CUT each tick observed is not.
 LEGACY_REPLAY_UNVERIFIED_INPUT_VISIBILITY = "LEGACY_REPLAY_UNVERIFIED_INPUT_VISIBILITY"
+
+#: Reported when a session whose RECORDING integrity was never verified
+#: (OPEN, INCOMPLETE, or LEGACY_UNVERIFIED) was replayed anyway via
+#: ``allow_incomplete_session=True``. The events present may be replayed
+#: faithfully; what is unverified is whether they are ALL of them.
+UNVERIFIED_RECORDING_INTEGRITY = "UNVERIFIED_RECORDING_INTEGRITY"
 
 #: Reported when ``start_ms`` skips part of the session's true beginning and
 #: the caller explicitly accepted that via ``allow_partial_range=True``. Every
@@ -120,6 +126,33 @@ class InvalidTickMarkerWatermark(RuntimeError):
     inputs to the tick that actually saw them. Replay must stop loudly at
     the offending marker rather than silently keep going on the strength of
     a check performed only once, at the start, against a different marker.
+    """
+
+
+class UnverifiedRecordingError(RuntimeError):
+    """Base for refusing to replay a session whose history may be incomplete."""
+
+
+class IncompleteSessionError(UnverifiedRecordingError):
+    """Raised when the session is not COMPLETE.
+
+    OPEN means the recorder never finalised it -- the process died, or is
+    still running -- so whatever it still held in memory is simply not in the
+    store. INCOMPLETE means the recorder finalised it while knowing history
+    had been abandoned. Neither is a basis for calling a replay exact, so
+    ``open()`` refuses unless ``allow_incomplete_session=True`` says the
+    caller accepts that explicitly.
+    """
+
+
+class UnverifiedLegacySessionError(UnverifiedRecordingError):
+    """Raised for a session recorded before recording integrity was tracked.
+
+    Such a session may well be complete -- but the build that wrote it could
+    fail a write, discard the batch, count the loss in memory only, and still
+    end the session, so ``ended_at`` is not evidence of anything. It is
+    readable and replayable behind the explicit override; it is never
+    silently certified as exact.
     """
 
 
@@ -209,6 +242,11 @@ class ReplaySession:
     #: ``open()`` raises ``LegacyInputVisibilityRequired`` rather than
     #: silently assuming publication order is delivery order.
     legacy_input_visibility: bool = False
+    #: Required to replay a session whose recording integrity was never
+    #: verified -- OPEN, INCOMPLETE or LEGACY_UNVERIFIED. Without it,
+    #: ``open()`` raises rather than presenting a possibly-truncated history
+    #: as an exact reproduction.
+    allow_incomplete_session: bool = False
     #: Required when ``start_ms`` skips part of the session's true
     #: beginning. Without it, ``open()`` raises ``PartialReplayUnsupported``
     #: rather than silently starting every component empty at an arbitrary
@@ -267,6 +305,7 @@ class ReplaySession:
         await self.store.open()
 
         info = await self.store.session(self.session_id)
+        self._check_recording_integrity(info)
         partial_range = (
             self.start_ms is not None and info is not None and self.start_ms > info.started_at
         )
@@ -348,6 +387,46 @@ class ReplaySession:
             start_ms=self.start_ms,
             end_ms=self.end_ms,
         ).__aiter__()
+
+    def _check_recording_integrity(self, info: SessionInfo | None) -> None:
+        """Refuse a session whose history is not known to be complete.
+
+        Exact replay is a claim about the WHOLE run. Every other check in
+        this class verifies that the recorded events are replayed faithfully;
+        this one asks the prior question of whether they are all of them.
+        """
+        if info is None:
+            # An unknown session has no integrity claim to check. The read
+            # below will simply produce nothing, and the tick-marker checks
+            # already refuse an empty timeline.
+            return
+        if info.status.is_verified_complete:
+            return
+        if not self.allow_incomplete_session:
+            if info.status is SessionStatus.LEGACY_UNVERIFIED:
+                raise UnverifiedLegacySessionError(
+                    f"session {self.session_id!r} was recorded before "
+                    "recording integrity was tracked, so whether it contains "
+                    "every event it accepted is unknown -- the build that "
+                    "wrote it could discard a failed batch and still end the "
+                    "session. Pass allow_incomplete_session=True to replay it "
+                    "anyway, explicitly accepting unverified recording "
+                    "integrity."
+                )
+            raise IncompleteSessionError(
+                f"session {self.session_id!r} is {info.status.value}, not "
+                f"COMPLETE"
+                + (f" ({info.failure_reason})" if info.failure_reason else "")
+                + (
+                    f"; {info.events_lost} accepted events were never "
+                    "durably recorded"
+                    if info.events_lost
+                    else ""
+                )
+                + ". Pass allow_incomplete_session=True to replay it anyway, "
+                "explicitly accepting unverified recording integrity."
+            )
+        self.stats.timeline_fidelity = UNVERIFIED_RECORDING_INTEGRITY
 
     @property
     def finished(self) -> bool:

@@ -21,6 +21,7 @@ from core.events import EventType
 from core.health import HealthRegistry
 from core.models.common import DataQuality
 from core.models.market import OrderBookSnapshot, PriceLevel
+from storage.base import SessionStatus
 from tests.conftest import START_MS
 from venues.base.adapter import VenueAdapter
 from venues.base.messages import BookDelta, ResyncRequest
@@ -388,6 +389,10 @@ class TestReplaySafety:
 
         session_id = "sess-replay-guard"
         await store.open()
+        # Storage no longer creates sessions implicitly (Phase 2 Batch 2):
+        # an append to an unknown id is a wiring mistake, not a second,
+        # invisible session.
+        await store.start_session(session_id, START_MS)
         await store.append_many(
             session_id,
             [
@@ -411,6 +416,11 @@ class TestReplaySafety:
                     ).to_json_dict(),
                 ),
             ],
+        )
+        # Exact replay requires a session whose recording integrity was
+        # verified (Phase 2 Batch 2); a hand-built recording must say so.
+        await store.finalize_session(
+            session_id, START_MS + 2, status=SessionStatus.COMPLETE
         )
 
         adapter = RecordingAdapter(venue_config, clock, ["BTC-USD"])

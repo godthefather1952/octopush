@@ -130,8 +130,19 @@ class TestTheOrchestratorDrivesIt:
             await platform.stop()
 
 
-class TestLossIsCounted:
-    async def test_a_failed_flush_reports_what_it_lost(self, recorder):
+class TestAFailedFlushIsNotLoss:
+    """P2-7, inverted from what this suite used to assert.
+
+    It previously required a failed flush to report the batch as LOST --
+    because the recorder really did throw it away. That is the defect: a
+    database that was briefly unreachable destroyed history permanently. A
+    failed write is now a retained batch, a failure count and bad health;
+    loss is reserved for history that is genuinely abandoned.
+    """
+
+    async def test_a_failed_flush_retains_the_batch_and_reports_no_loss(
+        self, recorder
+    ):
         rec, store, _ = recorder
 
         async def explode(*args, **kwargs):
@@ -141,7 +152,8 @@ class TestLossIsCounted:
         for i in range(200):
             await rec.record(make_event(i))
 
-        assert rec.events_lost == 200
+        assert rec.events_lost == 0, "a transient write failure is not loss"
+        assert rec.unpersisted == 200, "the batch must still be held for retry"
         assert rec.consecutive_failures == 1
         assert rec.healthy is False
 

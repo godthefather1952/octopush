@@ -176,7 +176,9 @@ runs in-process against a seeded market generator and a SQLite event store.
 # Public, read-only exchange feeds instead of the synthetic market.
 TF_FEED=live python -m apps.orchestrator
 
-# List and replay recorded sessions.
+# List and replay recorded sessions. --list shows each session's recording
+# status; only COMPLETE replays exactly, and anything else needs
+# --allow-incomplete-session to say so deliberately.
 python -m replay --list
 python -m replay --session session-abc123
 

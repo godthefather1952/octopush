@@ -11,12 +11,22 @@
 BEGIN;
 
 CREATE TABLE IF NOT EXISTS sessions (
-    session_id   TEXT PRIMARY KEY,
-    started_at   BIGINT NOT NULL,
-    ended_at     BIGINT,
-    label        TEXT NOT NULL DEFAULT '',
-    config_hash  TEXT NOT NULL DEFAULT ''
+    session_id     TEXT PRIMARY KEY,
+    started_at     BIGINT NOT NULL,
+    ended_at       BIGINT,
+    label          TEXT NOT NULL DEFAULT '',
+    config_hash    TEXT NOT NULL DEFAULT '',
+    -- Recording status. NULLABLE on purpose: a row written before this
+    -- column existed reads back as LEGACY_UNVERIFIED, never COMPLETE. The
+    -- build that wrote it could discard a failed batch and still end the
+    -- session, so ended_at is not evidence of completeness.
+    status         TEXT,
+    events_lost    BIGINT NOT NULL DEFAULT 0,
+    failure_reason TEXT NOT NULL DEFAULT ''
 );
+
+COMMENT ON COLUMN sessions.status IS
+    'OPEN | COMPLETE | INCOMPLETE. NULL means a pre-Batch-2 row, read as LEGACY_UNVERIFIED.';
 
 COMMENT ON COLUMN sessions.config_hash IS
     'Digest of the settings used, so replays across incompatible configs are refusable.';

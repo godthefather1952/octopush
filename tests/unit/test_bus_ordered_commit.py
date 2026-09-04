@@ -125,6 +125,11 @@ class TestP2_13RealRecorderReproduction:
         assert event_a.sequence is not None and event_b.sequence is not None
         assert event_a.sequence < event_b.sequence
         # The durable record agrees with dispatch order too (clause F).
+        # Flushed explicitly: since Batch 2 the recorder holds accepted
+        # events until storage confirms them and will not start a second
+        # flush over a batch already in flight, so B is still pending here
+        # rather than lost.
+        await recorder.flush()
         assert store.append_batches == [["A"], ["B"]]
 
 
@@ -321,6 +326,7 @@ class TestConcurrentPublisherOrdering:
         store.release("slow")
         await slow_task
         await bus.drain()
+        await recorder.flush()
 
         recorded_order = [tag for batch in store.append_batches for tag in batch]
         assert recorded_order == ["slow", "fast"]

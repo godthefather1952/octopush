@@ -22,7 +22,12 @@ import pytest
 
 from core.events import Event, EventType
 from storage import InMemoryEventStore, SQLiteEventStore
-from storage.base import EventStore
+from storage.base import (
+    EventStore,
+    SessionAlreadyExists,
+    SessionNotOpen,
+    SessionStatus,
+)
 
 POSTGRES_DSN = os.environ.get("TF_TEST_POSTGRES_DSN", "")
 
@@ -217,10 +222,21 @@ class TestIdempotency:
         assert await store.count("a") == 1
         assert await store.count("b") == 1
 
-    async def test_restarting_a_session_does_not_destroy_its_events(self, store):
-        await store.start_session("s1", 1, label="first")
+    async def test_restarting_a_session_is_refused_and_changes_nothing(self, store):
+        """P2-2: one call, one answer, on every backend.
+
+        This used to differ per backend -- memory and SQLite silently
+        replaced the session row (clearing ended_at), PostgreSQL updated the
+        metadata but kept it. A session id is now used exactly once.
+        """
+        await store.start_session("s1", 1, label="first", config_hash="a")
         await store.append("s1", make_event())
-        await store.start_session("s1", 2, label="second")
+        before = await store.session("s1")
+
+        with pytest.raises(SessionAlreadyExists):
+            await store.start_session("s1", 2, label="second", config_hash="b")
+
+        assert await store.session("s1") == before
         assert await store.count("s1") == 1
 
 
@@ -235,11 +251,15 @@ class TestSessionMetadata:
         assert info.config_hash == "deadbeef"
         assert info.ended_at is None
 
-    async def test_ending_a_session_records_the_time(self, store):
+    async def test_finalizing_a_session_records_the_time_and_status(self, store):
         await store.start_session("s1", 1_000)
-        await store.end_session("s1", 2_000)
+        assert (await store.session("s1")).status is SessionStatus.OPEN
+        await store.finalize_session("s1", 2_000, status=SessionStatus.COMPLETE)
         info = await store.session("s1")
         assert info.ended_at == 2_000
+        assert info.status is SessionStatus.COMPLETE
+        assert info.events_lost == 0
+        assert info.failure_reason == ""
 
     async def test_the_event_count_is_reported(self, store):
         await store.start_session("s1", 1)
@@ -545,20 +565,59 @@ class TestOpeningAnOlderDatabase:
         return path
 
     async def test_an_older_database_gains_the_new_columns(self, tmp_path):
+        """The upgrade must add columns AND refuse to certify old history.
+
+        Migration is only half the job. A session row written before the
+        integrity columns existed cannot be trusted: the build that wrote it
+        could fail a write, discard the batch and still end the session. It
+        therefore reads back as LEGACY_UNVERIFIED and refuses further
+        appends, rather than being backfilled to COMPLETE.
+        """
         from storage import SQLiteEventStore
 
         path = self._old_database(tmp_path)
         store = SQLiteEventStore(str(path))
         await store.open()
         try:
-            await store.append("s1", make_event(sequence=1, causation_id="legacy-1"))
-            read = [event async for event in store.read("s1")]
+            # The legacy events survived the upgrade and are readable.
+            assert await store.count("s1") == 1
+            legacy = [e async for e in store.read("s1")]
+            assert [e.id for e in legacy] == ["legacy-1"]
+            assert legacy[0].schema_version == 1
+
+            # ...but the session carries no verified integrity claim.
+            info = await store.session("s1")
+            assert info.status is SessionStatus.LEGACY_UNVERIFIED
+            with pytest.raises(SessionNotOpen):
+                await store.append("s1", make_event(sequence=1))
+
+            # A NEW session in the upgraded database works normally, which is
+            # what proves the added columns are actually usable.
+            await store.start_session("fresh", 2_000)
+            await store.append("fresh", make_event(sequence=2, causation_id="legacy-1"))
+            await store.finalize_session(
+                "fresh", 3_000, status=SessionStatus.COMPLETE
+            )
+            fresh = await store.session("fresh")
+            assert fresh.status is SessionStatus.COMPLETE
+            stored = [e async for e in store.read("fresh")]
+            assert stored[0].causation_id == "legacy-1"
         finally:
             await store.close()
 
-        assert len(read) == 2, "writing to an upgraded database must succeed"
-        assert read[-1].causation_id == "legacy-1"
-        assert read[-1].schema_version == Event.CURRENT_SCHEMA_VERSION
+    async def test_the_migration_is_repeatable(self, tmp_path):
+        """Opening an upgraded database again must not damage it."""
+        from storage import SQLiteEventStore
+
+        path = self._old_database(tmp_path)
+        for _ in range(3):
+            store = SQLiteEventStore(str(path))
+            await store.open()
+            assert await store.count("s1") == 1
+            assert (await store.session("s1")).status is (
+                SessionStatus.LEGACY_UNVERIFIED
+            )
+            await store.close()
 
     async def test_rows_written_before_the_upgrade_are_still_readable(self, tmp_path):
         from storage import SQLiteEventStore

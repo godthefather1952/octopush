@@ -1,10 +1,15 @@
-"""Phase 2 audit reproduction: two more findings, quick to demonstrate.
+"""Phase 2 findings P2-6 (closed) and P2-3 (still open).
 
-1. Same event_id, different payload: silently dropped, across all backends,
-   with no warning anywhere in the call path.
-2. ReplayMode.REALTIME does not pace against wall-clock time at all --
-   ``ManualClock.sleep(0)`` is a no-op, so a "REALTIME 1x" replay runs at the
-   same speed as FAST.
+1. **P2-6 -- CLOSED by Batch 2.** Reusing an event id for a *different*
+   event used to be silently dropped, across all backends, with no warning
+   anywhere in the call path. It is now an ``EventIdCollision``; only a
+   byte-identical re-delivery is still the intended idempotent no-op.
+2. **P2-3 -- STILL OPEN.** ``ReplayMode.REALTIME`` does not pace against
+   wall-clock time at all: ``ManualClock.sleep(0)`` is a no-op, so a
+   "REALTIME 1x" replay runs at the same speed as FAST. Batch 2 deliberately
+   did not remediate this; the reproduction below still stands.
+
+    python -m scripts.phase2_repro_id_collision_and_realtime
 """
 
 from __future__ import annotations
@@ -14,10 +19,11 @@ import time
 
 from core.clock import ManualClock
 from core.events import Event, EventType
+from storage.base import EventIdCollision
 from storage.memory import InMemoryEventStore
 
 
-async def id_collision() -> None:
+async def id_collision() -> bool:
     store = InMemoryEventStore()
     await store.open()
     sid = "repro-id-collision"
@@ -28,23 +34,39 @@ async def id_collision() -> None:
     second = Event(id="bus-fixed-id", type=EventType.SYSTEM_EVENT, ts_ms=200, source="B",
                    payload={"which": "SECOND -- completely different event"})
     await store.append(sid, first)
-    await store.append(sid, second)
 
+    print("=" * 70)
+    print("P2-6 verification: same event_id, different payload")
+    print("=" * 70)
+    refused = False
+    try:
+        await store.append(sid, second)
+    except EventIdCollision as exc:
+        refused = True
+        print(f"second append refused: {type(exc).__name__}")
+        print(f"  {exc}")
+    else:
+        print("second append ACCEPTED: DEFECT NOT CLOSED")
+
+    # ...while an exact re-delivery of the FIRST event is still a no-op, which
+    # is what makes retry-after-unknown-commit-outcome safe.
+    await store.append(sid, first)
     stored = [e async for e in store.read(sid)]
-    print("=" * 70)
-    print("Reproduction: same event_id, different payload")
-    print("=" * 70)
-    print(f"events appended: 2, events actually stored: {len(stored)}")
+    print(f"events stored after 1 collision + 1 exact retry: {len(stored)}")
     print(f"stored payload: {stored[0].payload}")
-    print("The second event vanished silently -- no exception, no log, no")
-    print("count of dropped events anywhere the caller can observe.")
+    idempotent = len(stored) == 1 and stored[0].payload == {"which": "first"}
+    print(
+        "A reused id carrying different content is now an error the caller "
+        "must handle; an identical re-delivery still converges on one copy."
+    )
+    return refused and idempotent
 
 
 async def realtime_is_a_no_op() -> None:
     clock = ManualClock(0)
     print()
     print("=" * 70)
-    print("Reproduction: ReplayMode.REALTIME pacing")
+    print("P2-3 reproduction (STILL OPEN): ReplayMode.REALTIME pacing")
     print("=" * 70)
     wall_start = time.monotonic()
     for _ in range(500):
@@ -60,10 +82,11 @@ async def realtime_is_a_no_op() -> None:
           "on wall-clock time regardless of `speed`.")
 
 
-async def main() -> None:
-    await id_collision()
+async def main() -> int:
+    closed = await id_collision()
     await realtime_is_a_no_op()
+    return 0 if closed else 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

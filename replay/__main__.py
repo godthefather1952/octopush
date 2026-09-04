@@ -27,6 +27,7 @@ from replay.engine import (
     PartialReplayUnsupported,
     ReplayMode,
     ReplaySession,
+    UnverifiedRecordingError,
 )
 from storage import build_store
 
@@ -46,8 +47,15 @@ async def list_sessions() -> None:
         print("no recorded sessions")
     for info in sessions:
         span = (info.ended_at - info.started_at) / 1000 if info.ended_at else None
+        # Status, not just ended_at: only COMPLETE means "every event the
+        # recorder accepted is here", and that is what decides whether this
+        # session can be replayed exactly (Phase 2 Batch 2).
+        status = info.status.value
+        if info.events_lost:
+            status += f"(-{info.events_lost})"
         print(
             f"{info.session_id}  events={info.event_count:<8} "
+            f"status={status:<20} "
             f"started={info.started_at}  duration={span if span is None else round(span, 1)}s  "
             f"config={info.config_hash}  {info.label}"
         )
@@ -91,11 +99,19 @@ async def replay(args: argparse.Namespace) -> None:
         legacy_timeline=args.legacy_timeline,
         legacy_input_visibility=args.legacy_input_visibility,
         allow_partial_range=args.allow_partial_range,
+        allow_incomplete_session=args.allow_incomplete_session,
     )
     try:
         await session.open()
-    except (LegacyTimelineRequired, PartialReplayUnsupported) as exc:
-        # LegacyInputVisibilityRequired is a LegacyTimelineRequired subclass.
+    except (
+        LegacyTimelineRequired,
+        PartialReplayUnsupported,
+        UnverifiedRecordingError,
+    ) as exc:
+        # LegacyInputVisibilityRequired is a LegacyTimelineRequired subclass,
+        # and IncompleteSessionError / UnverifiedLegacySessionError are both
+        # UnverifiedRecordingError. Each message names the flag that accepts
+        # the risk deliberately.
         raise SystemExit(str(exc)) from exc
 
     # NOTE: session.close() is deliberately not called here -- that is a
@@ -125,6 +141,7 @@ async def replay(args: argparse.Namespace) -> None:
     summary = {
         "session": args.session,
         "config_hash_recorded": info.config_hash,
+        "recording_status": info.status.value,
         "events_replayed": session.stats.events_published,
         "ticks_replayed": session.stats.ticks_read,
         "timeline_fidelity": session.stats.timeline_fidelity,
@@ -144,7 +161,14 @@ async def replay(args: argparse.Namespace) -> None:
     await store.close()
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI surface, separated so it can be tested without running a replay.
+
+    Every flag here accepts a specific, named loss of fidelity, and each one
+    exists because the engine refuses that case by default. A flag whose
+    ``dest`` stopped matching what ``replay()`` reads would silently disable
+    the escape hatch and leave the refusal unanswerable.
+    """
     parser = argparse.ArgumentParser(description="Replay a recorded trading session")
     parser.add_argument("--list", action="store_true", help="list recorded sessions")
     parser.add_argument("--session", help="session id to replay")
@@ -183,6 +207,23 @@ def main() -> None:
             "programmatically with one)"
         ),
     )
+    parser.add_argument(
+        "--allow-incomplete-session",
+        action="store_true",
+        help=(
+            "replay a session that is not verified COMPLETE -- one still OPEN, "
+            "one finalised INCOMPLETE after losing events, or one recorded "
+            "before recording integrity was tracked -- accepting that the "
+            "recording may be missing history and that the run is therefore "
+            "not an exact reproduction (the summary reports "
+            "timeline_fidelity accordingly)"
+        ),
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
     if args.list:
         asyncio.run(list_sessions())

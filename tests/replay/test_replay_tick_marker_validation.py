@@ -25,6 +25,7 @@ from core.bus import InMemoryEventBus
 from core.clock import ManualClock
 from core.events import Event, EventType
 from replay.engine import InvalidTickMarkerWatermark, LegacyInputVisibilityRequired, ReplaySession
+from storage.base import SessionStatus
 from storage.memory import InMemoryEventStore
 
 START_MS = 1_788_000_000_000
@@ -64,6 +65,12 @@ async def _build_session(events: list[Event]) -> InMemoryEventStore:
     await store.open()
     await store.start_session(SESSION_ID, events[0].ts_ms)
     await store.append_many(SESSION_ID, events)
+    # Exact replay requires a verified-complete recording (Phase 2 Batch 2).
+    # These sessions are hand-built and complete by construction, so they say
+    # so explicitly rather than relying on replay to assume it.
+    await store.finalize_session(
+        SESSION_ID, events[-1].ts_ms, status=SessionStatus.COMPLETE
+    )
     return store
 
 

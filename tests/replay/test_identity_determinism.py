@@ -88,7 +88,10 @@ async def record_session(settings, ticks: int = 220):
         raise_on_handler_error=True,
     )
     await run_platform(platform, ticks)
-    await platform.recorder.flush()
+    # Finalise: exact replay refuses a session that was never closed out,
+    # since an unfinalised session is missing whatever the recorder still
+    # held (Phase 2 Batch 2).
+    await platform.recorder.stop()
     return platform, store
 
 

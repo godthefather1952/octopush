@@ -206,7 +206,12 @@ class TestDeterminism:
 async def _record_session(settings, ticks: int = 150):
     platform = fresh_platform(settings)
     await run_platform(platform, ticks)
-    await platform.recorder.flush()
+    # Finalise, not just flush: since Phase 2 Batch 2 a session carries an
+    # explicit recording-integrity status, and exact replay refuses one that
+    # was never closed out -- an unfinalised session is missing whatever the
+    # recorder still held. stop() is idempotent, so a later platform.stop()
+    # is still safe.
+    await platform.recorder.stop()
     return platform
 
 

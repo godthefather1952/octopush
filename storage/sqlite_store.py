@@ -16,15 +16,32 @@ from pathlib import Path
 
 from core.events import Event, EventType
 from core.models.common import Millis
-from storage.base import EventStore, SessionInfo
+from storage.base import (
+    EventIdCollision,
+    EventStore,
+    SessionAlreadyExists,
+    SessionInfo,
+    SessionNotOpen,
+    SessionStatus,
+    UnknownSession,
+    describe_fingerprint_mismatch,
+    event_fingerprint,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
-    session_id   TEXT PRIMARY KEY,
-    started_at   INTEGER NOT NULL,
-    ended_at     INTEGER,
-    label        TEXT NOT NULL DEFAULT '',
-    config_hash  TEXT NOT NULL DEFAULT ''
+    session_id     TEXT PRIMARY KEY,
+    started_at     INTEGER NOT NULL,
+    ended_at       INTEGER,
+    label          TEXT NOT NULL DEFAULT '',
+    config_hash    TEXT NOT NULL DEFAULT '',
+    -- NULL means "written before this column existed": such a row is read
+    -- back as LEGACY_UNVERIFIED, never backfilled to COMPLETE. The build
+    -- that wrote it could discard a failed batch and still end the session,
+    -- so its ended_at proves nothing about completeness.
+    status         TEXT,
+    events_lost    INTEGER NOT NULL DEFAULT 0,
+    failure_reason TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -58,6 +75,21 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # (table, column, DDL)
     ("events", "schema_version", "ALTER TABLE events ADD COLUMN schema_version INTEGER"),
     ("events", "causation_id", "ALTER TABLE events ADD COLUMN causation_id TEXT"),
+    # Phase 2 Batch 2. Deliberately nullable with NO backfill: an existing
+    # row gets status NULL and is therefore reported LEGACY_UNVERIFIED.
+    # `UPDATE sessions SET status='COMPLETE'` would certify history this
+    # build has no evidence for.
+    ("sessions", "status", "ALTER TABLE sessions ADD COLUMN status TEXT"),
+    (
+        "sessions",
+        "events_lost",
+        "ALTER TABLE sessions ADD COLUMN events_lost INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "sessions",
+        "failure_reason",
+        "ALTER TABLE sessions ADD COLUMN failure_reason TEXT NOT NULL DEFAULT ''",
+    ),
 )
 
 
@@ -73,6 +105,38 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:
             conn.execute(ddl)
+
+
+def _status_of(raw: str | None) -> SessionStatus:
+    """Interpret a stored status column.
+
+    NULL means the row predates the column. It is LEGACY_UNVERIFIED, never
+    COMPLETE: the build that wrote it could lose a batch and still end the
+    session, so its ``ended_at`` carries no completeness claim at all.
+    """
+    if raw is None:
+        return SessionStatus.LEGACY_UNVERIFIED
+    try:
+        return SessionStatus(raw)
+    except ValueError:
+        return SessionStatus.LEGACY_UNVERIFIED
+
+
+def _row_fingerprint(row) -> tuple:
+    """The stored identity of an event row, matching ``event_fingerprint``."""
+    payload = json.loads(row["payload"])
+    return (
+        row["event_id"],
+        None if row["seq"] is None else int(row["seq"]),
+        int(row["ts_ms"]),
+        row["type"],
+        row["source"],
+        row["schema_name"],
+        int(row["schema_version"] or 1),
+        row["correlation_id"],
+        row["causation_id"],
+        json.dumps(payload, sort_keys=True, default=str, allow_nan=False),
+    )
 
 
 class SQLiteEventStore(EventStore):
@@ -115,22 +179,104 @@ class SQLiteEventStore(EventStore):
     ) -> None:
         async with self._lock:
             conn = self._require()
+            # A plain INSERT, never INSERT OR REPLACE: replacing would clear
+            # ended_at and status on an existing session, quietly reopening
+            # finished history (P2-2).
+            existing = conn.execute(
+                "SELECT status FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if existing is not None:
+                raise SessionAlreadyExists(
+                    f"session {session_id!r} already exists with status "
+                    f"{_status_of(existing['status']).value}; a session id is "
+                    "used once and is never reopened (no resume protocol "
+                    "exists)"
+                )
+            try:
+                conn.execute(
+                    "INSERT INTO sessions "
+                    "(session_id, started_at, ended_at, label, config_hash, "
+                    " status, events_lost, failure_reason) "
+                    "VALUES (?, ?, NULL, ?, ?, ?, 0, '')",
+                    (
+                        session_id,
+                        int(started_at),
+                        label,
+                        config_hash,
+                        SessionStatus.OPEN.value,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                # The SELECT above is serialised only against this process's
+                # own callers. Another process writing the same database wins
+                # the race at the primary key instead, and that must surface
+                # as the same refusal rather than as a raw driver error.
+                raise SessionAlreadyExists(
+                    f"session {session_id!r} already exists (created "
+                    "concurrently); a session id is used once and is never "
+                    "reopened"
+                ) from exc
+            conn.commit()
+
+    async def finalize_session(
+        self,
+        session_id: str,
+        ended_at: Millis,
+        *,
+        status: SessionStatus,
+        events_lost: int = 0,
+        failure_reason: str = "",
+    ) -> None:
+        if not status.is_terminal:
+            raise ValueError(f"{status.value} is not a terminal status")
+        async with self._lock:
+            conn = self._require()
+            row = conn.execute(
+                "SELECT status FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                raise UnknownSession(
+                    f"session {session_id!r} was never started; storage does "
+                    "not create sessions implicitly"
+                )
+            current = _status_of(row["status"])
+            if current.is_terminal:
+                raise SessionNotOpen(
+                    f"session {session_id!r} is already {current.value}; "
+                    "re-finalising would overwrite an integrity claim silently"
+                )
             conn.execute(
-                "INSERT OR REPLACE INTO sessions "
-                "(session_id, started_at, ended_at, label, config_hash) "
-                "VALUES (?, ?, NULL, ?, ?)",
-                (session_id, int(started_at), label, config_hash),
+                "UPDATE sessions SET ended_at = ?, status = ?, events_lost = ?, "
+                "failure_reason = ? WHERE session_id = ?",
+                (
+                    int(ended_at),
+                    status.value,
+                    int(events_lost),
+                    failure_reason,
+                    session_id,
+                ),
             )
             conn.commit()
 
-    async def end_session(self, session_id: str, ended_at: Millis) -> None:
-        async with self._lock:
-            conn = self._require()
-            conn.execute(
-                "UPDATE sessions SET ended_at = ? WHERE session_id = ?",
-                (int(ended_at), session_id),
+    def _status_row(self, session_id: str):
+        conn = self._require()
+        return conn.execute(
+            "SELECT status FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+
+    def _require_open_locked(self, session_id: str) -> None:
+        row = self._status_row(session_id)
+        if row is None:
+            raise UnknownSession(
+                f"session {session_id!r} was never started; storage does not "
+                "create sessions implicitly"
             )
-            conn.commit()
+        current = _status_of(row["status"])
+        if current.is_terminal:
+            raise SessionNotOpen(
+                f"session {session_id!r} is {current.value}; appending after "
+                "finalisation would grow a session already reported as closed"
+            )
 
     @staticmethod
     def _row(session_id: str, event: Event) -> tuple:
@@ -160,19 +306,83 @@ class SQLiteEventStore(EventStore):
         await self.append_many(session_id, [event])
 
     async def append_many(self, session_id: str, events: Iterable[Event]) -> None:
-        rows = [self._row(session_id, event) for event in events]
-        if not rows:
+        """Append a batch atomically.
+
+        The whole batch runs inside ONE explicit transaction, and every
+        collision check happens inside it too. That is deliberate rather
+        than inherited from driver defaults (Phase 2 Batch 2): sqlite3's
+        implicit transaction handling around ``executemany`` is a property
+        of the connection's isolation level, not a guarantee the caller can
+        reason about. With an explicit BEGIN, a raise leaves storage exactly
+        as it was, so the recorder's retry converges on the intended history
+        instead of layering a half-written batch under it.
+        """
+        batch = list(events)
+        if not batch:
             return
         async with self._lock:
             conn = self._require()
-            conn.executemany(
-                "INSERT OR IGNORE INTO events "
-                "(session_id, event_id, seq, ts_ms, type, source, schema_name, "
-                " schema_version, correlation_id, causation_id, payload) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                rows,
-            )
-            conn.commit()
+            self._require_open_locked(session_id)
+
+            incoming: dict[str, Event] = {}
+            prints: dict[str, tuple] = {}
+            for event in batch:
+                fingerprint = event_fingerprint(event)
+                previous = prints.get(event.id)
+                if previous is not None:
+                    if previous != fingerprint:
+                        raise EventIdCollision(
+                            f"batch for session {session_id!r} carries two "
+                            f"different events under id {event.id!r}: "
+                            f"{describe_fingerprint_mismatch(previous, fingerprint)}"
+                        )
+                    continue
+                prints[event.id] = fingerprint
+                incoming[event.id] = event
+
+            # Compare against what is already stored, in the same transaction
+            # that will do the writing.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                ids = list(incoming)
+                to_write: list[tuple] = []
+                for start in range(0, len(ids), 500):
+                    chunk = ids[start : start + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    existing = conn.execute(
+                        f"SELECT * FROM events WHERE session_id = ? "
+                        f"AND event_id IN ({placeholders})",
+                        [session_id, *chunk],
+                    ).fetchall()
+                    for row in existing:
+                        stored = _row_fingerprint(row)
+                        incoming_print = prints[row["event_id"]]
+                        if stored != incoming_print:
+                            raise EventIdCollision(
+                                f"session {session_id!r} already holds a "
+                                f"different event under id "
+                                f"{row['event_id']!r}: "
+                                + describe_fingerprint_mismatch(
+                                    stored, incoming_print
+                                )
+                            )
+                        # Identical re-delivery: the retry no-op.
+                        incoming.pop(row["event_id"], None)
+
+                to_write = [self._row(session_id, e) for e in incoming.values()]
+                if to_write:
+                    conn.executemany(
+                        "INSERT INTO events "
+                        "(session_id, event_id, seq, ts_ms, type, source, "
+                        " schema_name, schema_version, correlation_id, "
+                        " causation_id, payload) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        to_write,
+                    )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
 
     # -- reads -------------------------------------------------------------
 
@@ -239,6 +449,9 @@ class SQLiteEventStore(EventStore):
                     event_count=count,
                     label=row["label"],
                     config_hash=row["config_hash"],
+                    status=_status_of(row["status"]),
+                    events_lost=row["events_lost"] or 0,
+                    failure_reason=row["failure_reason"] or "",
                 )
             )
         return out

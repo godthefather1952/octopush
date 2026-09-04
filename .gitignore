@@ -17,3 +17,7 @@ build/
 
 # Verification and startup logs written by scripts/ — diagnostics, not source.
 .verify-logs/
+
+# Redis snapshot, dropped in the working directory by a locally-started
+# redis-server during contract tests.
+dump.rdb
