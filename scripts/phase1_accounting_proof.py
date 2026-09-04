@@ -117,20 +117,17 @@ async def main() -> int:
         "opportunity's accumulated-so-far contribution sits in its live "
         "AttributionBuilder (not yet in scorecard.trades), and OKAPI hedge fills "
         "carry a hedge_id as their correlation_id, which never matches an "
-        "opportunity attribution builder at all. Replaying the fill log with the "
-        "exact same per-fill delta logic Orchestrator._track_realized_delta uses, "
-        "bucketed by category:"
+        "opportunity attribution builder at all. Bucketed by category, using each "
+        "fill's own FillEvent.realized_pnl_delta -- captured by "
+        "PaperAccount.apply_fill at the moment it applied that fill, so this "
+        "reconciliation is immune to bus dispatch order the same way attribution "
+        "itself now is:"
     )
     closed_ids = {t.opportunity_id for t in closed_trades}
     open_ids = set(platform.orchestrator.attributions.keys())
-    baseline: dict[str, float] = {}
     gross_closed = fees_closed = gross_open = fees_open = gross_other = fees_other = 0.0
     for f in account.fill_log:
-        key = f"{f.venue}:{f.symbol}"
-        position = account.positions.get(key)
-        current = position.realized_pnl if position is not None else 0.0
-        delta = current - baseline.get(key, 0.0)
-        baseline[key] = current
+        delta = f.realized_pnl_delta
         cid = f.correlation_id or ""
         if cid in closed_ids:
             gross_closed += delta

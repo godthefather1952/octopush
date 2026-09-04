@@ -36,9 +36,13 @@ class AttributionBuilder:
     expected_costs_bps: float
     decision: RiskDecision
     #: Pre-fee realized P&L, accumulated one fill at a time via
-    #: :meth:`add_realized` -- never read from a position's lifetime-cumulative
-    #: counter, which would mix in every other opportunity ever traded on the
-    #: same venue:symbol (see ``Orchestrator._track_realized_delta``).
+    #: :meth:`add_realized` from each fill's own
+    #: ``FillEvent.realized_pnl_delta`` -- never read from a position's
+    #: lifetime-cumulative counter (which would mix in every other
+    #: opportunity ever traded on the same venue:symbol) and never
+    #: reconstructed from live account state at handler-dispatch time (which
+    #: can already reflect other fills applied, but not yet dispatched,
+    #: ahead of this one).
     realized_pnl_gross: float = 0.0
     fees: float = 0.0
     filled_notional: float = 0.0
