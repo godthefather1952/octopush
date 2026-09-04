@@ -2,8 +2,29 @@
 
 Latency is modelled *logically*, not by sleeping: each order carries the time
 at which it becomes visible to the simulated venue, and :meth:`poll` advances
-state to the current clock.  That keeps execution deterministic under replay
-and keeps the orchestrator's loop free of blocking waits.
+state to a caller-supplied logical time.  That keeps execution deterministic
+under replay and keeps the orchestrator's loop free of blocking waits.
+
+NO CLOCK READS (Phase 2 Batch 1.3 — P2-14)
+==========================================
+This class deliberately never calls ``self.clock.now_ms()``.  Every
+time-dependent decision it makes — when an order was submitted, when it
+becomes acknowledged, when a cancel reaches the venue, when a fill is
+stamped, when an order expires — uses the logical time its caller passed in.
+
+The reason is replay fidelity.  A recorded session preserves exactly one
+timestamp per orchestrator tick (the ``ORCHESTRATOR_TICK`` marker), so replay
+can only ever re-execute a tick at that one instant.  A clock read taken
+*here* is not that instant: with a live feed running concurrently with the
+tick, the clock can advance arbitrarily far between the tick's snapshot and
+the moment execution happens to run.  Recording ``submitted_at`` from such a
+read produced orders whose acknowledgement deadline replay reconstructed
+300ms earlier, so replay acknowledged (and filled) at a tick where the
+original had not — the P2-14 divergence.
+
+The ``clock`` field is retained because it is part of the constructed wiring
+contract, not because anything here reads it; the absence of reads is the
+invariant, and ``tests/unit/test_execution_time_fidelity.py`` asserts it.
 """
 
 from __future__ import annotations
@@ -107,8 +128,14 @@ class PaperExecutor(Executor):
 
     # -- submission --------------------------------------------------------
 
-    async def submit(self, plan: ExecutionPlan) -> ExecutionReport:
-        now = self.clock.now_ms()
+    async def submit(self, plan: ExecutionPlan, now_ms: Millis) -> ExecutionReport:
+        # ``now_ms`` is the caller's canonical logical time, never a clock
+        # read taken here (Phase 2 Batch 1.3 -- P2-14). Under a live feed
+        # running concurrently with the tick that produced this plan, a
+        # clock read here can land arbitrarily later than the tick's own
+        # recorded timestamp, which fixes ``submitted_at`` -- and therefore
+        # ``ack_at`` -- at an instant replay has no way to reconstruct.
+        now = now_ms
         orders: list[PaperOrder] = []
         notes: list[str] = []
 
@@ -121,7 +148,7 @@ class PaperExecutor(Executor):
                 self.rejected_submissions += 1
                 self.oms.reject(order.client_order_id, "execution disabled")
                 notes.append(f"{order.client_order_id}: execution disabled")
-                await self._publish_order(order, EventType.PAPER_ORDER_UPDATED)
+                await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now)
                 orders.append(order)
                 continue
 
@@ -130,7 +157,7 @@ class PaperExecutor(Executor):
             self._pending[order.client_order_id] = _Pending(
                 ack_at=now + self._latency(order.venue)
             )
-            await self._publish_order(order, EventType.PAPER_ORDER_CREATED)
+            await self._publish_order(order, EventType.PAPER_ORDER_CREATED, now)
             orders.append(order)
 
         return ExecutionReport(
@@ -145,7 +172,7 @@ class PaperExecutor(Executor):
 
     # -- cancellation ------------------------------------------------------
 
-    async def cancel(self, client_order_id: str) -> None:
+    async def cancel(self, client_order_id: str, now_ms: Millis) -> None:
         order = self.oms.get(client_order_id)
         if order is None or not order.is_live:
             return
@@ -153,18 +180,18 @@ class PaperExecutor(Executor):
             # Not yet acknowledged; the venue has nothing to cancel, so the
             # order resolves once it arrives.
             self._pending.setdefault(
-                client_order_id, _Pending(ack_at=self.clock.now_ms())
-            ).cancel_at = self.clock.now_ms()
+                client_order_id, _Pending(ack_at=now_ms)
+            ).cancel_at = now_ms
             return
         self.oms.transition(client_order_id, OrderStatus.CANCEL_PENDING)
-        pending = self._pending.setdefault(client_order_id, _Pending(ack_at=self.clock.now_ms()))
-        pending.cancel_at = self.clock.now_ms() + self.settings.venue(order.venue).cancel_latency_ms
-        await self._publish_order(order, EventType.PAPER_ORDER_UPDATED)
+        pending = self._pending.setdefault(client_order_id, _Pending(ack_at=now_ms))
+        pending.cancel_at = now_ms + self.settings.venue(order.venue).cancel_latency_ms
+        await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
 
-    async def cancel_all(self) -> int:
+    async def cancel_all(self, now_ms: Millis) -> int:
         live = self.oms.live_orders()
         for order in live:
-            await self.cancel(order.client_order_id)
+            await self.cancel(order.client_order_id, now_ms)
         return len(live)
 
     def inject_timeout(self, client_order_id: str) -> None:
@@ -187,7 +214,7 @@ class PaperExecutor(Executor):
 
             if pending.force_unknown:
                 self.oms.mark_unknown(order.client_order_id, "simulated venue timeout")
-                await self._publish_order(order, EventType.PAPER_ORDER_UPDATED)
+                await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
                 continue
 
             if now_ms < pending.ack_at:
@@ -197,7 +224,7 @@ class PaperExecutor(Executor):
                 self.oms.transition(order.client_order_id, OrderStatus.ACKNOWLEDGED)
                 order.acknowledged_at = now_ms
                 self.oms.transition(order.client_order_id, OrderStatus.OPEN)
-                await self._publish_order(order, EventType.PAPER_ORDER_UPDATED)
+                await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
 
             view = self._book_view(order)
 
@@ -206,7 +233,7 @@ class PaperExecutor(Executor):
                 if pending.cancel_at is not None and now_ms >= pending.cancel_at:
                     if self.simulator.cancel_wins_race(order, view):
                         self.oms.transition(order.client_order_id, OrderStatus.CANCELLED)
-                        await self._publish_order(order, EventType.PAPER_ORDER_UPDATED)
+                        await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
                         continue
                 else:
                     continue
@@ -214,7 +241,7 @@ class PaperExecutor(Executor):
             fill = self._attempt_fill(order, view, now_ms)
             if fill is not None:
                 fills.append(fill)
-                await self._record_fill(order, fill)
+                await self._record_fill(order, fill, now_ms)
 
             if order.is_terminal:
                 continue
@@ -226,7 +253,7 @@ class PaperExecutor(Executor):
                     else OrderStatus.CANCELLED
                 )
                 self.oms.transition(order.client_order_id, target)
-                await self._publish_order(order, EventType.PAPER_ORDER_UPDATED)
+                await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
 
         return fills
 
@@ -260,7 +287,9 @@ class PaperExecutor(Executor):
         source_ts = self.market.source_data_timestamp if self.market else None
         return self.simulator.build_fill(order, simulated, now_ms, source_ts)
 
-    async def _record_fill(self, order: PaperOrder, fill: FillEvent) -> None:
+    async def _record_fill(
+        self, order: PaperOrder, fill: FillEvent, now_ms: Millis
+    ) -> None:
         if not self.oms.apply_fill(fill):
             return
         self.account.apply_fill(fill)
@@ -274,16 +303,18 @@ class PaperExecutor(Executor):
                 payload=fill.to_json_dict(),
             )
         )
-        await self._publish_order(order, EventType.PAPER_ORDER_UPDATED)
+        await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
 
     def open_orders(self) -> list[PaperOrder]:
         return self.oms.live_orders()
 
-    async def _publish_order(self, order: PaperOrder, event_type: EventType) -> None:
+    async def _publish_order(
+        self, order: PaperOrder, event_type: EventType, now_ms: Millis
+    ) -> None:
         await self.bus.publish(
             Event(
                 type=event_type,
-                ts_ms=self.clock.now_ms(),
+                ts_ms=now_ms,
                 source=SERVICE,
                 schema_name="PaperOrder",
                 correlation_id=order.correlation_id,

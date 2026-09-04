@@ -331,7 +331,7 @@ class TestPaperExecutorLifecycle:
             max_slippage_bps=10.0,
             notional=100.0,
         )
-        report = await executor.submit(plan)
+        report = await executor.submit(plan, clock.now_ms())
         order = report.orders[0]
         assert order.status is OrderStatus.SUBMITTING
 
@@ -373,7 +373,7 @@ class TestPaperExecutorLifecycle:
             max_slippage_bps=10.0,
             notional=100.0,
         )
-        report = await executor.submit(plan)
+        report = await executor.submit(plan, clock.now_ms())
         assert report.orders[0].status is OrderStatus.REJECTED
         assert executor.rejected_submissions == 1
         assert account.fill_log == []
@@ -406,7 +406,7 @@ class TestPaperExecutorLifecycle:
             max_slippage_bps=10.0,
             notional=100.0,
         )
-        report = await executor.submit(plan)
+        report = await executor.submit(plan, clock.now_ms())
         order = report.orders[0]
         executor.inject_timeout(order.client_order_id)
         clock.advance(1_000)

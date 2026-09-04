@@ -64,8 +64,14 @@ class Veska:
         intent: TradeIntent,
         decision: RiskDecision,
         market: MarketState,
+        now_ms: Millis,
     ) -> ExecutionPlan | None:
-        """Build the plan for an approved intent, sized to what RUNE allowed."""
+        """Build the plan for an approved intent, sized to what RUNE allowed.
+
+        ``now_ms`` is the caller's canonical logical time (the orchestrator's
+        tick time), not a clock read taken here — see ``Executor``'s
+        "EXECUTION TIME IS ALWAYS EXPLICIT" note.
+        """
         notional = decision.approved_notional
         if notional <= 0:
             return None
@@ -112,7 +118,7 @@ class Veska:
         if not orders:
             return None
         plan = ExecutionPlan(
-            created_at=self.clock.now_ms(),
+            created_at=now_ms,
             source_data_timestamp=market.source_data_timestamp,
             correlation_id=intent.correlation_id,
             intent_id=intent.intent_id,
@@ -128,7 +134,7 @@ class Veska:
 
     # -- execution ---------------------------------------------------------
 
-    async def execute(self, plan: ExecutionPlan) -> ExecutionReport:
+    async def execute(self, plan: ExecutionPlan, now_ms: Millis) -> ExecutionReport:
         await self.bus.publish(
             Event(
                 type=EventType.EXECUTION_PLAN,
@@ -139,7 +145,7 @@ class Veska:
                 payload=plan.to_json_dict(),
             )
         )
-        report = await self.executor.submit(plan)
+        report = await self.executor.submit(plan, now_ms)
         await self.bus.publish(
             Event(
                 type=EventType.EXECUTION_REPORT,
@@ -155,11 +161,11 @@ class Veska:
     async def poll(self, now_ms: Millis) -> list[FillEvent]:
         return await self.executor.poll(now_ms)
 
-    async def cancel(self, client_order_id: str) -> None:
-        await self.executor.cancel(client_order_id)
+    async def cancel(self, client_order_id: str, now_ms: Millis) -> None:
+        await self.executor.cancel(client_order_id, now_ms)
 
-    async def cancel_all(self) -> int:
-        return await self.executor.cancel_all()
+    async def cancel_all(self, now_ms: Millis) -> int:
+        return await self.executor.cancel_all(now_ms)
 
     def open_orders(self) -> list[PaperOrder]:
         return self.executor.open_orders()

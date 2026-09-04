@@ -130,6 +130,10 @@ class Orchestrator:
     #: re-submitted on every tick until the first one filled — and the symbol
     #: would end up hedged several times over.
     working_hedges: dict[str, list[str]] = field(default_factory=dict)
+    #: The one logical timestamp the tick currently executing uses for every
+    #: time-dependent decision — see "TICK TIME" on :meth:`tick`. ``None``
+    #: outside a tick, where :attr:`tick_time` falls back to the live clock.
+    _tick_time: Millis | None = None
 
     def __post_init__(self) -> None:
         self.health.register(SERVICE, VERSION)
@@ -202,7 +206,7 @@ class Orchestrator:
             )
         previous = record.state
         record.state = target
-        record.updated_at = self.clock.now_ms()
+        record.updated_at = self.tick_time
         await self.bus.publish(
             Event(
                 type=EventType.STRATEGY_STATE_CHANGED,
@@ -237,9 +241,48 @@ class Orchestrator:
 
     # -- the tick ----------------------------------------------------------
 
+    @property
+    def tick_time(self) -> Millis:
+        """The canonical logical time of the tick currently executing.
+
+        Outside a tick this falls back to a live clock read, so anything
+        reached from a bus handler rather than from :meth:`tick` still gets
+        a sensible answer.
+        """
+        return self.clock.now_ms() if self._tick_time is None else self._tick_time
+
     async def tick(self) -> None:
+        """Run one orchestration cycle.
+
+        TICK TIME (Phase 2 Batch 1.3 — P2-14)
+        =====================================
+        A tick executes at ONE logical timestamp: :attr:`tick_time`, captured
+        once at the market-snapshot boundary (immediately after
+        ``_observe()``, the same instant the ``ORCHESTRATOR_TICK`` marker
+        records). Every time-dependent decision belonging to this tick —
+        opportunity validity, agent-response deadlines, intent creation and
+        deadlines, order submission and its acknowledgement deadline,
+        cancellation, expiry, fill stamping, marking — uses that one value
+        rather than reading the clock again as the tick proceeds.
+
+        This is not a stylistic preference; it is what makes the tick
+        replayable. A recorded session preserves exactly one timestamp per
+        tick, so replay re-executes the whole tick at that instant. In a live
+        run the clock does NOT stand still meanwhile: the feed advances it
+        concurrently, so a mid-tick clock read can land hundreds of
+        milliseconds after the snapshot the tick is reasoning about. Before
+        this batch, ``PaperExecutor.submit()`` read the clock itself and
+        stamped ``submitted_at`` from such a read; replay reconstructed the
+        same submission 300ms earlier, its acknowledgement deadline therefore
+        fell on the other side of the very next tick, and replay filled an
+        order the original had not — different fill prices, different P&L,
+        a different kill-switch outcome, from an identical recorded market.
+
+        The clock is still read freely for things that are observations
+        rather than decisions (log/metric stamps, health heartbeats): those
+        do not change what the platform does.
+        """
         self.ticks += 1
-        now = self.clock.now_ms()
 
         # First, not last: the warm-up branch below can return early, and a
         # tick that skipped persistence would reintroduce exactly the quiet
@@ -248,27 +291,38 @@ class Orchestrator:
 
         market = await self._observe()
 
-        # Marked HERE, right after _observe()'s snapshot, not at the top of
-        # the tick: under an asynchronous bus, publication order and
-        # dispatch order are not the same thing (see _mark_tick_boundary),
-        # so the only moment that correctly answers "what had TIDAL actually
-        # applied when this tick's MarketState was built" is immediately
-        # after that snapshot was taken. Unconditional -- a warm-up tick or
-        # one that produces no trades is still a real tick boundary.
+        # THE tick time, captured once, HERE: right after _observe()'s
+        # snapshot, not at the top of the tick.
         #
-        # The marker's own ts_ms is read fresh here too (Phase 2 Batch 1.2),
-        # not reused from the stale top-of-tick `now`: `_persist()` above can
-        # await real durable I/O, during which a market input can be
-        # published *and applied* with a later timestamp, and still be
-        # covered by this tick's watermark. EventStore orders events
-        # timestamp-primary (`Event.sort_key()`), so a marker stamped with
-        # the stale, earlier `now` would sort BEFORE an input it explicitly
-        # claims to have already applied -- silently breaking the
-        # deferred-input release replay depends on (see
-        # ReplaySession._pump_one). `now` itself is left untouched for
-        # _settle() below: only the marker's timeline position needs to
-        # track when it was actually built.
-        await self._mark_tick_boundary(self.clock.now_ms())
+        # For the marker (Phase 2 Batch 1.2) this is the only moment that
+        # correctly answers "what had TIDAL actually applied when this tick's
+        # MarketState was built": under an asynchronous bus, publication
+        # order and dispatch order are not the same thing (see
+        # _mark_tick_boundary), and `_persist()` above can await real durable
+        # I/O during which an input is published *and applied* with a later
+        # timestamp. EventStore orders events timestamp-primary
+        # (`Event.sort_key()`), so a marker stamped with the stale
+        # top-of-tick time would sort BEFORE an input it explicitly claims to
+        # have already applied, breaking the deferred-input release replay
+        # depends on (see ReplaySession._pump_one).
+        #
+        # For everything else (Phase 2 Batch 1.3) it is the single logical
+        # time this tick's decisions are made at -- see this method's "TICK
+        # TIME" note. The marker records it, so it is precisely the value
+        # replay restores before re-running this tick.
+        self._tick_time = self.clock.now_ms()
+        try:
+            await self._tick_body(market)
+        finally:
+            self._tick_time = None
+
+    async def _tick_body(self, market: MarketState) -> None:
+        """The rest of the tick, running at the fixed :attr:`tick_time`."""
+        now = self.tick_time
+
+        # Unconditional -- a warm-up tick or one that produces no trades is
+        # still a real tick boundary.
+        await self._mark_tick_boundary(now)
 
         await self._settle(now)
         portfolio = self._measure(market)
@@ -432,7 +486,7 @@ class Orchestrator:
         for key, venue_state in market.venues.items():
             if venue_state.metrics.mid is not None:
                 marks[key] = venue_state.metrics.mid
-        self.veska.executor.account.mark(marks, self.clock.now_ms())
+        self.veska.executor.account.mark(marks, self.tick_time)
         portfolio = self.veska.executor.account.snapshot()
         self.state.portfolio = portfolio
         # Execution and risk heartbeat here, before anything reads health:
@@ -540,7 +594,7 @@ class Orchestrator:
             log.error("kill switch fired", extra={"triggers": fired})
 
         if self.kill_switch.state.cancel_all_requested:
-            await self.veska.cancel_all()
+            await self.veska.cancel_all(self.tick_time)
             self.kill_switch.acknowledge_cancel_all()
         if self.kill_switch.state.execution_disabled:
             self.veska.executor.execution_disabled = True
@@ -615,7 +669,7 @@ class Orchestrator:
             await self._decide(record, market, portfolio)
             return
 
-        now = self.clock.now_ms()
+        now = self.tick_time
         waited = now - opportunity.created_at
         if waited >= self.settings.consensus.agent_response_timeout_ms or not (
             opportunity.is_valid_at(now)
@@ -677,7 +731,7 @@ class Orchestrator:
         self, record: OpportunityRecord, market: MarketState, portfolio: PortfolioState
     ) -> None:
         opportunity = record.opportunity
-        now = self.clock.now_ms()
+        now = self.tick_time
 
         if not opportunity.is_valid_at(now):
             await self._reject(record, "OPPORTUNITY_EXPIRED")
@@ -725,7 +779,7 @@ class Orchestrator:
 
         await self.transition(record, StrategyState.AUTHORIZED)
 
-        plan = self.veska.build_plan(intent, decision, market)
+        plan = self.veska.build_plan(intent, decision, market, self.tick_time)
         if plan is None:
             await self._reject(record, "PLANNING_FAILED")
             return
@@ -746,7 +800,7 @@ class Orchestrator:
         self.working_notional[opportunity.opportunity_id] = decision.approved_notional
 
         await self.transition(record, StrategyState.EXECUTING)
-        report = await self.veska.execute(plan)
+        report = await self.veska.execute(plan, self.tick_time)
         record.order_ids = [order.client_order_id for order in report.orders]
         await self.bus.drain()
 
@@ -771,7 +825,7 @@ class Orchestrator:
             latency_bps=latency,
             hedge_bps=self.settings.zephr.hedge_cost_bps,
         )
-        now = self.clock.now_ms()
+        now = self.tick_time
         return TradeIntent(
             created_at=now,
             # The oldest of this intent's own legs (TIDAL-H4) — not the
@@ -809,7 +863,7 @@ class Orchestrator:
         await self.bus.publish(
             Event(
                 type=EventType.RISK_EVALUATION_REQUEST,
-                ts_ms=self.clock.now_ms(),
+                ts_ms=self.tick_time,
                 source=SERVICE,
                 schema_name="TradeIntent",
                 correlation_id=intent.correlation_id,
@@ -851,9 +905,9 @@ class Orchestrator:
         live = [o for o in orders if o is not None and o.is_live]
         if live:
             deadline = record.intent.deadline_ms if record.intent else None
-            if deadline is not None and self.clock.now_ms() > deadline:
+            if deadline is not None and self.tick_time > deadline:
                 for order in live:
-                    await self.veska.cancel(order.client_order_id)
+                    await self.veska.cancel(order.client_order_id, self.tick_time)
             return
         filled = sum(o.filled_quantity for o in orders if o is not None)
         if filled <= 0:
@@ -872,7 +926,7 @@ class Orchestrator:
         await self.bus.publish(
             Event(
                 type=EventType.OPPORTUNITY_DETECTED,
-                ts_ms=self.clock.now_ms(),
+                ts_ms=self.tick_time,
                 source=SERVICE,
                 schema_name="Opportunity",
                 correlation_id=opportunity.opportunity_id,
@@ -891,7 +945,7 @@ class Orchestrator:
             return
         # Below the continuation threshold: cancel what is working and unwind.
         for order_id in record.order_ids:
-            await self.veska.cancel(order_id)
+            await self.veska.cancel(order_id, self.tick_time)
         await self.transition(record, StrategyState.EXITING)
         await self._submit_exit(record, market)
 
@@ -928,7 +982,7 @@ class Orchestrator:
             await self._finish_attribution(record)
             return
 
-        now = self.clock.now_ms()
+        now = self.tick_time
         record.exit_attempts += 1
         # Each retry crosses further: getting out matters more than the last
         # basis point of the exit price.
@@ -970,11 +1024,11 @@ class Orchestrator:
                 "reason_codes": ["EXIT_AUTHORISED"],
             }
         )
-        plan = self.veska.build_plan(exit_intent, exit_decision, market)
+        plan = self.veska.build_plan(exit_intent, exit_decision, market, self.tick_time)
         if plan is None:
             return
         plan.correlation_id = record.opportunity.opportunity_id
-        report = await self.veska.execute(plan)
+        report = await self.veska.execute(plan, self.tick_time)
         record.order_ids = [order.client_order_id for order in report.orders]
         await self.bus.drain()
 
@@ -992,7 +1046,7 @@ class Orchestrator:
         intents = self.okapi.build_hedges(portfolio, market)
         if not intents:
             return
-        now = self.clock.now_ms()
+        now = self.tick_time
         for hedge in intents:
             if self._hedge_in_flight(hedge.symbol):
                 continue
@@ -1044,12 +1098,12 @@ class Orchestrator:
                 requested_notional=notional,
                 reason_codes=["HEDGE_EXPOSURE_REDUCING"],
             )
-            plan = self.veska.build_plan(hedge_intent, decision, market)
+            plan = self.veska.build_plan(hedge_intent, decision, market, self.tick_time)
             if plan is None:
                 continue
             plan.correlation_id = hedge.hedge_id
             await self.okapi.publish_hedge(hedge)
-            report = await self.veska.execute(plan)
+            report = await self.veska.execute(plan, self.tick_time)
             self.working_hedges[hedge.symbol] = [
                 order.client_order_id for order in report.orders
             ]
@@ -1110,12 +1164,12 @@ class Orchestrator:
             await self.bus.publish(
                 Event(
                     type=EventType.SYSTEM_EVENT,
-                    ts_ms=self.clock.now_ms(),
+                    ts_ms=self.tick_time,
                     source=SERVICE,
                     schema_name="SystemEvent",
                     correlation_id=record.opportunity.opportunity_id,
                     payload=SystemEvent(
-                        created_at=self.clock.now_ms(),
+                        created_at=self.tick_time,
                         correlation_id=record.opportunity.opportunity_id,
                         kind="EXIT_INCOMPLETE",
                         severity=Severity.WARNING,
@@ -1150,7 +1204,7 @@ class Orchestrator:
         # opportunity's own correlation_id, in ``_on_fill`` -- not read here
         # from a position's lifetime-cumulative counter, which would inherit
         # every prior opportunity's contribution on the same venue:symbol.
-        builder.closed_at = self.clock.now_ms()
+        builder.closed_at = self.tick_time
         attribution = builder.build()
         record.realized_pnl = attribution.realized_pnl or 0.0
         self.scorecard.record(attribution)

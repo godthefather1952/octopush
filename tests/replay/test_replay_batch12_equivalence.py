@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from apps.orchestrator.wiring import build_platform
 from core.bus import InMemoryEventBus
 from core.clock import ManualClock
@@ -49,89 +51,97 @@ async def _replay(settings, store, session_id: str):
     return platform, session
 
 
+async def run_concurrent_session(recorded, ticks: int):
+    """Drive ``recorded`` for ``ticks`` under genuinely concurrent scheduling.
+
+    A real background bus dispatcher, an independently-scheduled
+    feed-publication task and an independently-scheduled orchestrator-tick
+    task, with neither task draining the bus to synchronize with the other.
+    """
+    await recorded.bus.start()
+
+    # A bounded producer/consumer handoff, NOT bus.drain(): tick_loop may run
+    # at most one tick ahead of what feed_loop has fed it, but the two are
+    # otherwise free to interleave however asyncio happens to schedule them
+    # -- unlike ManualClock.sleep()-based pacing (which risks the two loops'
+    # waiter deadlines drifting out of lockstep and deadlocking once one loop
+    # finishes advancing the clock before the other's last wait can ever be
+    # released), this handoff cannot deadlock: feed_loop always eventually
+    # unblocks tick_loop's wait.
+    progress = asyncio.Condition()
+    feed_done = 0
+    tick_done = 0
+
+    async def feed_loop() -> None:
+        nonlocal feed_done
+        for _ in range(ticks):
+            recorded.clock.advance(100)
+            # No bus.drain() here: publication is left to the real background
+            # dispatcher, running independently of both this loop and
+            # tick_loop below. This is also what lets the clock advance
+            # *during* a tick, which is precisely the condition P2-14's
+            # canonical tick time exists to survive.
+            await recorded.sim_driver.step()
+            async with progress:
+                feed_done += 1
+                progress.notify_all()
+            await asyncio.sleep(0)
+
+    async def tick_loop() -> None:
+        nonlocal tick_done
+        for _ in range(ticks):
+            async with progress:
+                # feed_done/tick_done are read live (nonlocal, mutated
+                # elsewhere in this same coroutine) on every predicate check
+                # -- the closure deliberately does NOT snapshot them, unlike
+                # the stale-loop-variable case B023 flags.
+                await progress.wait_for(lambda: feed_done > tick_done)  # noqa: B023
+            await recorded.orchestrator.tick()
+            async with progress:
+                tick_done += 1
+            await asyncio.sleep(0)
+
+    await asyncio.gather(feed_loop(), tick_loop())
+    await recorded.bus.drain()
+
+    # Settle any order still SUBMITTING when the concurrent section ended --
+    # comparing state while paper-execution latency is still in flight would
+    # compare two runs at different, non-reproducible phases of that
+    # in-flight work, which is a test-harness concern, not a replay-fidelity
+    # one.
+    for _ in range(60):
+        if not any(o.status.value == "SUBMITTING" for o in recorded.oms.orders.values()):
+            break
+        recorded.clock.advance(100)
+        await recorded.sim_driver.step()
+        await recorded.bus.drain()
+        await recorded.orchestrator.tick()
+
+    await recorded.recorder.flush()
+
+
 class TestConcurrentPublisherAndYieldingRecorderEquivalence:
     """Section 11(A), and the mission's "at minimum one" requirement: a real
     background bus dispatcher, an independently-scheduled feed-publication
     task, an independently-scheduled orchestrator-tick task, and a real
     Recorder -- with neither task draining the bus to synchronize with the
     other.
+
+    Parametrised over run lengths deliberately, including every length that
+    reproduced P2-14 (40, 55, 70 -- see
+    ``tests/unit/test_execution_time_fidelity.py`` for the root cause). An
+    exact-replay test may not pick a scenario merely because that scenario
+    happens to avoid a known deterministic divergence, so the lengths that
+    exposed the bug stay in the suite permanently.
     """
 
+    @pytest.mark.parametrize("ticks", [40, 50, 55, 70])
     async def test_original_and_replay_agree_under_independent_concurrent_scheduling(
-        self, settings
+        self, settings, ticks
     ):
         recorded = fresh_platform(settings)
         await recorded.start(record=True, feeds=False)
-        await recorded.bus.start()
-
-        # 50, not a round/convenient number: an investigation while writing
-        # this test found that a handful of specific tick counts in this
-        # exact harness (40, 55, 70 -- but not 20, 30, 45, 50, 65, 80)
-        # deterministically reproduce a SEPARATE, narrow economic-fill-price
-        # divergence between the original run and its replay, unrelated to
-        # both P2-13 (bus ordering) and the tick-marker timestamp fix this
-        # batch closes -- see the Batch 1.2 report's "remaining findings"
-        # for the reproduction recipe. 50 is a value confirmed clean, that
-        # still produces real trades, so this test isolates and proves
-        # THIS batch's fixes rather than tripping over that separate,
-        # out-of-scope issue.
-        ticks = 50
-        # A bounded producer/consumer handoff, NOT bus.drain(): tick_loop
-        # may run at most one tick ahead of what feed_loop has fed it, but
-        # the two are otherwise free to interleave however asyncio happens
-        # to schedule them -- unlike ManualClock.sleep()-based pacing (which
-        # risks the two loops' waiter deadlines drifting out of lockstep
-        # and deadlocking once one loop finishes advancing the clock before
-        # the other's last wait can ever be released), this handoff cannot
-        # deadlock: feed_loop always eventually unblocks tick_loop's wait.
-        progress = asyncio.Condition()
-        feed_done = 0
-        tick_done = 0
-
-        async def feed_loop() -> None:
-            nonlocal feed_done
-            for _ in range(ticks):
-                recorded.clock.advance(100)
-                # No bus.drain() here: publication is left to the real
-                # background dispatcher, running independently of both this
-                # loop and tick_loop below.
-                await recorded.sim_driver.step()
-                async with progress:
-                    feed_done += 1
-                    progress.notify_all()
-                await asyncio.sleep(0)
-
-        async def tick_loop() -> None:
-            nonlocal tick_done
-            for _ in range(ticks):
-                async with progress:
-                    # feed_done/tick_done are read live (nonlocal, mutated
-                    # elsewhere in this same coroutine) on every predicate
-                    # check -- the closure deliberately does NOT snapshot
-                    # them, unlike the stale-loop-variable case B023 flags.
-                    await progress.wait_for(lambda: feed_done > tick_done)  # noqa: B023
-                await recorded.orchestrator.tick()
-                async with progress:
-                    tick_done += 1
-                await asyncio.sleep(0)
-
-        await asyncio.gather(feed_loop(), tick_loop())
-        await recorded.bus.drain()
-
-        # Settle any order still SUBMITTING when the concurrent section
-        # ended -- comparing state while paper-execution latency is still
-        # in flight would compare two runs at different, non-reproducible
-        # phases of that in-flight work, which is a test-harness concern,
-        # not a replay-fidelity one.
-        for _ in range(60):
-            if not any(o.status.value == "SUBMITTING" for o in recorded.oms.orders.values()):
-                break
-            recorded.clock.advance(100)
-            await recorded.sim_driver.step()
-            await recorded.bus.drain()
-            await recorded.orchestrator.tick()
-
-        await recorded.recorder.flush()
+        await run_concurrent_session(recorded, ticks)
 
         total_ticks = recorded.orchestrator.ticks
         session_id = recorded.session_id
@@ -144,6 +154,7 @@ class TestConcurrentPublisherAndYieldingRecorderEquivalence:
 
         original = replay_equivalence_summary(recorded)
         reproduced = replay_equivalence_summary(replayed)
+        assert original["fills"], "the run must actually trade for this to prove anything"
         assert reproduced == original
 
 
@@ -166,10 +177,8 @@ class TestTimestampOrderInversionEquivalence:
     narrower, root-cause-focused version of this reproduction).
 
     Built on the same 50-tick, two-venue default scenario as
-    ``TestConcurrentPublisherAndYieldingRecorderEquivalence`` above (chosen
-    there for the same reason: confirmed clean of the separate, out-of-scope
-    fill-pricing divergence noted in the Batch 1.2 report's remaining
-    findings), with the marker-timestamp race injected around its midpoint.
+    ``TestConcurrentPublisherAndYieldingRecorderEquivalence`` above, with the
+    marker-timestamp race injected around its midpoint.
     """
 
     async def test_original_and_replay_agree_despite_a_stale_marker_timestamp_race(
