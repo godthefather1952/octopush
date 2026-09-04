@@ -194,12 +194,29 @@ class TestTheDevContainer:
         assert devcontainer["name"]
 
     def test_it_pins_a_python_the_project_supports(self, devcontainer):
-        """pyproject requires >= 3.11; the image must not be older."""
-        image = devcontainer["image"]
-        assert "python" in image
-        version = re.search(r"3\.(\d+)", image)
-        assert version is not None, image
-        assert int(version.group(1)) >= 11, f"{image} is older than the project's floor"
+        """pyproject requires >= 3.11; the shipped image must not be older.
+
+        The devcontainer builds from the repo's own ``Dockerfile`` (the
+        Codespaces Docker-in-Docker fix, e17fedb) rather than declaring a
+        bare ``image`` field — so the Python version it actually ships is
+        whatever that Dockerfile's ``FROM`` line pins, and there is no
+        separate ``image`` value left to check or drift from it.
+        """
+        build = devcontainer.get("build")
+        assert build is not None, (
+            "expected a build-based devcontainer (build.dockerfile), not a bare "
+            "image field — devcontainer.json's shape changed with the "
+            "Docker-in-Docker fix and this test must check the real thing"
+        )
+        assert build.get("context") == "..", "the build context must reach the repo root"
+        dockerfile_path = (ROOT / build["dockerfile"]).resolve()
+        assert dockerfile_path == (ROOT / "Dockerfile").resolve()
+        dockerfile = dockerfile_path.read_text()
+        version = re.search(r"FROM python:(3\.\d+)", dockerfile)
+        assert version is not None, "Dockerfile has no FROM python:X.Y line"
+        assert int(version.group(1).split(".")[1]) >= 11, (
+            f"{version.group(1)} is older than the project's floor"
+        )
 
     def test_docker_is_provided_by_a_feature_not_a_shell_script(self, devcontainer):
         """The stack runs containers, so the Codespace needs its own daemon."""
@@ -459,7 +476,17 @@ class TestResetIsExplicitlyDestructive:
             assert not self._volume_exists(name), f"{name} survived an explicit reset"
 
     def test_a_wrong_answer_cancels_and_deletes_nothing(self):
-        """Anything but the exact word cancels."""
+        """Anything but the exact word cancels.
+
+        This talks to the real Docker daemon (the script's own first check),
+        so it must tell "the script is wrong" apart from "Docker is not
+        available in this environment" — a missing daemon is an environment
+        limitation, not evidence about the script's confirmation logic, and
+        must not be conflated with either passing or failing that logic.
+        """
+        if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
+            pytest.skip("no Docker daemon available in this environment")
+
         result = subprocess.run(
             ["bash", "scripts/reset-paper.sh"],
             input="yes\n",
@@ -472,6 +499,10 @@ class TestResetIsExplicitlyDestructive:
         # Either it cancelled, or there were no volumes to erase in the first
         # place — both mean nothing was destroyed on a non-matching answer.
         combined = result.stdout + result.stderr
+        assert "Docker daemon is not running" not in combined, (
+            "Docker was available a moment ago; a daemon failure here is a real "
+            "environment problem, not this test's concern to swallow"
+        )
         assert "Cancelled" in combined or "nothing to erase" in combined
         assert "Reset complete" not in combined
 
@@ -513,9 +544,26 @@ class TestThePythonVersionIsConsistent:
         assert self._python_version(dockerfile, r"FROM python:(3\.\d+)") == "3.12"
 
     def test_the_devcontainer_matches_the_dockerfile(self):
-        """A Codespace should be the version the project runs on."""
-        devcontainer = (ROOT / ".devcontainer" / "devcontainer.json").read_text()
-        assert self._python_version(devcontainer, r"python:1-(3\.\d+)-") == "3.12"
+        """A Codespace should be the version the project runs on.
+
+        The devcontainer no longer declares its own image or version string
+        to compare against the Dockerfile — it *builds from* the Dockerfile
+        (``build.dockerfile``), so the real relationship to test is that it
+        points at the same file this class's other test already asserts pins
+        3.12, not a second, independent version string that could drift.
+        """
+        import json
+
+        raw = (ROOT / ".devcontainer" / "devcontainer.json").read_text()
+        stripped = re.sub(r"^\s*//.*$", "", raw, flags=re.MULTILINE)
+        devcontainer = json.loads(stripped)
+        build = devcontainer.get("build")
+        assert build is not None, "devcontainer must build from the repo's Dockerfile"
+        dockerfile_path = (ROOT / ".devcontainer" / build["context"] / build["dockerfile"]).resolve()
+        assert dockerfile_path == (ROOT / "Dockerfile").resolve(), (
+            "devcontainer.json must build from the same Dockerfile that pins the "
+            "canonical Python version, not a different or duplicated one"
+        )
 
     def test_ci_runs_the_canonical_version(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()

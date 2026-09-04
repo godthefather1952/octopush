@@ -33,8 +33,23 @@ class VenueRouter:
 
     @staticmethod
     def _levels(market: MarketState, leg: OpportunityLeg) -> list[PriceLevel]:
+        """Levels to route against, or none at all (TIDAL-L5).
+
+        A venue/symbol having a populated book is not the same question as
+        whether that book is currently trustworthy: ``state.book`` stays
+        populated (the last known snapshot/deltas) through a disconnect, a
+        sequence gap, or ordinary staleness -- only ``quality`` reflects
+        whether TIDAL still stands behind it. Routing from a STALE or
+        UNAVAILABLE book would price and size an order against data TIDAL
+        itself has already stopped trusting. This is the single quality gate
+        for routing, and it defers entirely to the canonical
+        ``DataQuality.is_usable`` -- no separate freshness threshold is
+        invented here.
+        """
         state = market.venue_state(leg.venue, leg.symbol)
         if state is None or state.book is None:
+            return []
+        if not state.quality.is_usable:
             return []
         return state.book.asks if leg.side is Side.BUY else state.book.bids
 

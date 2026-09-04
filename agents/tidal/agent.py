@@ -77,7 +77,6 @@ class Tidal:
         #: every message until it resolves, and one event per message would
         #: flood the bus with the same fact.
         self._clock_skew_reported_ms: dict[tuple[str, str], Millis] = {}
-        self.updates_since_checkpoint: dict[tuple[str, str], int] = {}
         self.desyncs = 0
         self.resync_requests = 0
         #: When a resync was last asked for, per book. A gap usually arrives as
@@ -295,7 +294,6 @@ class Tidal:
             await self.request_resync(snapshot.venue, snapshot.symbol, str(exc))
             return
         self._snapshot_overflow_streak.pop(key, None)
-        self.updates_since_checkpoint[key] = 0
         await self._record_latency(key, snapshot.exchange_ts, snapshot.received_ts)
         self.connected.setdefault(snapshot.venue, True)
 
@@ -315,7 +313,6 @@ class Tidal:
             )
             await self.request_resync(delta.venue, delta.symbol, str(exc))
             return
-        self.updates_since_checkpoint[key] = self.updates_since_checkpoint.get(key, 0) + 1
         await self._record_latency(key, delta.exchange_ts, delta.received_ts)
 
     async def on_trade(self, trade: TradeEvent) -> None:
@@ -339,7 +336,14 @@ class Tidal:
         """
         if not book.synced or book.crossed or not book.bids or not book.asks:
             return DataQuality.UNAVAILABLE
-        if not self.connected.get(book.venue, True):
+        # Fail-closed by default (TIDAL-L1): a venue this dict has never heard
+        # from is not "assumed connected until proven otherwise" -- it is
+        # UNAVAILABLE until something actually established that lifecycle
+        # (VENUE_CONNECTED, or any accepted snapshot -- see on_snapshot's
+        # setdefault). The published ``VenueMarketState.connected`` field
+        # already used this default; this only makes the internal quality
+        # gate agree with it instead of silently trusting the unknown case.
+        if not self.connected.get(book.venue, False):
             return DataQuality.UNAVAILABLE
         if book.last_update_ts is None or book.exchange_ts is None:
             return DataQuality.UNAVAILABLE

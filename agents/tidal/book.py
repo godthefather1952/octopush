@@ -19,6 +19,12 @@ class BookDesyncError(RuntimeError):
     """Raised when an update cannot be applied to the current book."""
 
 
+#: Bound on ``LocalOrderBook.invalid_reason`` (TIDAL-L2): diagnostic only, so
+#: a long formatted detail is truncated rather than let an arbitrarily large
+#: string accumulate in book state.
+_MAX_INVALID_REASON_LEN = 200
+
+
 class BookOverflowError(BookDesyncError):
     """Raised when a book's stored level count exceeds its safety bound.
 
@@ -90,6 +96,14 @@ class LocalOrderBook:
     overflow_count: int = 0
     #: Set when a gap is seen, cleared by the next checkpoint.
     needs_resync: bool = False
+    #: Why this book is currently untrusted (TIDAL-L2), bounded and
+    #: diagnostic only -- nothing here ever gates trading behavior. ``None``
+    #: while the book is synced or has never been invalidated. Set by
+    #: :meth:`invalidate`, :meth:`_desync` and :meth:`_check_storage_bound`
+    #: alike, so a disconnect, a sequence gap and a storage overflow are
+    #: equally visible instead of only the first path anyone happened to add
+    #: a message to; cleared the moment a fresh snapshot re-establishes sync.
+    invalid_reason: str | None = None
     #: True between a snapshot and the first delta applied on top of it.
     #: Range-sequenced feeds relax the continuity rule for exactly that one
     #: update; see :meth:`apply_delta`.
@@ -135,10 +149,13 @@ class LocalOrderBook:
             self.synced = False
             self.needs_resync = True
             self.awaiting_first_delta = False
+            reason = (
+                f"snapshot exceeded max_levels_per_side={self.max_levels_per_side} "
+                f"(incoming bids={incoming_bids}, asks={incoming_asks})"
+            )
+            self.invalid_reason = reason[:_MAX_INVALID_REASON_LEN]
             raise BookOverflowError(
-                f"{self.venue}:{self.symbol} snapshot exceeded max_levels_per_side="
-                f"{self.max_levels_per_side} (incoming bids={incoming_bids}, "
-                f"asks={incoming_asks}) -- rejected before copying into storage"
+                f"{self.venue}:{self.symbol} {reason} -- rejected before copying into storage"
             )
         self.bids = {level.price: level.size for level in snapshot.bids if level.size > 0}
         self.asks = {level.price: level.size for level in snapshot.asks if level.size > 0}
@@ -149,12 +166,17 @@ class LocalOrderBook:
         self.needs_resync = False
         self.awaiting_first_delta = True
         self.updates_applied += 1
+        # A successful checkpoint re-establishes trust from scratch: whatever
+        # explained the previous distrust no longer applies (TIDAL-L2).
+        self.invalid_reason = None
 
     def _desync(self, detail: str) -> BookDesyncError:
         self.sequence_gaps += 1
         self.synced = False
         self.needs_resync = True
-        return BookDesyncError(f"{self.venue}:{self.symbol} sequence gap: {detail}")
+        reason = f"sequence gap: {detail}"
+        self.invalid_reason = reason[:_MAX_INVALID_REASON_LEN]
+        return BookDesyncError(f"{self.venue}:{self.symbol} {reason}")
 
     def _check_range(self, delta: BookDelta) -> bool:
         """Validate a range-sequenced delta. False means "already covered".
@@ -303,10 +325,12 @@ class LocalOrderBook:
         self.synced = False
         self.needs_resync = True
         self.awaiting_first_delta = False
-        raise BookOverflowError(
-            f"{self.venue}:{self.symbol} delta exceeded max_levels_per_side="
-            f"{self.max_levels_per_side} (bids={len(self.bids)}, asks={len(self.asks)})"
+        reason = (
+            f"delta exceeded max_levels_per_side={self.max_levels_per_side} "
+            f"(bids={len(self.bids)}, asks={len(self.asks)})"
         )
+        self.invalid_reason = reason[:_MAX_INVALID_REASON_LEN]
+        raise BookOverflowError(f"{self.venue}:{self.symbol} {reason}")
 
     @staticmethod
     def _set(side: dict[float, float], level: PriceLevel) -> None:
@@ -319,6 +343,7 @@ class LocalOrderBook:
         self.synced = False
         self.needs_resync = True
         self.awaiting_first_delta = False
+        self.invalid_reason = reason[:_MAX_INVALID_REASON_LEN] if reason else None
 
     # -- reads -------------------------------------------------------------
 
