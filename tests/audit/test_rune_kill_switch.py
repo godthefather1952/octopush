@@ -1,0 +1,466 @@
+"""Phase 5 — H8, H9, H10, H11: the emergency boundary.
+
+Pre-trade prevention and post-fill detection are different jobs. RUNE stops a
+trade being authorised; the kill switch is what notices that the platform has
+ended up somewhere it should not be — through partial fills, slippage, or the
+concurrent commitments audited elsewhere in this suite — and does something
+about it.
+
+Four questions:
+
+* **H8** — is there any automatic path that engages ``RISK_LIMIT_BREACH`` when
+  a live portfolio exceeds a configured hard limit?
+* **H9** — does ``EXCESSIVE_LATENCY`` consume latency, or data age under a
+  latency-shaped name?
+* **H10** — after ``DISABLE_EXECUTION``, does clearing the switch restore the
+  platform's ability to submit?
+* **H11** — can an order that was already live when FLATTEN fired re-open
+  exposure after the flatten completes?
+"""
+
+from __future__ import annotations
+
+import inspect
+
+import pytest
+
+from apps.orchestrator.orchestrator import Orchestrator
+from core.bus import InMemoryEventBus
+from core.clock import ManualClock
+from core.config import Settings, load_settings, simulated_venues
+from core.models.ops import KillAction, KillSwitchState
+from risk.kill_switch import (
+    CONFIRMATIONS,
+    TRIGGER_ACTIONS,
+    TRIGGERS,
+    KillSwitch,
+    KillSwitchInputs,
+)
+from tests.audit.rune_fixtures import portfolio, portfolio_with, position
+from tests.conftest import START_MS
+
+
+def settings(**risk_overrides) -> Settings:
+    base = load_settings().model_copy(update={"venues": simulated_venues()})
+    if risk_overrides:
+        return base.model_copy(
+            update={"risk": base.risk.model_copy(update=risk_overrides)}
+        )
+    return base
+
+
+def switch(**risk_overrides) -> KillSwitch:
+    clock = ManualClock(START_MS)
+    return KillSwitch(
+        bus=InMemoryEventBus(raise_on_handler_error=True),
+        clock=clock,
+        settings=settings(**risk_overrides),
+    )
+
+
+def inputs(**overrides) -> KillSwitchInputs:
+    defaults = dict(
+        portfolio=portfolio(),
+        health=None,
+        reconciliation_ok=True,
+        market_data_ok=True,
+        book_corruption=False,
+        max_latency_ms=0.0,
+        storage_ok=True,
+        unexpected_position=False,
+        required_components=[],
+    )
+    defaults.update(overrides)
+    return KillSwitchInputs(**defaults)
+
+
+class TestTriggerInventory:
+    """Every action mapping should have a predicate that can reach it."""
+
+    def test_every_evaluated_trigger_has_an_action_mapping(self):
+        missing = sorted(set(TRIGGERS) - set(TRIGGER_ACTIONS))
+        assert not missing, f"triggers with no action mapping: {missing}"
+
+    def test_every_action_mapping_is_reachable(self):
+        """H8. ``TRIGGER_ACTIONS`` names what happens when a trigger fires;
+        ``TRIGGERS`` is what actually fires. A mapping with no predicate and no
+        caller is a safety response nothing can invoke."""
+        callers = _explicit_engage_calls()
+        unreachable = sorted(
+            name
+            for name in TRIGGER_ACTIONS
+            # MANUAL is operator-invoked by design; see the test below.
+            if name != "MANUAL" and name not in TRIGGERS and name not in callers
+        )
+        assert not unreachable, (
+            "kill-switch actions defined for triggers that no automatic "
+            f"predicate evaluates and no code path engages: {unreachable}. "
+            "A live portfolio past a hard exposure limit has no automatic "
+            "detection path."
+        )
+
+    def test_manual_is_reachable_by_design(self):
+        """MANUAL has no predicate on purpose — an operator engages it. Pinned
+        so the finding above is scoped to the automatic triggers."""
+        assert "MANUAL" in TRIGGER_ACTIONS
+        assert "MANUAL" not in TRIGGERS
+
+    def test_confirmations_only_delay_measurement_triggers(self):
+        """A breached limit is true the moment it is observed; a measurement
+        can blip. Recorded so the distinction stays deliberate."""
+        assert set(CONFIRMATIONS) == {
+            "SYSTEM_HEALTH_FAILURE",
+            "EXCESSIVE_LATENCY",
+            "MARKET_DATA_OUTAGE",
+        }
+        for immediate in ("MAX_DRAWDOWN_BREACHED", "MAX_DAILY_LOSS_BREACHED",
+                          "BOOK_CORRUPTION", "RECONCILIATION_MISMATCH"):
+            assert CONFIRMATIONS.get(immediate, 1) == 1
+
+
+def _explicit_engage_calls() -> set[str]:
+    """Trigger names passed to ``kill_switch.engage(...)`` anywhere in the app."""
+    import apps.orchestrator.orchestrator as orch
+    import risk.kill_switch as ks
+
+    names: set[str] = set()
+    for module in (orch, ks):
+        source = inspect.getsource(module)
+        for line in source.splitlines():
+            if ".engage(" not in line:
+                continue
+            fragment = line.split(".engage(", 1)[1]
+            for quote in ('"', "'"):
+                if fragment.startswith(quote):
+                    names.add(fragment[1:].split(quote, 1)[0])
+    return names
+
+
+class TestNoAutomaticExposureBreachDetection:
+    """H8, stated as the invariant rather than as an inventory question.
+
+    Every configured hard exposure limit should have SOME automatic path that
+    notices a live breach. Pre-trade gates cannot provide it: they run before a
+    trade, and the states this is about arise after one.
+    """
+
+    #: Limits whose breach is a live-portfolio condition rather than a
+    #: pre-trade projection.
+    LIVE_EXPOSURE_LIMITS = [
+        "max_gross_exposure",
+        "max_net_exposure",
+        "max_venue_exposure",
+        "max_strategy_exposure",
+        "max_position_notional",
+        "max_leverage",
+    ]
+
+    def test_drawdown_and_daily_loss_do_have_detection(self):
+        """The control: two limits that ARE watched continuously."""
+        assert "MAX_DRAWDOWN_BREACHED" in TRIGGERS
+        assert "MAX_DAILY_LOSS_BREACHED" in TRIGGERS
+
+    def test_unhedged_exposure_has_a_detection_path(self):
+        """``UNEXPECTED_POSITION`` is fed from the orchestrator's unhedged
+        measurement, so this dimension is watched."""
+        assert "UNEXPECTED_POSITION" in TRIGGERS
+        source = inspect.getsource(Orchestrator._protect)
+        assert "unexpected_position=abs(unhedged)" in source
+
+    @pytest.mark.parametrize("limit_name", LIVE_EXPOSURE_LIMITS)
+    def test_every_live_exposure_limit_has_an_automatic_breach_trigger(self, limit_name):
+        watched = _limits_read_by_triggers()
+        assert limit_name in watched, (
+            f"nothing evaluated every tick reads {limit_name}. A live "
+            "portfolio past this limit — through partial fills, slippage or "
+            "concurrent authorisation — is never detected, and RISK_LIMIT_BREACH "
+            f"is defined but unreachable. Triggers read: {sorted(watched)}"
+        )
+
+    async def test_a_portfolio_past_gross_exposure_fires_nothing(self):
+        """Diagnostic: the concrete state, run through the real evaluator."""
+        engine = switch()
+        limit = engine.settings.risk.max_gross_exposure
+        book = portfolio_with(
+            position("VENUE_A", quantity=limit / 100.0 * 2),  # double the limit
+        )
+        assert book.gross_exposure > limit
+        fired = await engine.evaluate(inputs(portfolio=book))
+        assert fired == [], (
+            "recorded for the report: a portfolio at "
+            f"{book.gross_exposure} against a {limit} gross limit fires "
+            f"{fired}"
+        )
+        assert engine.state.trading_allowed, (
+            "and trading is still permitted afterwards"
+        )
+
+
+def _limits_read_by_triggers() -> set[str]:
+    """Which ``settings.risk`` fields the trigger predicates actually consult."""
+    from core.config import RiskLimits
+
+    watched: set[str] = set()
+    for predicate in TRIGGERS.values():
+        source = inspect.getsource(predicate)
+        for field in RiskLimits.model_fields:
+            if f"settings.risk.{field}" in source:
+                watched.add(field)
+    return watched
+
+
+class TestLatencyTriggerMeasuresLatency:
+    """H9 — ``EXCESSIVE_LATENCY`` versus what the orchestrator feeds it."""
+
+    def test_the_predicate_compares_against_a_data_age_limit(self):
+        import risk.kill_switch as ks
+
+        source = inspect.getsource(ks._latency)
+        assert "inputs.max_latency_ms > settings.risk.max_data_age_ms * 5" in source
+
+    def test_the_orchestrator_feeds_data_age_not_transport_latency(self):
+        """The premise, read off production."""
+        source = inspect.getsource(Orchestrator._protect)
+        assert "s.age_ms or 0 for s in market.venues.values()" in source
+        assert "max_latency_ms=float(max_age)" in source
+        assert "latency_ms" not in source.split("max_age = max(")[1].split(")")[0]
+
+    def test_venue_state_reports_the_two_as_different_numbers(self):
+        """``age_ms`` is ``as_of - last_update_ts``; ``latency_ms`` is the
+        smoothed ``received_ts - exchange_ts``. They answer different
+        questions and can point in opposite directions."""
+        from core.models.market import VenueMarketState
+        from tests.conftest import make_book, venue_state_from_book
+
+        # Fresh data, slow transport: received a moment ago, but the exchange
+        # observed it long before.
+        book = make_book("VENUE_A", "BTC-USD", 100.0, ts=START_MS)
+        state = venue_state_from_book(book, as_of=START_MS)
+        fresh_but_slow = state.model_copy(update={"latency_ms": 30_000.0})
+        assert fresh_but_slow.age_ms == 0
+        assert fresh_but_slow.latency_ms == 30_000.0
+
+        # Old data, fast transport.
+        stale_but_quick = venue_state_from_book(
+            make_book("VENUE_A", "BTC-USD", 100.0, ts=START_MS - 30_000),
+            as_of=START_MS,
+        ).model_copy(update={"latency_ms": 1.0})
+        assert stale_but_quick.age_ms == 30_000
+        assert stale_but_quick.latency_ms == 1.0
+        assert isinstance(fresh_but_slow, VenueMarketState)
+
+    async def test_high_transport_latency_with_fresh_data_does_not_fire(self):
+        """What the trigger's name promises, against what it measures."""
+        engine = switch()
+        threshold = engine.settings.risk.max_data_age_ms * 5
+        # The orchestrator would report age, which is 0 here.
+        fired = await engine.evaluate(inputs(max_latency_ms=0.0))
+        assert "EXCESSIVE_LATENCY" not in fired
+        # And with the number the trigger's name implies:
+        engine2 = switch()
+        for _ in range(CONFIRMATIONS["EXCESSIVE_LATENCY"]):
+            fired2 = await engine2.evaluate(inputs(max_latency_ms=threshold + 1.0))
+        assert "EXCESSIVE_LATENCY" in fired2, (
+            "the predicate does fire on a large input; the question is which "
+            "number the orchestrator puts into it"
+        )
+
+    def test_the_input_field_is_named_for_latency(self):
+        assert "max_latency_ms" in KillSwitchInputs.__dataclass_fields__
+
+
+class TestTriggerExceptionsAreSwallowed:
+    """§30 — a mandatory safety predicate that raises is skipped, and the
+    evaluation continues as though the condition were absent."""
+
+    def test_evaluate_catches_and_continues(self):
+        source = inspect.getsource(KillSwitch.evaluate)
+        assert "except Exception:" in source
+        assert "continue" in source.split("except Exception:")[1]
+
+    async def test_a_raising_predicate_does_not_engage_anything(self, monkeypatch):
+        import risk.kill_switch as ks
+
+        def exploding(_inputs, _settings):
+            raise RuntimeError("predicate exploded")
+
+        monkeypatch.setitem(ks.TRIGGERS, "MAX_DRAWDOWN_BREACHED", exploding)
+        engine = switch()
+        book = portfolio(cash=0.0, peak_equity=100_000.0)
+        assert book.drawdown >= engine.settings.risk.max_drawdown
+        fired = await engine.evaluate(inputs(portfolio=book))
+        assert "MAX_DRAWDOWN_BREACHED" not in fired, (
+            "recorded: a raising safety predicate fails open — the condition "
+            "it was watching goes unobserved and the platform keeps trading"
+        )
+        assert engine.state.trading_allowed
+
+
+class TestDisableExecutionRecovery:
+    """H10 — the lifecycle after ``DISABLE_EXECUTION``."""
+
+    def test_the_orchestrator_latches_the_executor_flag(self):
+        source = inspect.getsource(Orchestrator._protect)
+        assert "if self.kill_switch.state.execution_disabled:" in source
+        assert "self.veska.executor.execution_disabled = True" in source
+
+    def test_nothing_in_production_ever_clears_the_executor_flag(self):
+        """Read across the whole application rather than one function."""
+        import apps.orchestrator.orchestrator as orch
+        import execution.paper.executor as executor
+        import risk.kill_switch as ks
+
+        for module in (orch, ks, executor):
+            source = inspect.getsource(module)
+            assert "execution_disabled = False" not in source, (
+                f"{module.__name__} does clear the flag; recheck this audit"
+            )
+
+    async def test_clearing_the_switch_resets_the_switch_state(self):
+        """The premise: the switch itself does recover."""
+        engine = switch()
+        await engine.engage("RECONCILIATION_MISMATCH", "audit")
+        assert engine.state.execution_disabled is True
+
+        await engine.clear("operator investigated")
+        assert engine.state.execution_disabled is False
+        assert engine.state.trading_allowed
+
+    async def test_a_recovery_path_exists_for_the_executor_latch(self):
+        """H10, stated as the invariant.
+
+        The orchestrator latches ``PaperExecutor.execution_disabled = True``
+        and there is no assignment anywhere that sets it back. A manual clear
+        therefore restores the kill-switch state while leaving the platform
+        permanently unable to submit, and no operator action exists to undo
+        that for the life of the process.
+        """
+        import apps.orchestrator.orchestrator as orch
+        import execution.paper.executor as executor
+        import risk.kill_switch as ks
+        from apps.api import app as api
+
+        modules = {
+            "apps.orchestrator.orchestrator": orch,
+            "risk.kill_switch": ks,
+            "execution.paper.executor": executor,
+            "apps.api.app": api,
+        }
+        clears = sorted(
+            name
+            for name, module in modules.items()
+            if "execution_disabled = False" in inspect.getsource(module)
+        )
+        assert clears, (
+            "nothing re-enables PaperExecutor.execution_disabled. "
+            "RECONCILIATION_MISMATCH and UNEXPECTED_POSITION latch it, "
+            "KillSwitch.clear() resets only KillSwitchState, and the API "
+            "exposes engage but no counterpart. Searched: "
+            f"{sorted(modules)}"
+        )
+
+    def test_the_executor_refuses_submissions_while_disabled(self):
+        """Confirms the flag is load-bearing, so the missing reset matters."""
+        import execution.paper.executor as executor
+
+        assert "if self.execution_disabled:" in inspect.getsource(executor)
+
+    def test_which_triggers_reach_this_state(self):
+        latching = sorted(
+            name
+            for name, actions in TRIGGER_ACTIONS.items()
+            if KillAction.DISABLE_EXECUTION in actions
+        )
+        assert latching == ["RECONCILIATION_MISMATCH", "UNEXPECTED_POSITION"]
+
+
+class TestFlattenAndLiveOrders:
+    """H11 — can a previously-live opening order undo a flatten?"""
+
+    LOSS_TRIGGERS = ("MAX_DRAWDOWN_BREACHED", "MAX_DAILY_LOSS_BREACHED")
+
+    @pytest.mark.parametrize("trigger", LOSS_TRIGGERS)
+    def test_a_flatten_trigger_also_cancels_resting_orders(self, trigger):
+        actions = TRIGGER_ACTIONS[trigger]
+        assert KillAction.FLATTEN in actions, "premise: this trigger flattens"
+        assert KillAction.CANCEL_ALL in actions, (
+            f"{trigger} requests FLATTEN without CANCEL_ALL. An opening order "
+            "that was already resting when the trigger fired can still fill "
+            "after the flatten completes, re-opening the exposure the safety "
+            f"action just closed. Actions: {[a.value for a in actions]}"
+        )
+
+    def test_flatten_only_visits_states_with_no_opening_orders(self):
+        """The other half: even with CANCEL_ALL absent, a flatten that also
+        handled EXECUTING records would close the window."""
+        source = inspect.getsource(Orchestrator._flatten)
+        assert "StrategyState.MONITORING" in source
+        assert "StrategyState.EXECUTING" in source, (
+            "_flatten skips records in EXECUTING — exactly the state whose "
+            "entry orders are still live — so their orders are neither "
+            "cancelled by the action set nor unwound by the flatten"
+        )
+
+    def test_cancel_all_is_applied_before_flatten_in_the_tick(self):
+        """Ordering matters: cancelling after flattening would leave the same
+        window. Recorded as a control for whichever remediation is chosen."""
+        source = inspect.getsource(Orchestrator._protect)
+        cancel_at = source.index("cancel_all_requested")
+        flatten_at = source.index("flatten_requested")
+        assert cancel_at < flatten_at
+
+    async def test_market_data_outage_holds_positions_deliberately(self):
+        """§33 — recorded as a design decision, not a defect.
+
+        Losing the feed cancels resting orders and stops new ones, but does not
+        flatten: closing a position requires prices, and an outage is exactly
+        when there are none.
+        """
+        actions = TRIGGER_ACTIONS["MARKET_DATA_OUTAGE"]
+        assert KillAction.HALT_NEW_TRADES in actions
+        assert KillAction.CANCEL_ALL in actions
+        assert KillAction.FLATTEN not in actions
+
+
+class TestKillSwitchStateSemantics:
+    async def test_engaging_is_idempotent(self):
+        engine = switch()
+        first = await engine.engage("BOOK_CORRUPTION")
+        second = await engine.engage("BOOK_CORRUPTION")
+        assert first.triggered_by == second.triggered_by == ["BOOK_CORRUPTION"]
+        assert len(engine.history) == 1
+
+    async def test_trading_is_disallowed_the_moment_anything_engages(self):
+        engine = switch()
+        assert engine.state.trading_allowed
+        await engine.engage("SYSTEM_HEALTH_FAILURE")
+        assert not engine.state.trading_allowed
+
+    async def test_clearing_resets_streaks_as_well_as_state(self):
+        engine = switch()
+        await engine.evaluate(inputs(market_data_ok=False))
+        assert engine.streaks.get("MARKET_DATA_OUTAGE") == 1
+        await engine.clear()
+        assert engine.streaks == {}
+        assert engine.state == KillSwitchState()
+
+    async def test_a_condition_that_clears_before_confirmation_resets_its_streak(self):
+        engine = switch()
+        await engine.evaluate(inputs(market_data_ok=False))
+        assert engine.streaks["MARKET_DATA_OUTAGE"] == 1
+        await engine.evaluate(inputs(market_data_ok=True))
+        assert "MARKET_DATA_OUTAGE" not in engine.streaks
+
+    async def test_the_switch_reads_a_live_clock_for_its_timestamps(self):
+        """§43 — ``engage`` and ``clear`` call ``self.clock.now_ms()`` rather
+        than taking the tick's instant. Recorded: the economic ACTIONS do not
+        depend on it, but the recorded causal ordering of a safety event does.
+        """
+        engine = switch()
+        source = inspect.getsource(KillSwitch.engage)
+        assert "now = self.clock.now_ms()" in source
+        assert "now_ms" not in inspect.signature(KillSwitch.engage).parameters
+
+        engine.clock.advance(5_000)
+        await engine.engage("BOOK_CORRUPTION")
+        assert engine.state.triggered_at == START_MS + 5_000
