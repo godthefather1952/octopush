@@ -19,7 +19,9 @@ from core.bus import InMemoryEventBus
 from core.clock import ManualClock
 from core.events import Event, EventType
 from replay.engine import (
+    UNVERIFIED_CONFIGURATION,
     UNVERIFIED_RECORDING_INTEGRITY,
+    FidelityDimension,
     IncompleteSessionError,
     ReplaySession,
     UnverifiedLegacySessionError,
@@ -30,6 +32,10 @@ from storage.base import SessionStatus
 
 START_MS = 1_788_000_000_000
 SESSION_ID = "s1"
+#: Hand-built sessions carry a digest of their own and the replay is given
+#: the matching one, so these tests exercise recording integrity rather
+#: than tripping over an unrelated, unverified configuration dimension.
+CONFIG_HASH = "test-config"
 
 
 def _input(seq: int, ts_ms: int) -> Event:
@@ -73,7 +79,7 @@ async def _store_with(status: SessionStatus | None, **finalize) -> InMemoryEvent
     """
     store = InMemoryEventStore()
     await store.open()
-    await store.start_session(SESSION_ID, START_MS)
+    await store.start_session(SESSION_ID, START_MS, config_hash=CONFIG_HASH)
     await store.append_many(SESSION_ID, EVENTS)
     if status is not None:
         await store.finalize_session(
@@ -88,6 +94,7 @@ def _session(store, **kwargs) -> ReplaySession:
         bus=InMemoryEventBus(raise_on_handler_error=True),
         clock=ManualClock(START_MS),
         session_id=SESSION_ID,
+        current_config_hash=CONFIG_HASH,
         **kwargs,
     )
 
@@ -156,14 +163,26 @@ class TestTheOverrideIsVisible:
         )
 
     async def test_a_legacy_session_replays_under_the_override(self, tmp_path):
+        """A pre-Batch-2 database predates config digests too, so BOTH
+        dimensions are unverified -- which is precisely the case a single
+        fidelity string could not express."""
         store = await _legacy_store(tmp_path)
         try:
-            session = _session(store, allow_incomplete_session=True)
+            session = _session(
+                store, allow_incomplete_session=True, allow_config_mismatch=True
+            )
             with session:
                 await session.open()
+                fidelity = session.stats.fidelity
                 assert (
-                    session.stats.timeline_fidelity == UNVERIFIED_RECORDING_INTEGRITY
+                    fidelity.issues[FidelityDimension.RECORDING_INTEGRITY]
+                    == UNVERIFIED_RECORDING_INTEGRITY
                 )
+                assert (
+                    fidelity.issues[FidelityDimension.CONFIGURATION]
+                    == UNVERIFIED_CONFIGURATION
+                )
+                assert not fidelity.is_exact
         finally:
             await store.close()
 

@@ -107,37 +107,79 @@ class TestItIsStillUsable:
 
 
 class TestTheConfigDigestStillWorks:
-    def test_the_digest_covers_the_dsn_without_exposing_it(self, settings):
-        """Replay refuses to compare sessions from different configs.
+    """What the digest promises, after Phase 2 narrowed it to MATERIAL settings.
 
-        That check has to notice a changed DSN, so the digest must still
-        depend on it — just not by carrying it in the clear.
-        """
+    Phase 0 digested the whole settings object, so this suite asserted that a
+    changed DSN changed the digest. Phase 2 gave the digest a job -- it gates
+    exact replay (P2-9), and a mismatch refuses the run -- and that job made
+    the breadth actively harmful: pointing at a different database, or moving
+    a SQLite file, would have counted as "the configuration materially
+    changed", so every replay of a session recorded elsewhere would demand the
+    override, and a routinely-overridden gate protects nothing.
+
+    ``storage.sqlite_path`` and ``storage.postgres_dsn`` are therefore
+    excluded: they say WHERE events live and how to reach it, and neither can
+    change what a replay computes from them (proved end to end in
+    ``tests/contract/test_replay_config_reproducibility.py``, which replays
+    one recording under changed infrastructure and compares every economic
+    output). ``storage.backend`` stays material.
+
+    The security property is unchanged and pinned below: a secret is hashed
+    rather than masked, so wherever a SecretStr IS material the digest can
+    still tell two credentials apart -- and it never carries either in the
+    clear.
+    """
+
+    def test_the_dsn_is_excluded_from_the_replay_digest(self, settings):
         from replay.engine import config_digest
 
         other = load_settings(
             storage={"backend": "postgres", "postgres_dsn": DSN.replace("db.internal", "db2")}
         )
-        first = config_digest(settings.model_dump())
-        second = config_digest(other.model_dump())
-        assert first != second
-        assert PASSWORD not in first
+        same_backend = load_settings(storage={"backend": "postgres", "postgres_dsn": DSN})
+        assert config_digest(same_backend.model_dump()) == config_digest(
+            other.model_dump()
+        ), "which server holds the events cannot change what they replay to"
+        assert PASSWORD not in config_digest(settings.model_dump())
 
-    def test_a_masked_dump_would_have_hidden_the_change(self):
+    def test_the_backend_choice_is_still_material(self):
+        """Narrowed, not abandoned: the store TYPE remains part of the digest."""
+        from replay.engine import config_digest
+
+        sqlite = load_settings(storage={"backend": "sqlite"})
+        postgres = load_settings(storage={"backend": "postgres", "postgres_dsn": DSN})
+        assert config_digest(sqlite.model_dump()) != config_digest(
+            postgres.model_dump()
+        )
+
+    def test_a_secret_is_hashed_rather_than_masked(self):
         """Why the digest takes the model dump, not the json dump.
 
         model_dump(mode="json") renders every SecretStr as the same asterisks,
-        so two different credentials digest identically and a changed store
-        goes unnoticed. This pins the reason rather than leaving the argument
-        order looking arbitrary.
+        so two different credentials digest identically and a changed setting
+        goes unnoticed. ``_unmask`` hashes the real value instead. Asserted on
+        the hashing helper directly, since the only SecretStr in Settings
+        today happens to sit in an excluded position -- the guarantee has to
+        hold for the next one, wherever it lands.
         """
-        from replay.engine import config_digest
+        from pydantic import SecretStr
 
+        from replay.engine import _unmask, config_digest
+
+        first = _unmask({"credential": SecretStr(PASSWORD)})
+        second = _unmask({"credential": SecretStr("something-else")})
+        assert first != second, "two credentials must not digest identically"
+        assert PASSWORD not in str(first), "...and neither may appear in the clear"
+        assert PASSWORD not in config_digest({"credential": SecretStr(PASSWORD)})
+
+    def test_a_masked_dump_really_does_lose_the_difference(self):
+        """The behaviour the hashing exists to defeat, pinned so a change to
+        pydantic's masking cannot quietly invalidate the argument above."""
         a = load_settings(storage={"backend": "postgres", "postgres_dsn": DSN})
         b = load_settings(
             storage={"backend": "postgres", "postgres_dsn": DSN.replace("db.internal", "db2")}
         )
-        assert config_digest(a.model_dump(mode="json")) == config_digest(
-            b.model_dump(mode="json")
+        assert (
+            a.model_dump(mode="json")["storage"]["postgres_dsn"]
+            == b.model_dump(mode="json")["storage"]["postgres_dsn"]
         ), "if this ever differs, the masking behaviour changed"
-        assert config_digest(a.model_dump()) != config_digest(b.model_dump())

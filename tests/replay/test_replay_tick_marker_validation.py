@@ -29,6 +29,10 @@ from storage.base import SessionStatus
 from storage.memory import InMemoryEventStore
 
 START_MS = 1_788_000_000_000
+#: These sessions are hand-built, so they carry a digest of their own and
+#: the replay is given the matching one -- otherwise every replay here
+#: would be reported non-exact for a configuration nobody changed.
+CONFIG_HASH = "test-config"
 SESSION_ID = "s1"
 
 
@@ -63,7 +67,7 @@ def _marker(seq: int, ts_ms: int, tick: int, watermark: object) -> Event:
 async def _build_session(events: list[Event]) -> InMemoryEventStore:
     store = InMemoryEventStore()
     await store.open()
-    await store.start_session(SESSION_ID, events[0].ts_ms)
+    await store.start_session(SESSION_ID, events[0].ts_ms, config_hash=CONFIG_HASH)
     await store.append_many(SESSION_ID, events)
     # Exact replay requires a verified-complete recording (Phase 2 Batch 2).
     # These sessions are hand-built and complete by construction, so they say
@@ -80,6 +84,7 @@ def _session(store: InMemoryEventStore) -> ReplaySession:
         bus=InMemoryEventBus(raise_on_handler_error=True),
         clock=ManualClock(START_MS),
         session_id=SESSION_ID,
+        current_config_hash=CONFIG_HASH,
     )
 
 

@@ -21,7 +21,7 @@ from core.bus import InMemoryEventBus
 from core.clock import ManualClock
 from core.config import simulated_venues
 from core.events import Event, EventType
-from replay.engine import ReplaySession
+from replay.engine import ReplaySession, config_digest
 from storage.memory import InMemoryEventStore
 from tests.conftest import START_MS, make_book
 from tests.replay.test_replay import fresh_platform, replay_equivalence_summary
@@ -31,15 +31,27 @@ from tests.replay.test_replay_tick_marker_timestamp import BlockableStore
 async def _replay(settings, store, session_id: str):
     clock = ManualClock(START_MS)
     bus = InMemoryEventBus(raise_on_handler_error=True)
+    # The exact settings the ORIGINAL run recorded its digest from, so the
+    # replay is comparing like with like.
+    replay_settings = settings.model_copy(update={"venues": simulated_venues()})
     platform = build_platform(
-        settings.model_copy(update={"venues": simulated_venues()}),
+        replay_settings,
         clock=clock,
         bus=bus,
         store=InMemoryEventStore(),
         raise_on_handler_error=True,
     )
     await platform.start(record=False, feeds=False)
-    session = ReplaySession(store=store, bus=bus, clock=clock, session_id=session_id)
+    session = ReplaySession(
+        store=store,
+        bus=bus,
+        clock=clock,
+        session_id=session_id,
+        # The recorded session carries this digest, so supplying it is what
+        # lets the replay claim configuration fidelity rather than merely
+        # never having checked (Phase 2 finalization, P2-9).
+        current_config_hash=config_digest(replay_settings.model_dump()),
+    )
     with session:
         await session.open()
         while True:

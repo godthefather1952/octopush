@@ -218,8 +218,11 @@ async def _record_session(settings, ticks: int = 150):
 async def _replay_session(settings, store, session_id: str):
     clock = ManualClock(START_MS)
     bus = InMemoryEventBus(raise_on_handler_error=True)
+    # The exact settings the ORIGINAL run recorded its digest from, so the
+    # replay compares like with like.
+    replay_settings = settings.model_copy(update={"venues": simulated_venues()})
     platform = build_platform(
-        settings.model_copy(update={"venues": simulated_venues()}),
+        replay_settings,
         clock=clock,
         bus=bus,
         store=InMemoryEventStore(),
@@ -227,7 +230,15 @@ async def _replay_session(settings, store, session_id: str):
     )
     # Feeds stay off: the recording is the market.
     await platform.start(record=False, feeds=False)
-    session = ReplaySession(store=store, bus=bus, clock=clock, session_id=session_id)
+    session = ReplaySession(
+        store=store,
+        bus=bus,
+        clock=clock,
+        session_id=session_id,
+        # Supplying the current digest is what lets the replay CLAIM
+        # configuration fidelity instead of merely never having checked.
+        current_config_hash=config_digest(replay_settings.model_dump()),
+    )
     with session:
         await session.open()
         while True:

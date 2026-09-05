@@ -28,6 +28,7 @@ from core.clock import ManualClock
 from replay.engine import (
     LEGACY_REPLAY_UNVERIFIED_TIMELINE,
     PARTIAL_REPLAY_UNVERIFIED_STARTING_STATE,
+    FidelityDimension,
     LegacyTimelineRequired,
     PartialReplayUnsupported,
     ReplaySession,
@@ -62,7 +63,11 @@ class TestPartialReplayRange:
             legacy_timeline=True,
         )
         await forced.open()
-        assert forced.stats.timeline_fidelity == LEGACY_REPLAY_UNVERIFIED_TIMELINE
+        assert (
+            forced.stats.fidelity.issues[FidelityDimension.TIMELINE]
+            == LEGACY_REPLAY_UNVERIFIED_TIMELINE
+        )
+        assert not forced.stats.is_exact
         assert await forced.step() is None, "nothing at all should be in this empty range"
 
     async def test_a_range_beginning_between_ticks_is_refused(self, settings):
@@ -93,7 +98,11 @@ class TestPartialReplayRange:
             allow_partial_range=True,
         )
         await forced.open()
-        assert forced.stats.timeline_fidelity == PARTIAL_REPLAY_UNVERIFIED_STARTING_STATE
+        assert (
+            forced.stats.fidelity.issues[FidelityDimension.STARTING_STATE]
+            == PARTIAL_REPLAY_UNVERIFIED_STARTING_STATE
+        )
+        assert not forced.stats.is_exact
 
     async def test_a_range_ending_between_ticks_needs_no_opt_in(self, settings):
         """E3: end_ms truncates the session early (a normal prefix, no
@@ -115,7 +124,9 @@ class TestPartialReplayRange:
             end_ms=info.started_at + 150,
         )
         await session.open()
-        assert session.stats.timeline_fidelity is None
+        assert session.stats.fidelity.verified(FidelityDimension.TIMELINE)
+        assert session.stats.fidelity.verified(FidelityDimension.STARTING_STATE)
+        assert session.stats.fidelity.verified(FidelityDimension.INPUT_VISIBILITY)
 
         ticks_fired = 0
         while True:
@@ -142,7 +153,9 @@ class TestPartialReplayRange:
             end_ms=info.started_at + 100,  # exactly the first tick's own ts_ms
         )
         await session.open()
-        assert session.stats.timeline_fidelity is None
+        assert session.stats.fidelity.verified(FidelityDimension.TIMELINE)
+        assert session.stats.fidelity.verified(FidelityDimension.STARTING_STATE)
+        assert session.stats.fidelity.verified(FidelityDimension.INPUT_VISIBILITY)
 
         ticks_fired = 0
         while True:

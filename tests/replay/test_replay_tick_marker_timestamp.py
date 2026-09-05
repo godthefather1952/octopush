@@ -29,7 +29,7 @@ from core.bus import InMemoryEventBus
 from core.clock import ManualClock
 from core.config import simulated_venues
 from core.events import Event, EventType
-from replay.engine import ReplaySession
+from replay.engine import ReplaySession, config_digest
 from storage.memory import InMemoryEventStore
 from tests.conftest import START_MS, make_book
 
@@ -207,8 +207,9 @@ class TestTickMarkerTimestampStaleness:
 
         replay_clock = ManualClock(START_MS)
         replay_bus = InMemoryEventBus(raise_on_handler_error=True)
+        replay_settings = settings.model_copy(update={"venues": simulated_venues()})
         replayed = build_platform(
-            settings.model_copy(update={"venues": simulated_venues()}),
+            replay_settings,
             clock=replay_clock,
             bus=replay_bus,
             store=InMemoryEventStore(),
@@ -216,7 +217,11 @@ class TestTickMarkerTimestampStaleness:
         )
         await replayed.start(record=False, feeds=False)
         session = ReplaySession(
-            store=store, bus=replay_bus, clock=replay_clock, session_id=session_id
+            store=store,
+            bus=replay_bus,
+            clock=replay_clock,
+            session_id=session_id,
+            current_config_hash=config_digest(replay_settings.model_dump()),
         )
         ticks_fired = 0
         replayed_second_tick_mid = None
