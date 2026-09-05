@@ -20,6 +20,61 @@ boundary. It changes no production code.
 
 ---
 
+## External validation
+
+| Run | Result |
+| --- | --- |
+| Baseline before the audit (`2125519`) | 2294 passed / 2 skipped / **0 failed** |
+| Phase 5 audit, run #34 (`4a5c4fa`) | 2698 passed / **51 failed** / 2 skipped |
+| Python 3.11 unit + contract, run #34 | 1381 passed / 126 skipped / **0 failed** |
+
+Also PASS on run #34: Mypy core, paper boundary, backend contract pre-check,
+and the entire pre-existing baseline suite. Ruff failed on four audit-only
+issues (one `SIM300`, three `RUF002` ambiguous multiplication signs in audit
+docstrings), fixed in the cleanup pass described below.
+
+**Most of the 51 failures are the deliverable.** The audit tests state safety
+invariants, not current behaviour, so a failure where a finding exists is the
+finding being demonstrated. Run #34 independently reproduced the
+concurrent-reservation, strategy-exposure-unit, open-order-capacity,
+future-timestamp, lifetime-error-rate, headroom-completeness, kill-switch
+(reachability, recovery, flatten), exposure-projection and configuration
+findings.
+
+It also produced something the audit had not predicted: the production-like
+probe observed live net and unhedged exposure beyond configured limits on the
+shipped simulation, with no kill-switch trigger. See **Production-like
+observations**.
+
+The 3.11 job passing 1381 / 0 failed confirms that no pre-existing test was
+disturbed: every failure is in `tests/audit/`, which that job does not select.
+
+### Cleanup pass
+
+A follow-up commit removed **only false audit-harness failures** — defects in
+the test construction, not in RUNE:
+
+- The RUNE-AI comparisons built two independent `intent()` objects for the
+  with-AI and without-AI runs. `TradeIntent.intent_id` is minted by a
+  `default_factory`, and `deterministic_fingerprint` includes it (correctly:
+  a decision naming a different intent *is* a different decision), so the
+  fingerprints differed for a reason unrelated to commentary. Every comparison
+  now evaluates one shared `intent` against one shared `RiskContext`, which is
+  the stronger test. No field was removed from the fingerprint.
+- `test_stale_commentary_is_attached_but_inert` re-evaluated the *same* intent
+  an hour later, so it was rejected by `INTENT_NOT_EXPIRED` and
+  `MARKET_DATA_FRESH` — measuring the deadline gates, not the AI boundary. It
+  now ages the commentary while keeping the trade temporally valid.
+- `test_the_decision_id_is_the_only_minted_value` varied two minted things at
+  once. It now reuses one intent, so `decision_id` is demonstrably the only
+  field that moves.
+
+No assertion was weakened, no test was skipped, xfailed or deleted, and no
+finding assertion was touched. The cleaned failure count is deliberately not
+stated here: it has not been measured.
+
+---
+
 ## Architecture
 
 ```
@@ -248,17 +303,37 @@ which inverts what the gate is for.
 ## Kill-switch architecture
 
 `TRIGGER_ACTIONS` defines 12 responses. `TRIGGERS` defines 9 predicates
-evaluated every tick. `MANUAL` is operator-invoked through the API by design.
-That leaves **`RISK_LIMIT_BREACH`** — actions defined, no predicate, and no
-code path that engages it by name.
+evaluated every tick. `MANUAL` is operator-invoked through the API by design —
+the endpoint passes an arbitrary trigger name through, so any mapping is
+*technically* reachable by an operator who already knows to type it, which is
+not detection.
 
-So no automatic path notices a live portfolio past `max_gross_exposure`,
-`max_net_exposure`, `max_venue_exposure`, `max_strategy_exposure`,
-`max_position_notional` or `max_leverage`. Drawdown, daily loss and unhedged
-exposure (via `UNEXPECTED_POSITION`) *are* watched; the exposure dimensions are
-not. Pre-trade prevention is not equivalent to post-fill detection — partial
-fills, slippage and the concurrent commitments above all produce live states
-that were never projected.
+That leaves **two** mappings with no predicate and no caller. External
+validation reported them together; they are separate findings and are recorded
+separately:
+
+- **`RISK_LIMIT_BREACH`** (P5-3, HIGH) requests `HALT_NEW_TRADES` and
+  `CANCEL_ALL` — a response no other trigger delivers for an exposure breach.
+  Nothing invokes it, so no automatic path notices a live portfolio past
+  `max_gross_exposure`, `max_net_exposure`, `max_venue_exposure`,
+  `max_strategy_exposure`, `max_position_notional` or `max_leverage`.
+- **`AGENT_FAILURE`** (P5-17, LOW) requests `(HALT_NEW_TRADES,)` — byte-identical
+  to `SYSTEM_HEALTH_FAILURE`'s action set, and `SYSTEM_HEALTH_FAILURE`'s
+  predicate already fires when a required agent stops being HEALTHY. A required
+  agent that answers with nothing is separately caught by consensus
+  completeness. So nothing is left unprotected: this is a vestigial mapping,
+  **not** an exposure gap, and it is deliberately not folded into P5-3.
+
+Drawdown, daily loss and unhedged exposure (via `UNEXPECTED_POSITION`) *are*
+watched; the exposure dimensions are not. And `UNEXPECTED_POSITION` fires at
+`abs(unhedged) > max_unhedged_notional * 3`, three times the gate's own limit,
+so even that dimension has a band in which the entry gate refuses new trades
+while nothing acts on the exposure already held — the band the external probe
+landed in.
+
+Pre-trade prevention is not equivalent to post-fill detection: partial fills,
+slippage and the concurrent commitments above all produce live states that were
+never projected.
 
 `EXCESSIVE_LATENCY` compares `inputs.max_latency_ms` against
 `max_data_age_ms * 5`. `Orchestrator._protect` fills that field from
@@ -352,10 +427,41 @@ histogram, peak open orders and the worst observed value for every exposure
 dimension, then asserts that no live state exceeded a configured hard limit and
 that no decision authorised more than its own limits allowed.
 
-The default simulation is not calibrated to press any limit, so a clean result
-is not evidence of correctness — it is a check that the adversarial findings
-above are not *also* reachable by ordinary operation. External validation
-should read the printed summary as the measurement.
+The expectation when this was written was that the default simulation would be
+too quiet to press any limit, so that a clean result would say little. **It was
+not clean.** External validation (run #34) measured:
+
+| | Observed | Limit |
+| --- | --- | --- |
+| `MAX_NET_EXPOSURE` | **25,103.8003** | 25,000.0 |
+| `MAX_UNHEDGED_EXPOSURE` | **25,103.8003** | 10,000.0 |
+| kill-switch triggers | **none** | — |
+| RiskDecisions | 8, all `APPROVED` | — |
+
+The shipped platform, on its shipped market, with no adversarial construction,
+entered a live state beyond two configured hard limits and nothing stopped it.
+
+Two details make this coherent rather than contradictory:
+
+- **Why no trigger fired.** `UNEXPECTED_POSITION` is the only kill-switch
+  predicate that watches unhedged exposure, and `Orchestrator._protect` feeds
+  it `abs(unhedged) > max_unhedged_notional * 3` — 30,000, not 10,000. So
+  25,103 sits inside a band where the pre-trade gate would refuse a new trade
+  while nothing acts on the state already held. No exposure dimension has a
+  trigger at its own limit; that is P5-3.
+- **Why the pre-trade gates did not prevent it.** All 8 decisions were
+  `APPROVED`, each projecting against a portfolio that had not yet moved, and
+  a balanced two-leg trade projects zero net delta. The live net that resulted
+  is post-fill drift — fills landing away from reference prices, and hedge
+  activity — which the pre-trade projection does not claim to predict and
+  which nothing re-checks afterwards.
+
+This is direct, independent evidence for P5-1 and P5-3 from ordinary
+operation rather than from a constructed scenario. The severities of both are
+unchanged by it; what changes is that the need for remediation no longer rests
+on an argument about reachability.
+
+The test asserting this is preserved exactly as a strict safety invariant.
 
 ---
 
@@ -367,7 +473,7 @@ Severities follow §46. Ranked most severe first.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | **P5-1** | CRITICAL | Concurrent authorisation | Gross, venue, position, net and leverage limits bound the total the platform has committed to, not merely the total it has already filled | Only `MAX_STRATEGY_EXPOSURE` consults a reservation. Every other exposure gate reads `PortfolioState`, which moves on fill. `_seek` authorises each opportunity in turn with no settlement between them | `test_rune_pending_reservations.py::TestGrossExposureUnderConcurrentAuthorisation`, `…VenueExposure…`, `…PositionExposure…`, `…Leverage…` | N concurrent authorisations can commit N× a hard limit before any of them fills | Reserve committed exposure per venue / symbol / side at authorisation, release it on fill or terminal transition, and add it to every projection |
 | **P5-2** | HIGH | Strategy exposure | The reservation, the gate and the dashboard use one unit | Reservation and dashboard are per-leg (`approved_notional`, once per opportunity); the gate projects the incoming intent at `notional × legs` | `test_rune_strategy_exposure.py::TestStrategyExposureCannotBeAuthorisedPastItsLimit`, `…TestTheMismatchScalesWithLegCount`, `…TestRiskUtilizationReportsTheSameUnitTheGateEnforces` | A two-leg strategy can be authorised to ~2× its configured budget; three-leg ~3×. The dashboard understates by the same factor | Store `approved_notional × len(legs)` in `working_notional`, or divide the incoming projection consistently. One unit, chosen and documented |
-| **P5-3** | HIGH | Kill switch | Every configured hard limit has an automatic detection path for a live breach | `RISK_LIMIT_BREACH` exists in `TRIGGER_ACTIONS` with no predicate in `TRIGGERS` and no caller. Gross, net, venue, strategy, position and leverage are never re-checked after a fill | `test_rune_kill_switch.py::TestTriggerInventory::test_every_action_mapping_is_reachable`, `TestNoAutomaticExposureBreachDetection` | A live portfolio past a hard exposure limit — reachable via P5-1, partial fills or slippage — is never detected and trading continues | Add a `_risk_limit_breach` predicate over the live portfolio and register it in `TRIGGERS` |
+| **P5-3** | HIGH | Kill switch | Every configured hard limit has an automatic detection path for a live breach | `RISK_LIMIT_BREACH` exists in `TRIGGER_ACTIONS` with no predicate in `TRIGGERS` and no caller. Gross, net, venue, strategy, position and leverage are never re-checked after a fill | `test_rune_kill_switch.py::TestTriggerInventory::test_risk_limit_breach_is_reachable`, `TestNoAutomaticExposureBreachDetection`; **externally observed** in `test_rune_production_behaviour.py` (live net 25,103.80 > 25,000, unhedged 25,103.80 > 10,000, zero triggers) | A live portfolio past a hard exposure limit — reachable via P5-1, partial fills or slippage — is never detected and trading continues. `UNEXPECTED_POSITION`, the one exposure-adjacent trigger, fires only at 3x the unhedged limit, leaving a band where the gate refuses new trades while nothing acts on the state already held | Add a `_risk_limit_breach` predicate over the live portfolio and register it in `TRIGGERS` |
 | **P5-4** | HIGH | Open-order capacity | After authorising a trade the platform holds at most `max_open_orders` | Gate compares only the current count; `build_plan` then creates one order per leg | `test_rune_pending_reservations.py::TestOpenOrderCapacity` | At `limit − 1`, a two-leg trade reaches `limit + 1`; a three-leg trade `limit + 2` | Gate on `open_orders + len(intent.legs) <= max_open_orders` |
 | **P5-5** | HIGH | Kill switch recovery | A manual clear restores the platform to a working state | `execution_disabled` is latched `True` by the orchestrator and assigned `False` nowhere in the codebase | `test_rune_kill_switch.py::TestDisableExecutionRecovery` | After `RECONCILIATION_MISMATCH` or `UNEXPECTED_POSITION` the platform silently cannot submit for the life of the process; the clear appears to succeed | Clear the executor latch in `KillSwitch.clear()` (or add an explicit, documented operator action) |
 | **P5-6** | HIGH | Kill switch | A safety action cannot be undone by state that predates it | `MAX_DRAWDOWN_BREACHED` / `MAX_DAILY_LOSS_BREACHED` request `FLATTEN` without `CANCEL_ALL`, and `_flatten` skips records in `EXECUTING` | `test_rune_kill_switch.py::TestFlattenAndLiveOrders` | An opening order live when the trigger fired can fill after the flatten, re-opening the exposure that was just closed | Add `CANCEL_ALL` to both action sets, and/or have `_flatten` cancel a record's live orders before exiting |
@@ -381,6 +487,7 @@ Severities follow §46. Ranked most severe first.
 | **P5-14** | LOW | Configuration | A configured limit is a limit | `RiskLimits` fields are `gt=0` without `allow_inf_nan=False`, so `+inf` is accepted and silently disables the gate that reads it | `test_rune_loss_boundaries.py::TestNumericSafety::test_an_infinite_limit_is_not_a_limit` | An infinite limit passes every comparison. `TidalConfig` and `NoroConfig` already set `allow_inf_nan=False`, so the convention exists | Add `allow_inf_nan=False` to every `RiskLimits` float |
 | **P5-15** | LOW | Configuration | Incoherent configurations are refused | The validator checks `min_trade ≤ max_order ≤ max_position ≤ max_gross` but not `max_order` against `max_venue_exposure`, nor `max_strategy_exposure` against `min_trade_notional × legs` | `test_rune_loss_boundaries.py::TestConfigCoherence` | A per-order cap larger than any venue may hold, or a strategy budget below the minimum trade, both load without warning and make the platform quietly untradeable | Extend `_limits_are_coherent` |
 | **P5-16** | LOW | Determinism | Nothing on the emergency path depends on a live clock read | `KillSwitch.engage()` / `clear()` call `self.clock.now_ms()` rather than accepting the tick instant | `test_rune_kill_switch.py::TestKillSwitchStateSemantics::test_the_switch_reads_a_live_clock_for_its_timestamps` | The economic actions are unaffected; the recorded causal ordering of a safety event can differ between a run and its replay | Thread `now_ms` through, as the fast loop already does |
+| **P5-17** | LOW | Kill switch | An action mapping names a response some trigger can deliver | `AGENT_FAILURE` has actions defined, no predicate in `TRIGGERS`, and no caller. Its action set is `(HALT_NEW_TRADES,)` — byte-identical to `SYSTEM_HEALTH_FAILURE`'s, whose predicate already covers a required agent going unhealthy | `test_rune_kill_switch.py::TestTriggerInventory::test_agent_failure_is_not_a_vestigial_mapping` | **Not an exposure gap and explicitly not part of P5-3.** Nothing is unprotected: a failing required agent is caught by `SYSTEM_HEALTH_FAILURE`, and a required agent that answers with nothing is caught by consensus completeness. The mapping is vestigial, and a dead entry in a safety table invites someone to assume a response exists that no code path delivers | Either give it a predicate that means something `SYSTEM_HEALTH_FAILURE` does not, or delete the mapping. Do not add a trigger without deciding what it should mean |
 
 ### Expected conservative behaviour (not defects)
 
@@ -460,7 +567,12 @@ sequenced; nothing here is done in Phase 5.
    ledger with a lifecycle, and it must use the unit fixed in step 1. Every
    exposure projection then reads reserved + filled.
 5. **P5-3** (post-fill breach detection). Best done after P5-1, so the trigger
-   is a genuine backstop rather than the primary control.
+   is a genuine backstop rather than the primary control. The external probe
+   shows the shipped system already reaching such a state, so this cannot be
+   deferred indefinitely on the argument that P5-1 makes it unreachable.
+   Deciding `RISK_LIMIT_BREACH`'s semantics here is also the natural moment to
+   settle **P5-17**, since both are questions about what the trigger table is
+   supposed to contain.
 6. **P5-5** and **P5-6** (kill-switch recovery and flatten/cancel ordering).
    Independent of the exposure work and of each other.
 7. **P5-12** (fail-closed trigger exceptions), **P5-10** (latency input),

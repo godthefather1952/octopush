@@ -12,8 +12,8 @@ Three places name the same quantity:
 * **The dashboard.** ``Orchestrator._refresh_risk_utilization`` reports
   ``{STRATEGY: sum(working_notional.values())}``.
 
-So the *incoming* intent is counted at ``notional × legs`` while every
-*already-working* opportunity is counted at ``notional × 1``. If that is a
+So the *incoming* intent is counted at ``notional x legs`` while every
+*already-working* opportunity is counted at ``notional x 1``. If that is a
 real mismatch, a strategy's live gross exposure can exceed its configured
 maximum by a factor approaching the leg count, and the gate will not notice
 because it is comparing a per-leg sum against a per-trade projection.
@@ -232,7 +232,7 @@ class TestRiskUtilizationReportsTheSameUnitTheGateEnforces:
 
     ``RuneCore.utilization`` is handed ``{STRATEGY: sum(working_notional)}``
     by the orchestrator and reports it against ``max_strategy_exposure`` — the
-    limit the gate enforces in ``notional × legs`` units.
+    limit the gate enforces in ``notional x legs`` units.
     """
 
     def test_the_reported_strategy_exposure_matches_real_gross(self):

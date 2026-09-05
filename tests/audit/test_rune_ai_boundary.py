@@ -152,19 +152,40 @@ class TestTheCoreNeverSeesCommentary:
         }, f"commentary writes to {assigned}"
 
 
+async def compare_with_and_without_ai(
+    ai: RuneAI, ctx_kwargs: dict, intent_kwargs: dict, *, now_ms: int = START_MS
+):
+    """Evaluate ONE intent against ONE context, with and without commentary.
+
+    The single shared ``proposed`` and ``ctx`` are the whole point.
+    ``TradeIntent.intent_id`` is minted by a ``default_factory``, so building
+    a second ``intent(...)`` for the comparison run would change the input as
+    well as the AI presence — and ``deterministic_fingerprint`` includes
+    ``intent_id``, correctly, because a decision that named a different intent
+    would be a different decision. Reusing the object isolates the one
+    variable this file is about.
+
+    ``RuneCore.evaluate`` does not mutate either argument (pinned in
+    ``test_rune_gate_invariants.py::TestGatesArePureFunctions``), so sharing
+    them across the two runs is sound as well as stronger.
+    """
+    proposed = intent(**intent_kwargs)
+    ctx = context(**ctx_kwargs)
+    baseline = await build_rune().evaluate(proposed, ctx, now_ms)
+    withai = await build_rune(ai).evaluate(proposed, ctx, now_ms)
+    return baseline, withai
+
+
 class TestAlarmedAiCannotRejectAnApproval:
     async def test_maximum_concern_leaves_an_approval_untouched(self):
         ctx_kwargs, intent_kwargs = APPROVE_CASE
-        baseline = await build_rune().evaluate(
-            intent(**intent_kwargs), context(**ctx_kwargs), START_MS
-        )
-        assert baseline.verdict is RiskVerdict.APPROVED
-
         ai = RuneAI(ScriptedProvider({}))
         ai.latest = commentary(1.0, codes=["CATASTROPHE", "STOP", "DANGER"])
-        withai = await build_rune(ai).evaluate(
-            intent(**intent_kwargs), context(**ctx_kwargs), START_MS
+        baseline, withai = await compare_with_and_without_ai(
+            ai, ctx_kwargs, intent_kwargs
         )
+
+        assert baseline.verdict is RiskVerdict.APPROVED
         assert deterministic_fingerprint(withai) == deterministic_fingerprint(baseline)
         assert withai.verdict is RiskVerdict.APPROVED
         assert withai.approved_notional == pytest.approx(baseline.approved_notional)
@@ -172,22 +193,19 @@ class TestAlarmedAiCannotRejectAnApproval:
     async def test_maximum_concern_cannot_shrink_an_approved_size(self):
         ai = RuneAI(ScriptedProvider({}))
         ai.latest = commentary(1.0)
-        withai = await build_rune(ai).evaluate(intent(), context(), START_MS)
-        baseline = await build_rune().evaluate(intent(), context(), START_MS)
+        baseline, withai = await compare_with_and_without_ai(ai, {}, {})
         assert withai.approved_notional == pytest.approx(baseline.approved_notional)
+        assert withai.requested_notional == pytest.approx(baseline.requested_notional)
 
     async def test_maximum_concern_cannot_change_a_reduced_size(self):
         ctx_kwargs, intent_kwargs = REDUCE_CASE
-        baseline = await build_rune().evaluate(
-            intent(**intent_kwargs), context(**ctx_kwargs), START_MS
-        )
-        assert baseline.verdict is RiskVerdict.APPROVED_REDUCED
-
         ai = RuneAI(ScriptedProvider({}))
         ai.latest = commentary(1.0)
-        withai = await build_rune(ai).evaluate(
-            intent(**intent_kwargs), context(**ctx_kwargs), START_MS
+        baseline, withai = await compare_with_and_without_ai(
+            ai, ctx_kwargs, intent_kwargs
         )
+
+        assert baseline.verdict is RiskVerdict.APPROVED_REDUCED
         assert deterministic_fingerprint(withai) == deterministic_fingerprint(baseline)
 
 
@@ -196,16 +214,13 @@ class TestCalmAiCannotApproveARejection:
     async def test_zero_concern_leaves_a_rejection_untouched(
         self, ctx_kwargs, intent_kwargs
     ):
-        baseline = await build_rune().evaluate(
-            intent(**intent_kwargs), context(**ctx_kwargs), START_MS
-        )
-        assert baseline.verdict is RiskVerdict.REJECTED
-
         ai = RuneAI(ScriptedProvider({}))
         ai.latest = commentary(0.0, codes=["ALL_CLEAR", "SAFE_TO_TRADE"])
-        withai = await build_rune(ai).evaluate(
-            intent(**intent_kwargs), context(**ctx_kwargs), START_MS
+        baseline, withai = await compare_with_and_without_ai(
+            ai, ctx_kwargs, intent_kwargs
         )
+
+        assert baseline.verdict is RiskVerdict.REJECTED
         assert deterministic_fingerprint(withai) == deterministic_fingerprint(baseline)
         assert withai.verdict is RiskVerdict.REJECTED
         assert withai.approved_notional == 0.0
@@ -218,8 +233,7 @@ class TestDegradedAiIsNoAi:
         await ai.assess({})
         assert ai.latest is not None and not ai.latest.ok
 
-        withai = await build_rune(ai).evaluate(intent(), context(), START_MS)
-        baseline = await build_rune().evaluate(intent(), context(), START_MS)
+        baseline, withai = await compare_with_and_without_ai(ai, {}, {})
         assert deterministic_fingerprint(withai) == deterministic_fingerprint(baseline)
         assert withai.ai_commentary is None, (
             "an unavailable commentary must not be attached as if it were one"
@@ -228,27 +242,55 @@ class TestDegradedAiIsNoAi:
     async def test_a_malformed_payload_changes_nothing(self):
         ai = RuneAI(ScriptedProvider({"concern_level": "not-a-number"}))
         await ai.assess({})
-        withai = await build_rune(ai).evaluate(intent(), context(), START_MS)
-        baseline = await build_rune().evaluate(intent(), context(), START_MS)
+        baseline, withai = await compare_with_and_without_ai(ai, {}, {})
         assert deterministic_fingerprint(withai) == deterministic_fingerprint(baseline)
 
     async def test_a_missing_provider_changes_nothing(self):
-        withai = await build_rune(None).evaluate(intent(), context(), START_MS)
-        baseline = await build_rune().evaluate(intent(), context(), START_MS)
+        proposed = intent()
+        ctx = context()
+        withai = await build_rune(None).evaluate(proposed, ctx, START_MS)
+        baseline = await build_rune().evaluate(proposed, ctx, START_MS)
         assert deterministic_fingerprint(withai) == deterministic_fingerprint(baseline)
 
     async def test_stale_commentary_is_attached_but_inert(self):
         """``Rune.evaluate`` reads ``ai.latest`` — whatever it happens to be —
         rather than calling the provider on the decision path. That keeps the
         network off the fast loop; the commentary may therefore be arbitrarily
-        old and must remain metadata."""
+        old and must remain metadata.
+
+        The TRADE has to stay temporally valid while the commentary ages, or
+        the test measures the deadline and data-age gates instead of the AI
+        boundary. So the later evaluation uses a freshly-timed intent: the
+        commentary is an hour old, the market observation and the deadline are
+        not.
+        """
         ai = RuneAI(ScriptedProvider({}))
         ai.latest = commentary(0.9)
-        rune = build_rune(ai)
-        first = await rune.evaluate(intent(), context(), START_MS)
-        second = await rune.evaluate(intent(), context(), START_MS + 3_600_000)
-        assert first.ai_concern_level == second.ai_concern_level
-        assert first.verdict is second.verdict
+
+        # A valid trade now, with commentary that is already stale.
+        first = await build_rune(ai).evaluate(intent(), context(), START_MS)
+        assert first.verdict is RiskVerdict.APPROVED
+
+        later = START_MS + 3_600_000
+        later_intent_kwargs = {
+            "created_at": later,
+            "source_data_timestamp": later - 50,
+            "deadline_ms": later + 2_000,
+        }
+        baseline, withai = await compare_with_and_without_ai(
+            ai, {}, later_intent_kwargs, now_ms=later
+        )
+
+        assert baseline.verdict is RiskVerdict.APPROVED, (
+            "the later trade must itself be valid, or this test is measuring "
+            f"INTENT_NOT_EXPIRED rather than the AI boundary: "
+            f"{baseline.reason_codes}"
+        )
+        assert deterministic_fingerprint(withai) == deterministic_fingerprint(baseline)
+        assert withai.ai_concern_level == pytest.approx(0.9), (
+            "hour-old commentary is still attached as metadata"
+        )
+        assert first.ai_concern_level == withai.ai_concern_level
 
     async def test_the_decision_path_never_calls_the_provider(self):
         provider = ScriptedProvider({})
@@ -259,6 +301,24 @@ class TestDegradedAiIsNoAi:
             "a provider call on the risk path would put a network round trip "
             "inside the hard gate"
         )
+
+    async def test_an_aged_commentary_does_not_call_the_provider_either(self):
+        """Complements the stale test: nothing refreshes commentary on the
+        decision path, however old it is."""
+        provider = ScriptedProvider({})
+        ai = RuneAI(provider)
+        ai.latest = commentary(0.9)
+        later = START_MS + 3_600_000
+        await build_rune(ai).evaluate(
+            intent(
+                created_at=later,
+                source_data_timestamp=later - 50,
+                deadline_ms=later + 2_000,
+            ),
+            context(),
+            later,
+        )
+        assert provider.calls == 0
 
 
 class TestCommentaryMetadataIsBounded:

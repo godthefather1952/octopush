@@ -200,7 +200,7 @@ class TestDeadline:
         params = set(inspect.signature(RuneCore.evaluate).parameters)
         assert params == {"self", "intent", "ctx", "now_ms"}
         fields = set(RiskContext.__dataclass_fields__)
-        assert not [f for f in fields if "ai" == f or f.startswith("ai_")]
+        assert not [f for f in fields if f == "ai" or f.startswith("ai_")]
         assert "commentary" not in " ".join(fields)
 
 

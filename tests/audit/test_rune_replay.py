@@ -150,13 +150,25 @@ class TestNothingNondeterministicIsReachable:
             assert forbidden not in source
 
     def test_the_decision_id_is_the_only_minted_value(self):
-        first = core().evaluate(intent(), context(), START_MS)
-        second = core().evaluate(intent(), context(), START_MS)
+        """One intent, evaluated twice.
+
+        Building a second ``intent()`` would mint a second ``intent_id`` as
+        well, so the comparison would vary two things at once and the
+        fingerprint — which includes ``intent_id``, correctly — would differ
+        for a reason that has nothing to do with the decision. Reusing the
+        input isolates what is actually being claimed: across two evaluations
+        of the SAME input, ``decision_id`` is the only field that moves.
+        """
+        proposed = intent()
+        ctx = context()
+        first = core().evaluate(proposed, ctx, START_MS)
+        second = core().evaluate(proposed, ctx, START_MS)
         assert first.decision_id != second.decision_id, (
             "premise: ids are minted per decision, which is why the "
             "fingerprint excludes them"
         )
         assert fingerprint(first) == fingerprint(second)
+        assert first.intent_id == second.intent_id
 
     def test_the_decision_id_goes_through_the_platform_id_mechanism(self):
         source = inspect.getsource(RuneCore)

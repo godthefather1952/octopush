@@ -84,7 +84,12 @@ class TestTriggerInventory:
     def test_every_action_mapping_is_reachable(self):
         """H8. ``TRIGGER_ACTIONS`` names what happens when a trigger fires;
         ``TRIGGERS`` is what actually fires. A mapping with no predicate and no
-        caller is a safety response nothing can invoke."""
+        caller is a safety response nothing can invoke.
+
+        External validation reported TWO such mappings, and they are different
+        findings, so each has its own test below rather than being lumped into
+        one list. This test records the inventory that produced them.
+        """
         callers = _explicit_engage_calls()
         unreachable = sorted(
             name
@@ -92,18 +97,68 @@ class TestTriggerInventory:
             # MANUAL is operator-invoked by design; see the test below.
             if name != "MANUAL" and name not in TRIGGERS and name not in callers
         )
-        assert not unreachable, (
-            "kill-switch actions defined for triggers that no automatic "
-            f"predicate evaluates and no code path engages: {unreachable}. "
-            "A live portfolio past a hard exposure limit has no automatic "
-            "detection path."
+        assert unreachable == ["AGENT_FAILURE", "RISK_LIMIT_BREACH"], (
+            "the set of unreachable action mappings changed; the two findings "
+            f"below are scoped to the old set. Now: {unreachable}"
+        )
+
+    def test_risk_limit_breach_is_reachable(self):
+        """P5-3. The serious one: a hard exposure limit with no detection.
+
+        ``RISK_LIMIT_BREACH`` requests HALT_NEW_TRADES and CANCEL_ALL — a
+        response no other trigger delivers for an exposure breach — and nothing
+        can invoke it.
+        """
+        callers = _explicit_engage_calls()
+        assert "RISK_LIMIT_BREACH" in TRIGGERS or "RISK_LIMIT_BREACH" in callers, (
+            "RISK_LIMIT_BREACH has actions defined but no predicate in TRIGGERS "
+            "and no caller. A live portfolio past max_gross_exposure, "
+            "max_net_exposure, max_venue_exposure, max_strategy_exposure, "
+            "max_position_notional or max_leverage is never detected."
+        )
+
+    def test_agent_failure_is_not_a_vestigial_mapping(self):
+        """A separate, lower-severity finding — NOT part of P5-3.
+
+        ``AGENT_FAILURE`` is a dead mapping rather than a missing safety
+        response. Its action set is ``(HALT_NEW_TRADES,)``, which is exactly
+        what ``SYSTEM_HEALTH_FAILURE`` already delivers when a required
+        component stops being HEALTHY — and a failing agent is precisely that.
+        A missing required agent is separately caught by consensus
+        completeness. So nothing is unprotected; the mapping simply names a
+        response that another trigger provides.
+        """
+        callers = _explicit_engage_calls()
+        reachable = "AGENT_FAILURE" in TRIGGERS or "AGENT_FAILURE" in callers
+        assert TRIGGER_ACTIONS["AGENT_FAILURE"] == TRIGGER_ACTIONS[
+            "SYSTEM_HEALTH_FAILURE"
+        ], "premise: the two action sets are identical"
+        assert reachable, (
+            "AGENT_FAILURE has actions defined but no predicate and no caller. "
+            "It is a vestigial mapping, not an exposure gap: "
+            f"{[a.value for a in TRIGGER_ACTIONS['AGENT_FAILURE']]} is already "
+            "delivered by SYSTEM_HEALTH_FAILURE, whose predicate covers a "
+            "required agent going unhealthy. Either give it a predicate that "
+            "means something SYSTEM_HEALTH_FAILURE does not, or remove it."
         )
 
     def test_manual_is_reachable_by_design(self):
-        """MANUAL has no predicate on purpose — an operator engages it. Pinned
-        so the finding above is scoped to the automatic triggers."""
+        """MANUAL has no predicate on purpose — an operator engages it through
+        the API. Pinned so the findings above are scoped to the automatic
+        triggers rather than to every predicate-less mapping."""
         assert "MANUAL" in TRIGGER_ACTIONS
         assert "MANUAL" not in TRIGGERS
+
+    def test_the_api_can_engage_any_trigger_name(self):
+        """Why 'operator-invoked' is a real category: the endpoint passes an
+        arbitrary string through. That makes MANUAL reachable — and would make
+        the two above reachable too, but only if an operator already knew to
+        type them, which is not detection."""
+        from apps.api import app as api
+
+        source = inspect.getsource(api)
+        assert "platform.kill_switch.engage(trigger, detail)" in source
+        assert 'trigger: str = "MANUAL"' in source
 
     def test_confirmations_only_delay_measurement_triggers(self):
         """A breached limit is true the moment it is observed; a measurement
