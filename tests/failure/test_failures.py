@@ -428,10 +428,15 @@ class TestAgentFailures:
         state: SystemState = platform.state
         seen_before = set(state.opportunities)
 
-        # NORO goes away: it can no longer price anything, so it publishes no
-        # opinion at all — as opposed to publishing a neutral one.
-        platform.noro.fair_values = {}
-        platform.noro.on_market_state = lambda _state: None
+        # NORO goes away: it publishes no opinion at all -- as opposed to
+        # publishing a neutral one, or an abstention.
+        #
+        # Suppressing ``evaluate`` is what actually removes it. Clearing
+        # ``fair_values`` used to work because ``evaluate`` read that cache;
+        # since v0.2 it evaluates straight from ``self.market`` via
+        # ``build_contributors``, so emptying the cache leaves NORO answering
+        # normally and the injection would silently stop injecting anything.
+        platform.noro.evaluate = lambda _opportunity, _now_ms: None
 
         for _ in range(300):
             platform.clock.advance(100)

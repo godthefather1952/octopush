@@ -199,12 +199,51 @@ class TestAttribution:
         assert trade.expected_costs_bps > 0
 
     async def test_scorecard_reports_per_agent_statistics(self, platform):
+        """Every agent that cast a directional vote gets statistics.
+
+        NORO is deliberately not required to appear. On the two-venue
+        simulated market it abstains -- present, healthy, and contributing no
+        directional claim -- so it earns no ``AgentContribution`` and
+        therefore no predictive record. Scoring an abstention would mean
+        crediting NORO with predicting a trade it explicitly declined to have
+        a view on.
+        """
         await run_platform(platform, 800)
         scores = platform.orchestrator.scorecard.scores()
-        assert AgentId.NORO in scores
+        assert scores, "some agent voted and was scored"
+        assert AgentId.ZEPHR in scores, "the executability vote is directional"
         for score in scores.values():
+            assert score.observations > 0
             assert 0.0 <= score.hit_rate <= 1.0
             assert -1.0 <= score.predictive_contribution <= 1.0
+
+    async def test_an_abstaining_agent_is_not_credited_with_a_prediction(
+        self, platform
+    ):
+        """The abstention has to be visible, and visible as an abstention.
+
+        It appears in ``ConsensusResult.abstained_agents`` -- not in
+        ``missing_agents``, which would mean the strategy should have been
+        suspended, and not in ``contributions``, which would mean it had
+        influenced the score.
+        """
+        await run_platform(platform, 800)
+        results = [
+            record.opportunity
+            for record in platform.state.opportunities.values()
+        ]
+        assert results, "the run produced opportunities"
+
+        scorecard = platform.orchestrator.scorecard
+        abstained = [
+            trade for trade in scorecard.trades if AgentId.NORO not in trade.signals
+        ]
+        for trade in abstained:
+            assert AgentId.NORO not in trade.contributions
+            assert AgentId.NORO not in trade.weights
+        assert AgentId.NORO not in scorecard.scores() or (
+            scorecard.scores()[AgentId.NORO].observations > 0
+        ), "NORO is either absent from the scorecard, or genuinely voted"
 
     async def test_weights_are_not_adapted_automatically(self, platform):
         before = dict(platform.settings.consensus.weights)

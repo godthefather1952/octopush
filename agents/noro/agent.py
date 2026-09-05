@@ -15,6 +15,15 @@ So the benchmark is now built from the venues *not* participating in the
 opportunity. When such venues exist, NORO can genuinely confirm or contradict.
 When they do not — an ordinary two-venue market — it says exactly that, and
 neither confirms nor contradicts.
+
+Saying so is an **abstention**, not a neutral vote: the opinion carries
+``abstain=True`` and supplies no mass to either side of the consensus
+weighted mean. That distinction is arithmetic, not presentational. A weighted
+mean divides by the weights it summed, so an opinion contributing nothing to
+the numerator while contributing its weight to the denominator is a vote
+against whatever the other agents concluded — which is how NORO's honest "I
+have no independent evidence" came to suppress consensus on every two-venue
+market and stop the platform trading at all.
 """
 
 from __future__ import annotations
@@ -214,6 +223,12 @@ class Noro:
                 contributor.reliability, 4
             )
 
+        # An abstention is exactly "no independent benchmark exists", and it
+        # is derived from that one condition rather than set in two places, so
+        # the flag and the verdict cannot drift apart. Every path that DOES
+        # produce a benchmark votes normally -- confirming, contradicting, or
+        # genuinely neutral on real evidence.
+        abstain = benchmark is None
         if benchmark is None:
             signal, confidence, reasons = self._no_independent_evidence(detail)
         else:
@@ -231,6 +246,7 @@ class Noro:
             correlation_id=opportunity.opportunity_id,
             signal=signal,
             confidence=confidence,
+            abstain=abstain,
             expires_at=now_ms + config.ttl_ms,
             reason_codes=reasons,
             model_version=VERSION,
@@ -244,11 +260,17 @@ class Noro:
 
         Every usable venue for this symbol is one of the opportunity's own two,
         so any benchmark would be built from the very prices under judgement.
-        NORO reports a neutral signal at low confidence, which lets TIDAL and
-        ZEPHR carry the decision without NORO contributing a vote it has not
-        earned. Confidence is low rather than zero because "0 signal, full
-        confidence" would assert strong belief in neutrality, which is the
-        opposite of what is being said.
+        The opinion is published with ``abstain=True``, which keeps NORO
+        present and complete for required-agent purposes while contributing no
+        scoring mass at all, so TIDAL and ZEPHR decide on their own evidence.
+
+        The signal and confidence still carry the honest values -- a neutral
+        signal, and a low confidence because "0 signal, full confidence" would
+        assert strong belief in neutrality, the opposite of what is being said.
+        Neither of them is what removes NORO from the score, though: an
+        abstention is a statement about *participation*, and dialling
+        confidence to zero to fake it would hide that behind a number an
+        informative model could legitimately report.
         """
         config = self.settings.noro
         detail["independent_contributors"] = 0

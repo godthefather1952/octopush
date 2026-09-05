@@ -142,6 +142,22 @@ class TestP3_4_TwoVenuesProduceNoConfirmation:
         assert fair is not None
         assert {v.venue for v in fair.venues} == {"A", "B"}
 
+    def test_the_opinion_is_marked_as_an_abstention(self, config):
+        """The flag consensus actually reads.
+
+        A neutral signal at low confidence is not enough on its own: a
+        weighted mean divides by the weights it summed, so an opinion carrying
+        weight into the denominator and nothing into the numerator votes
+        against whatever the other agents concluded. ``abstain`` is what
+        removes it from both sides.
+        """
+        opinion = opinion_for(self._pair(), config, "A", "B")
+        assert opinion.abstain is True
+
+    def test_the_abstention_survives_serialisation(self, config):
+        opinion = opinion_for(self._pair(), config, "A", "B")
+        assert opinion.to_json_dict()["abstain"] is True
+
 
 class TestP3_4_AgainstTheRealDetector:
     """The empirical companion, over the same random search the audit ran.
@@ -208,6 +224,37 @@ class TestP3_4_ThreeVenuesCarryInformation:
         assert opinion.signal > 0
         assert FAIR_VALUE_CONFIRMS_DISLOCATION in opinion.reason_codes
         assert opinion.detail["independent_venues"] == "C"
+
+    @pytest.mark.parametrize(
+        ("buy_bps", "sell_bps"),
+        [(10.0, 10.0), (10.0, -1.0), (-5.0, -5.0), (10.0, 0.0)],
+    )
+    def test_an_evidenced_verdict_is_never_an_abstention(
+        self, config, buy_bps, sell_bps
+    ):
+        """Confirming, contradicting, and a genuine zero reached on real
+        evidence are all VOTES. Only the absence of an independent benchmark
+        is an abstention, so each of these participates in consensus
+        normally."""
+        opinion = opinion_for(anchored(buy_bps, sell_bps), config, "A", "B")
+        assert opinion.abstain is False
+        assert INSUFFICIENT_INDEPENDENT_VALUATION_BREADTH not in opinion.reason_codes
+
+    def test_a_genuine_zero_on_evidence_is_a_vote_not_an_abstention(self, config):
+        """The sharpest case for the distinction: both opinions carry
+        ``signal == 0``, and only one of them declines to participate."""
+        evidenced = opinion_for(anchored(10.0, 0.0), config, "A", "B")
+        no_evidence = opinion_for(
+            [venue("A", ANCHOR, liquidity=SATURATED),
+             venue("B", ANCHOR * 1.002, liquidity=SATURATED)],
+            config,
+            "A",
+            "B",
+        )
+        assert evidenced.signal == pytest.approx(0.0, abs=1e-9)
+        assert no_evidence.signal == 0.0
+        assert evidenced.abstain is False
+        assert no_evidence.abstain is True
 
     def test_case_b_an_independent_anchor_can_contradict(self, config):
         """The anchor sits above BOTH opportunity venues, so the sell leg is

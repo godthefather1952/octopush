@@ -511,21 +511,58 @@ class TestStability:
         jumps = [abs(b - a) for a, b in itertools.pairwise(signals)]
         assert max(jumps) < 0.02, f"largest single-step jump {max(jumps):.4f}"
 
-    def test_slowly_changing_liquidity_produces_a_smooth_confidence(self, config):
+    def test_linearly_growing_liquidity_produces_monotone_confidence(self, config):
         """Depth no longer touches the signal at all -- it is a pure price
-        comparison now -- so the property worth checking is that the
-        confidence it does feed moves smoothly."""
+        comparison now -- so the property worth checking is the continuity of
+        the confidence it does feed.
+
+        Increments are LINEAR, and deliberately so. An earlier version of this
+        test grew liquidity geometrically (x1.08 per step) and asserted a fixed
+        0.02 bound on the absolute step in confidence. That is not a
+        continuity test: the reliability term is linear in notional below
+        saturation, so a geometrically growing input produces a geometrically
+        growing step, and the bound was tripped at 0.0208 by arithmetic rather
+        than by any discontinuity. Sweeping linearly through and well past
+        ``reliability_saturation_notional`` tests what was actually meant --
+        that confidence rises smoothly, never falls, and flattens once
+        reliability saturates.
+        """
+        saturation = config.reliability_saturation_notional
+        increment = saturation / 25
         signals, confidences = [], []
-        for step in range(60):
-            liquidity = 1_000.0 * (1.08**step)
+        for step in range(1, 41):
             opinion = opinion_for(
-                self._anchored(10.0, 10.0, liquidity), config, "A", "B"
+                self._anchored(10.0, 10.0, increment * step), config, "A", "B"
             )
             signals.append(opinion.signal)
             confidences.append(opinion.confidence)
+
         assert len(set(signals)) == 1, "prices did not move, so the signal must not"
-        jumps = [abs(b - a) for a, b in itertools.pairwise(confidences)]
-        assert max(jumps) < 0.02, f"largest single-step jump {max(jumps):.4f}"
+        assert all(0.0 <= c <= 1.0 for c in confidences)
+        assert confidences == sorted(confidences), "confidence fell as depth grew"
+        assert all(
+            b - a >= -1e-12 for a, b in itertools.pairwise(confidences)
+        ), "downward discontinuity"
+        # Steps 1..25 climb; everything from 25 on is past saturation and flat.
+        assert confidences[0] < confidences[24]
+        assert len(set(confidences[24:])) == 1, (
+            f"reliability saturates at {saturation}, so confidence must stop "
+            f"moving: {sorted(set(confidences[24:]))}"
+        )
+
+    def test_the_confidence_climb_is_evenly_spaced_below_saturation(self, config):
+        """The linear reliability term, made visible: equal increments of
+        near-touch notional buy equal increments of confidence until the cap
+        binds."""
+        increment = config.reliability_saturation_notional / 25
+        confidences = [
+            opinion_for(
+                self._anchored(10.0, 10.0, increment * step), config, "A", "B"
+            ).confidence
+            for step in range(1, 21)
+        ]
+        gains = [b - a for a, b in itertools.pairwise(confidences)]
+        assert max(gains) - min(gains) < 1e-9, gains
 
     def test_a_slowly_shifting_microprice_produces_a_smooth_signal(self, config):
         signals = []

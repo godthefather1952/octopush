@@ -1,4 +1,4 @@
-"""Consensus: weighting, freshness handling, and the missing-agent rule."""
+"""Consensus: weighting, freshness, missing agents, and abstention."""
 
 from __future__ import annotations
 
@@ -13,7 +13,14 @@ from strategies.consensus import ConsensusEngine
 from tests.conftest import START_MS
 
 
-def slot(agent: AgentId, signal: float, confidence: float, quality=DataQuality.FRESH):
+def slot(
+    agent: AgentId,
+    signal: float,
+    confidence: float,
+    quality=DataQuality.FRESH,
+    *,
+    abstain: bool = False,
+):
     return OpinionSlot(
         opinion=AgentOpinion(
             agent_id=agent,
@@ -21,6 +28,7 @@ def slot(agent: AgentId, signal: float, confidence: float, quality=DataQuality.F
             created_at=START_MS,
             signal=signal,
             confidence=confidence,
+            abstain=abstain,
             expires_at=START_MS + 1_000,
             model_version="t",
         ),
@@ -226,3 +234,341 @@ class TestThresholds:
         if engine.config.exit_threshold <= result.agreement < engine.config.entry_threshold:
             assert engine.continuation_allowed(result)
             assert not engine.entry_allowed(result)
+
+
+class TestAbstention:
+    """An agent that answered and declined to vote.
+
+    Three states have to stay distinct. MISSING is a hole in the data and
+    suspends a required agent's strategy. INFORMATIVE is a vote, including a
+    signal of exactly zero when the evidence genuinely supports neutrality.
+    ABSTAINING is neither: the agent is present, usable and complete, and
+    supplies no scoring mass on either side of the weighted mean.
+
+    The distinction is arithmetic, not cosmetic. A weighted mean divides by
+    the weights it summed, so an agent contributing 0 to the numerator while
+    contributing its weight to the denominator is voting against whatever
+    everyone else concluded, in proportion to its own weight.
+    """
+
+    @staticmethod
+    def _informative():
+        return {
+            AgentId.TIDAL: slot(AgentId.TIDAL, 0.2, 1.0),
+            AgentId.ZEPHR: slot(AgentId.ZEPHR, 1.0, 1.0),
+        }
+
+    def _expected_without_noro(self, engine):
+        weights = engine.config.weights
+        numerator = weights[AgentId.TIDAL] * 1.0 * 0.2 + weights[AgentId.ZEPHR] * 1.0
+        denominator = weights[AgentId.TIDAL] * 1.0 + weights[AgentId.ZEPHR] * 1.0
+        return numerator / denominator
+
+    # -- A: a required agent abstains ------------------------------------
+
+    def test_a_required_abstention_leaves_the_result_complete(self, engine):
+        result = combine(
+            engine,
+            {
+                **self._informative(),
+                AgentId.NORO: slot(AgentId.NORO, 0.0, 0.1, abstain=True),
+            },
+        )
+        assert result.complete is True
+
+    def test_an_abstaining_agent_is_reported_as_abstained_not_missing(self, engine):
+        result = combine(
+            engine,
+            {
+                **self._informative(),
+                AgentId.NORO: slot(AgentId.NORO, 0.0, 0.1, abstain=True),
+            },
+        )
+        assert AgentId.NORO in result.abstained_agents
+        assert AgentId.NORO not in result.missing_agents
+        assert AgentId.NORO not in result.degraded_agents
+
+    def test_the_score_is_the_weighted_mean_of_the_voting_agents_only(self, engine):
+        result = combine(
+            engine,
+            {
+                **self._informative(),
+                AgentId.NORO: slot(AgentId.NORO, 0.0, 0.1, abstain=True),
+            },
+        )
+        assert result.score == pytest.approx(self._expected_without_noro(engine))
+
+    def test_the_denominator_excludes_the_abstaining_agent(self, engine):
+        """Stated directly: the score is identical to the one produced when
+        NORO is not in the input at all. Only ``complete`` differs."""
+        with_abstention = combine(
+            engine,
+            {
+                **self._informative(),
+                AgentId.NORO: slot(AgentId.NORO, 0.0, 0.1, abstain=True),
+            },
+        )
+        without_noro = combine(engine, self._informative())
+        assert with_abstention.score == pytest.approx(without_noro.score)
+        assert with_abstention.complete is True
+        assert without_noro.complete is False
+
+    def test_an_abstaining_agent_gets_no_contribution_row(self, engine):
+        result = combine(
+            engine,
+            {
+                **self._informative(),
+                AgentId.NORO: slot(AgentId.NORO, 0.0, 0.1, abstain=True),
+            },
+        )
+        assert AgentId.NORO not in {c.agent_id for c in result.contributions}
+        assert {c.agent_id for c in result.contributions} == {
+            AgentId.TIDAL,
+            AgentId.ZEPHR,
+        }
+
+    def test_the_abstaining_agents_confidence_cannot_change_the_score(self, engine):
+        scores = {
+            confidence: combine(
+                engine,
+                {
+                    **self._informative(),
+                    AgentId.NORO: slot(
+                        AgentId.NORO, 0.0, confidence, abstain=True
+                    ),
+                },
+            ).score
+            for confidence in (0.0, 0.1, 0.5, 1.0)
+        }
+        assert len(set(scores.values())) == 1, scores
+
+    def test_the_abstaining_agents_signal_cannot_change_the_score(self, engine):
+        """It carries no mass, so even a nonsensical signal on an abstaining
+        opinion is inert."""
+        scores = {
+            signal: combine(
+                engine,
+                {
+                    **self._informative(),
+                    AgentId.NORO: slot(AgentId.NORO, signal, 1.0, abstain=True),
+                },
+            ).score
+            for signal in (-1.0, 0.0, 1.0)
+        }
+        assert len(set(scores.values())) == 1, scores
+
+    # -- B: a required agent is missing ----------------------------------
+
+    def test_a_missing_required_agent_is_still_incomplete(self, engine):
+        result = combine(engine, self._informative())
+        assert result.complete is False
+        assert AgentId.NORO in result.missing_agents
+        assert AgentId.NORO not in result.abstained_agents
+
+    def test_a_stale_required_agent_is_missing_not_abstaining(self, engine):
+        result = combine(
+            engine,
+            {
+                **self._informative(),
+                AgentId.NORO: slot(
+                    AgentId.NORO, 1.0, 1.0, DataQuality.STALE, abstain=True
+                ),
+            },
+        )
+        assert AgentId.NORO in result.missing_agents
+        assert AgentId.NORO not in result.abstained_agents
+        assert result.complete is False
+
+    # -- C: abstention is not a directional neutral ----------------------
+
+    def test_abstention_and_a_neutral_vote_score_differently(self, engine):
+        """The whole point of the new field, in one comparison. Both opinions
+        carry ``signal=0``; only one of them declines to participate."""
+        neutral = combine(
+            engine,
+            {
+                **self._informative(),
+                AgentId.NORO: slot(AgentId.NORO, 0.0, 1.0, abstain=False),
+            },
+        )
+        abstaining = combine(
+            engine,
+            {
+                **self._informative(),
+                AgentId.NORO: slot(AgentId.NORO, 0.0, 1.0, abstain=True),
+            },
+        )
+        assert neutral.score != pytest.approx(abstaining.score)
+        assert abstaining.score > neutral.score, (
+            "the neutral vote drags the positive consensus toward zero; the "
+            "abstention leaves it to the agents that had evidence"
+        )
+        assert neutral.complete is abstaining.complete is True
+
+    def test_a_neutral_vote_still_earns_a_contribution_row(self, engine):
+        result = combine(
+            engine,
+            {
+                **self._informative(),
+                AgentId.NORO: slot(AgentId.NORO, 0.0, 1.0, abstain=False),
+            },
+        )
+        assert AgentId.NORO in {c.agent_id for c in result.contributions}
+        assert AgentId.NORO not in result.abstained_agents
+
+    def test_a_low_confidence_neutral_vote_still_suppresses(self, engine):
+        """The defect this build fixes, preserved as evidence: NORO's honest
+        zero at confidence 0.1 was counted in the denominator, so it pulled
+        the score down even though it claimed nothing."""
+        suppressed = combine(
+            engine,
+            {
+                **self._informative(),
+                AgentId.NORO: slot(AgentId.NORO, 0.0, 0.1, abstain=False),
+            },
+        )
+        assert suppressed.score < self._expected_without_noro(engine)
+
+    # -- D: everyone abstains --------------------------------------------
+
+    def test_when_every_agent_abstains_the_score_is_zero(self, engine):
+        result = combine(
+            engine,
+            {
+                agent: slot(agent, 1.0, 1.0, abstain=True)
+                for agent in (AgentId.TIDAL, AgentId.NORO, AgentId.ZEPHR)
+            },
+        )
+        assert result.score == 0.0
+        assert result.agreement == 0.0
+        assert result.contributions == []
+        assert set(result.abstained_agents) == {
+            AgentId.TIDAL,
+            AgentId.NORO,
+            AgentId.ZEPHR,
+        }
+
+    def test_an_all_abstain_result_is_complete_but_never_entered(self, engine):
+        """Completeness is about presence, so it holds. Entry is about
+        agreement, and an empty weighted mean is zero -- far below any
+        threshold. This must not be special-cased into a trade."""
+        result = combine(
+            engine,
+            {
+                agent: slot(agent, 1.0, 1.0, abstain=True)
+                for agent in (AgentId.TIDAL, AgentId.NORO, AgentId.ZEPHR)
+            },
+        )
+        assert result.complete is True
+        assert engine.entry_allowed(result) is False
+
+    # -- E: a non-required agent abstains --------------------------------
+
+    def test_a_non_required_abstention_leaves_the_score_untouched(self, engine):
+        """LUMEN is optional. Whether it abstains or is simply absent, the
+        agents with evidence decide."""
+        assert AgentId.LUMEN not in engine.config.required_agents
+        with_lumen = combine(
+            engine,
+            {
+                **self._informative(),
+                AgentId.NORO: slot(AgentId.NORO, 0.5, 1.0),
+                AgentId.LUMEN: slot(AgentId.LUMEN, -1.0, 1.0, abstain=True),
+            },
+        )
+        without_lumen = combine(
+            engine,
+            {
+                **self._informative(),
+                AgentId.NORO: slot(AgentId.NORO, 0.5, 1.0),
+            },
+        )
+        assert with_lumen.score == pytest.approx(without_lumen.score)
+        assert AgentId.LUMEN in with_lumen.abstained_agents
+
+    # -- F: a degraded abstention ----------------------------------------
+
+    def test_a_degraded_abstention_is_reported_in_both_lists(self, engine):
+        """Degradation describes freshness and abstention describes
+        participation; they are orthogonal, and a degraded agent that
+        abstained is honestly both."""
+        result = combine(
+            engine,
+            {
+                **self._informative(),
+                AgentId.NORO: slot(
+                    AgentId.NORO, 0.0, 0.1, DataQuality.DEGRADED, abstain=True
+                ),
+            },
+        )
+        assert AgentId.NORO in result.degraded_agents
+        assert AgentId.NORO in result.abstained_agents
+        assert AgentId.NORO not in result.missing_agents
+
+    def test_a_degraded_abstention_still_contributes_no_mass(self, engine):
+        result = combine(
+            engine,
+            {
+                **self._informative(),
+                AgentId.NORO: slot(
+                    AgentId.NORO, 0.0, 0.1, DataQuality.DEGRADED, abstain=True
+                ),
+            },
+        )
+        assert result.score == pytest.approx(self._expected_without_noro(engine))
+        assert AgentId.NORO not in {c.agent_id for c in result.contributions}
+
+
+class TestAbstentionDefaults:
+    def test_an_opinion_is_informative_unless_it_says_otherwise(self):
+        """Backward compatibility: every agent that never abstains, and every
+        payload serialised before the field existed, keeps voting normally."""
+        opinion = AgentOpinion(
+            agent_id=AgentId.TIDAL,
+            symbol="BTC-USD",
+            created_at=START_MS,
+            signal=0.5,
+            confidence=0.9,
+            expires_at=START_MS + 1_000,
+            model_version="t",
+        )
+        assert opinion.abstain is False
+
+    def test_a_payload_without_the_field_still_validates(self):
+        legacy = {
+            "agent_id": "TIDAL",
+            "symbol": "BTC-USD",
+            "created_at": START_MS,
+            "signal": 0.5,
+            "confidence": 0.9,
+            "expires_at": START_MS + 1_000,
+            "model_version": "t",
+        }
+        assert AgentOpinion.model_validate(legacy).abstain is False
+
+    def test_the_field_round_trips_through_serialisation(self):
+        opinion = AgentOpinion(
+            agent_id=AgentId.NORO,
+            symbol="BTC-USD",
+            created_at=START_MS,
+            signal=0.0,
+            confidence=0.1,
+            abstain=True,
+            expires_at=START_MS + 1_000,
+            model_version="t",
+        )
+        payload = opinion.to_json_dict()
+        assert payload["abstain"] is True
+        assert AgentOpinion.model_validate(payload).abstain is True
+
+    def test_a_consensus_result_without_the_field_still_validates(self):
+        from core.models.agent import ConsensusResult
+
+        legacy = {
+            "created_at": START_MS,
+            "symbol": "BTC-USD",
+            "strategy": "cross_venue",
+            "score": 0.5,
+            "agreement": 0.5,
+        }
+        assert ConsensusResult.model_validate(legacy).abstained_agents == []

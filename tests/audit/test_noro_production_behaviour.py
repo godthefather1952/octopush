@@ -190,6 +190,17 @@ class TestEveryOpinionDeclinesToVote:
         codes = {tuple(payload["reason_codes"]) for _, _, payload in rows}
         assert codes == {(INSUFFICIENT_INDEPENDENT_VALUATION_BREADTH,)}, codes
 
+    def test_every_opinion_is_flagged_as_an_abstention(self, rows):
+        """What actually keeps the two-venue market tradeable.
+
+        A declined vote that still carried weight into the consensus
+        denominator would drag every score toward zero, and the platform would
+        detect opportunities and never fill one. ``abstain`` removes NORO from
+        both sides of the weighted mean, leaving TIDAL and ZEPHR to decide on
+        the evidence they do have.
+        """
+        assert {payload["abstain"] for _, _, payload in rows} == {True}
+
     def test_no_confirmation_or_contradiction_is_ever_claimed(self, rows):
         for _, _, payload in rows:
             assert FAIR_VALUE_CONFIRMS_DISLOCATION not in payload["reason_codes"]

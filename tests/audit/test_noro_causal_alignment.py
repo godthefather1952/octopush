@@ -93,10 +93,20 @@ class TestNoroSeesTheSnapshotThatCreatedTheOpportunity:
     """Directly, through NORO's own handler, in the production event order."""
 
     async def test_the_in_tick_order_keeps_them_aligned(self, config):
+        """The opinion is formed from the snapshot the tick delivered.
+
+        Built on THREE venues so the alignment is observable. With only the
+        opportunity's own two, NORO abstains and publishes no benchmark at
+        all, and the test would be measuring the neutral path rather than
+        causal alignment. The independent anchor C is what NORO judges the
+        trade against, so it is the value that must match the snapshot in
+        force at detection.
+        """
         noro = build_noro(config)
         first = market(
             venue("A", 100.0, liquidity=100_000.0),
             venue("B", 100.2, liquidity=100_000.0),
+            venue("C", 100.1, liquidity=100_000.0),
         )
         await noro.on_event(
             Event(
@@ -107,8 +117,7 @@ class TestNoroSeesTheSnapshotThatCreatedTheOpportunity:
                 payload=first.to_json_dict(),
             )
         )
-        fair_at_detection = noro.fair_value(SYMBOL).fair_value
-        assert fair_at_detection == pytest.approx(100.1)
+        anchor_at_detection = 100.1
 
         published: list[Event] = []
         noro.bus.subscribe(
@@ -127,8 +136,59 @@ class TestNoroSeesTheSnapshotThatCreatedTheOpportunity:
         )
         await noro.bus.drain()
         assert len(published) == 1
-        assert published[0].payload["detail"]["fair_value"] == pytest.approx(
-            fair_at_detection
+        detail = published[0].payload["detail"]
+        assert detail["independent_venues"] == "C"
+        assert detail["valuation_benchmark"] == pytest.approx(anchor_at_detection)
+        assert published[0].payload["abstain"] is False, (
+            "an independent anchor exists, so this is a real vote"
+        )
+
+    async def test_a_later_snapshot_does_not_retro_change_the_published_opinion(
+        self, config
+    ):
+        """Causal alignment stated as the property that matters: an opinion
+        already published carries the benchmark of the snapshot that produced
+        it, and a later snapshot cannot reach back and alter it."""
+        noro = build_noro(config)
+        published: list[Event] = []
+        noro.bus.subscribe(
+            lambda e: published.append(e) or _noop(),
+            types=[EventType.AGENT_OPINION],
+            name="capture",
+        )
+
+        for anchor, ts in ((100.1, START_MS), (100.5, START_MS + 100)):
+            await noro.on_event(
+                Event(
+                    type=EventType.MARKET_STATE,
+                    ts_ms=ts,
+                    source="TIDAL",
+                    schema_name="MarketState",
+                    payload=market(
+                        venue("A", 100.0, liquidity=100_000.0),
+                        venue("B", 100.2, liquidity=100_000.0),
+                        venue("C", anchor, liquidity=100_000.0),
+                        created_at=ts,
+                    ).to_json_dict(),
+                )
+            )
+            await noro.on_event(
+                Event(
+                    type=EventType.OPPORTUNITY_DETECTED,
+                    ts_ms=ts,
+                    source="ORCHESTRATOR",
+                    schema_name="Opportunity",
+                    payload=opportunity("A", "B").to_json_dict(),
+                )
+            )
+        await noro.bus.drain()
+
+        assert len(published) == 2
+        assert published[0].payload["detail"]["valuation_benchmark"] == (
+            pytest.approx(100.1)
+        )
+        assert published[1].payload["detail"]["valuation_benchmark"] == (
+            pytest.approx(100.5)
         )
 
     async def test_an_interleaved_newer_snapshot_would_be_visible(self, config):

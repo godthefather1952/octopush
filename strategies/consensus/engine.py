@@ -52,6 +52,7 @@ class ConsensusEngine:
         contributions: list[AgentContribution] = []
         missing: list[AgentId] = []
         degraded: list[AgentId] = []
+        abstained: list[AgentId] = []
         weighted_signal_sum = 0.0
         weight_sum = 0.0
 
@@ -69,6 +70,27 @@ class ConsensusEngine:
                 # STALE or UNAVAILABLE: excluded entirely, and reported as
                 # missing so the caller can see the hole.
                 missing.append(agent)
+                continue
+            if slot.opinion.abstain:
+                # The agent answered and declined to vote. It is PRESENT --
+                # required-agent completeness is about usability, not about
+                # whether a directional claim was made -- but it supplies no
+                # scoring mass on either side of the division.
+                #
+                # Leaving it in the denominator would not be neutrality. A
+                # weighted mean divides by the weights it summed, so an agent
+                # contributing 0 to the numerator and its full weight to the
+                # denominator drags the score toward zero in proportion to its
+                # own weight: an abstention would function as a vote against
+                # whatever everyone else concluded. That is exactly what
+                # suppressed consensus on two-venue markets once NORO started
+                # answering honestly.
+                #
+                # This reads only the generic ``abstain`` flag. Consensus must
+                # never branch on an individual agent's reason codes -- each
+                # agent decides when it has nothing to add, and says so in the
+                # one field every agent shares.
+                abstained.append(agent)
                 continue
             effective = weight * slot.opinion.confidence
             weighted = effective * slot.opinion.signal
@@ -108,6 +130,12 @@ class ConsensusEngine:
             contributions=contributions,
             missing_agents=missing,
             degraded_agents=degraded,
+            abstained_agents=abstained,
+            # Completeness is about whether every required agent was PRESENT
+            # and usable, never about whether it cast a directional vote. An
+            # agent that abstained answered the question; treating that as a
+            # hole would suspend the strategy precisely when the agent is
+            # working as designed.
             complete=not missing_required,
         )
 
