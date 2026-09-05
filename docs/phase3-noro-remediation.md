@@ -405,3 +405,54 @@ Nothing in this pass was executed: no `pytest`, no `ruff`, no `mypy`, no import
 check, no script, no container, no replay, no application start. Every
 statement here is a claim about code that an independent validator must
 confirm.
+
+---
+
+## 22. Validation-suite migration
+
+A follow-up commit on this branch migrated the test surface. No production
+behaviour was changed by it, and no test was executed by its author.
+
+**Why the tests were out of date by design.** The Phase 3 audit suite was
+written *before* remediation, and much of it existed to prove that defects
+were real: that `10.001` bps silently fell back to whole-book depth, that
+`[-1, +10]` still produced a positive aggregate, that a two-venue detector
+opportunity was confirmed by construction, that confidence sat at 1.0
+regardless of disagreement. Those assertions were correct records of the old
+behaviour. NORO v0.2 changed that behaviour deliberately, so the tests had to
+change with it.
+
+**What they became.** Evidence, not deletions. Each defect reproduction was
+turned into a regression assertion that the defect stays closed, keeping the
+original finding's numbers in the docstring as the thing that must not come
+back, and naming the finding ID in the class or test name (`TestP3_2_...`,
+`test_p3_1_arbitrary_window_cannot_trigger_full_book_fallback`). Nothing was
+solved with a module-level `skip` or `xfail`.
+
+Two collection blockers reported by the external validator are addressed:
+`tests/unit/test_pricing.py` and `tests/audit/test_noro_liquidity_window.py`
+both imported the removed `usable_liquidity`, which stopped collection before
+any semantic test ran. Both now use `near_touch_notional` and the
+`NoroConfig`-based `venue_price`. A separate Ruff `RUF022` failure —
+`core/models/__init__.py`'s `__all__` no longer sorted after the
+`DEPTH_BUCKETS_BPS` and `depth_bucket_key` exports were added — is fixed by
+reordering the list. That is the only non-test change in the migration commit,
+and it is ordering only.
+
+**One end-to-end consequence is deliberately left exposed.**
+`tests/integration/test_pipeline.py::TestAttribution` asserts that the
+platform closes trades on the simulated two-venue market. NORO now contributes
+`signal 0.0` at confidence `0.1` there instead of a near-saturated `+1` at
+confidence `1.0`, which removes roughly 1.5 of weighted mass from the
+consensus numerator while leaving the entry threshold at 0.60. Whether the
+remaining agents still clear that threshold is a question about the running
+system, not about the code, and this pass could not answer it without
+executing the suite. The assertion was therefore left untouched: if trades
+stop, that is a real and important consequence of making NORO's vote truthful,
+and it should surface as a failing end-to-end test rather than be smoothed
+away by weakening the test or — expressly out of scope here — retuning
+consensus.
+
+**Testing status: TESTS NOT RUN — EXTERNAL VALIDATION REQUIRED.** Every
+expectation in the migrated suite was derived by reading the implementation.
+None of it is a measured result.

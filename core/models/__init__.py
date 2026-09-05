@@ -76,6 +76,7 @@ from core.models.risk import (
 )
 
 __all__ = [
+    "DEPTH_BUCKETS_BPS",
     "FLAT_EPSILON",
     "MONEY_EPSILON",
     "ORDER_TRANSITIONS",
@@ -87,7 +88,6 @@ __all__ = [
     "AgentOpinion",
     "AgentScore",
     "Base",
-    "DEPTH_BUCKETS_BPS",
     "BookMetrics",
     "ConsensusResult",
     "ConsolidatedView",
@@ -138,7 +138,7 @@ __all__ = [
     "TradeIntent",
     "TradingMode",
     "VenueMarketState",
-    "new_id",
     "depth_bucket_key",
+    "new_id",
     "safe_bps",
 ]

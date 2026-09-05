@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from agents.noro.fair_value import compute_fair_value, usable_liquidity, venue_price
+from agents.noro.fair_value import compute_fair_value, near_touch_notional, venue_price
 from agents.zephr.liquidity import build_sizing_curve, quote_leg
 from core.config import FeeSchedule, NoroConfig, ZephrConfig
 from core.models.common import DataQuality, Side
@@ -37,31 +37,76 @@ def state(
     )
 
 
+#: Reliability saturates far below any of these books, so every contributor
+#: weighs exactly 1.0 and the weighted median reduces to the plain median.
+#: That is the shape most of these tests want: the estimator's *ordering*
+#: behaviour, with weighting held constant.
+EQUAL_WEIGHT = NoroConfig(reliability_saturation_notional=1.0)
+
+
 class TestFairValue:
-    def test_equal_liquidity_gives_the_average(self, noro_config):
+    """NORO v0.2: a reliability-weighted MEDIAN, not a liquidity-weighted mean.
+
+    The old suite asserted mean behaviour -- "two venues average", "the deep
+    venue pulls fair value towards it". Both were true of the pre-remediation
+    estimator and are deliberately false now: a median cannot be dragged by
+    one venue's size, which is the P3-5 fix.
+    """
+
+    def test_two_equally_reliable_venues_give_the_midpoint(self):
         fair = compute_fair_value(
-            "BTC-USD", [state("A", 100.0), state("B", 102.0)], noro_config
+            "BTC-USD", [state("A", 100.0), state("B", 102.0)], EQUAL_WEIGHT
         )
         assert fair is not None
+        # Exactly half the weight sits at or below each price, so the
+        # straddling pair is averaged.
         assert fair.fair_value == pytest.approx(101.0, rel=1e-3)
 
-    def test_deep_venue_pulls_fair_value_towards_it(self, noro_config):
+    def test_identical_contributors_give_the_common_price(self, noro_config):
         fair = compute_fair_value(
             "BTC-USD",
-            [state("A", 100.0, size=10.0), state("B", 102.0, size=0.5)],
+            [state("A", 100.0), state("B", 100.0), state("C", 100.0)],
             noro_config,
         )
         assert fair is not None
-        # The deep venue dominates: fair value sits much nearer 100 than 101.
-        assert fair.fair_value < 100.5
+        assert fair.fair_value == pytest.approx(100.0, rel=1e-6)
+        assert fair.dispersion_bps == pytest.approx(0.0, abs=1e-6)
 
-    def test_deviations_are_signed_and_sum_towards_zero(self, noro_config):
-        fair = compute_fair_value(
-            "BTC-USD", [state("A", 100.0), state("B", 102.0)], noro_config
+    def test_the_benchmark_lies_within_the_contributor_price_range(self, noro_config):
+        states = [state("A", 100.0), state("B", 101.0), state("C", 130.0)]
+        fair = compute_fair_value("BTC-USD", states, noro_config)
+        prices = [v.price for v in fair.venues]
+        assert min(prices) <= fair.fair_value <= max(prices)
+
+    def test_p3_5_a_deep_venue_does_not_drag_the_benchmark(self):
+        """P3-5 regression. The old weighted mean moved with raw depth; the
+        median does not. C is the outlier AND by far the deepest venue."""
+        modest = [state("A", 100.0, size=0.5), state("B", 100.1, size=0.5)]
+        outlier = state("C", 130.0, size=500.0)
+        fair = compute_fair_value("BTC-USD", [*modest, outlier], EQUAL_WEIGHT)
+        assert fair.fair_value == pytest.approx(100.1, rel=1e-3), (
+            "the middle price wins; the deep outlier is one vote, not a weight"
         )
-        cheap, rich = fair.cheapest, fair.richest
-        assert cheap.venue == "A" and cheap.deviation_bps < 0
-        assert rich.venue == "B" and rich.deviation_bps > 0
+
+    def test_reliability_is_bounded_at_one(self, noro_config):
+        fair = compute_fair_value(
+            "BTC-USD", [state("A", 100.0, size=10_000.0)], noro_config
+        )
+        assert fair.venues[0].reliability <= 1.0
+
+    def test_contributor_order_does_not_change_the_benchmark(self, noro_config):
+        states = [state("A", 100.0), state("B", 101.0), state("C", 103.0)]
+        forward = compute_fair_value("BTC-USD", states, noro_config)
+        backward = compute_fair_value("BTC-USD", list(reversed(states)), noro_config)
+        assert forward.fair_value == pytest.approx(backward.fair_value)
+        assert [v.venue for v in forward.venues] == [v.venue for v in backward.venues]
+
+    def test_deviations_are_signed_around_the_benchmark(self):
+        fair = compute_fair_value(
+            "BTC-USD", [state("A", 100.0), state("B", 102.0)], EQUAL_WEIGHT
+        )
+        by_venue = {v.venue: fair.deviation_of(v.price) for v in fair.venues}
+        assert by_venue["A"] < 0 and by_venue["B"] > 0
 
     def test_unusable_venues_are_excluded(self, noro_config):
         fair = compute_fair_value(
@@ -80,17 +125,39 @@ class TestFairValue:
             is None
         )
 
+    def test_no_contributor_at_all_returns_none(self, noro_config):
+        assert compute_fair_value("BTC-USD", [], noro_config) is None
+
+    def test_only_the_requested_symbol_contributes(self, noro_config):
+        eth = venue_state_from_book(make_book("B", "ETH-USD", 3_000.0))
+        fair = compute_fair_value("BTC-USD", [state("A", 100.0), eth], noro_config)
+        assert [v.venue for v in fair.venues] == ["A"]
+        assert fair.fair_value == pytest.approx(100.0, rel=1e-3)
+
     def test_venue_price_blends_mid_and_microprice(self):
         s = state("A", 100.0)
-        blended = venue_price(s, 1.0)
+        blended = venue_price(s, NoroConfig(microprice_weight=1.0))
         assert blended == pytest.approx(s.metrics.microprice)
-        assert venue_price(s, 0.0) == pytest.approx(s.metrics.mid)
+        assert venue_price(s, NoroConfig(microprice_weight=0.0)) == pytest.approx(
+            s.metrics.mid
+        )
 
-    def test_usable_liquidity_takes_the_thinner_side(self):
+    def test_near_touch_notional_takes_the_thinner_side(self):
         s = state("A", 100.0)
         s.metrics.bid_depth_by_bps["10"] = 1_000.0
         s.metrics.ask_depth_by_bps["10"] = 400.0
-        assert usable_liquidity(s, 10.0) == pytest.approx(400.0)
+        assert near_touch_notional(s, NoroConfig(liquidity_window_bps=10.0)) == (
+            pytest.approx(400.0)
+        )
+
+    def test_p3_1_a_missing_bucket_excludes_rather_than_falling_back(self):
+        """P3-1 regression. ``near_touch_notional`` must never answer an
+        unmeasured window with whole-book depth."""
+        s = state("A", 100.0)
+        s.metrics.bid_depth_by_bps.pop("10")
+        s.metrics.ask_depth_by_bps.pop("10")
+        assert s.metrics.bid_depth_notional > 0, "the full book is still there"
+        assert near_touch_notional(s, NoroConfig(liquidity_window_bps=10.0)) is None
 
 
 class TestWalkBook:

@@ -1,4 +1,4 @@
-"""Shared builders and audit-only comparator models for the Phase 3 NORO audit.
+"""Shared builders and audit-only comparator models for the NORO audit suite.
 
 Nothing here is production code, and nothing here may be wired into
 production. The comparators exist to answer one question with evidence rather
@@ -11,6 +11,14 @@ buckets from the book it is given, which is convenient but makes it impossible
 to construct the shapes this audit needs -- a venue with tiny near-touch depth
 and an enormous far book, say. Every metric here is set explicitly so the
 audit controls exactly one variable at a time.
+
+Migrated to NORO v0.2. The valuation API these helpers wrap changed by design
+in the Phase 3 remediation: ``usable_liquidity`` became
+``near_touch_notional`` with no full-book fallback, ``venue_price`` takes the
+whole ``NoroConfig`` so the microprice cap travels with it, and the estimator
+is a reliability-weighted median rather than a liquidity-weighted mean. The
+old spellings are gone from production on purpose and are not reconstructed
+here.
 """
 
 from __future__ import annotations
@@ -18,11 +26,16 @@ from __future__ import annotations
 import statistics
 from dataclasses import dataclass
 
-from agents.noro.fair_value import FairValue, compute_fair_value, venue_price
-from agents.tidal.metrics import DEPTH_BUCKETS_BPS
+from agents.noro.fair_value import (
+    FairValue,
+    build_contributors,
+    compute_fair_value,
+    valuation_from,
+)
 from core.config import NoroConfig
 from core.models.common import DataQuality, Side
 from core.models.market import (
+    DEPTH_BUCKETS_BPS,
     BookMetrics,
     MarketState,
     OrderBookSnapshot,
@@ -34,9 +47,10 @@ from core.models.opportunity import Opportunity, OpportunityKind, OpportunityLeg
 START_MS = 1_788_000_000_000
 SYMBOL = "BTC-USD"
 
-#: The buckets TIDAL actually publishes. NORO's config accepts any positive
-#: float, so this tuple is the real domain of "a window that will hit a
-#: measured bucket".
+#: The buckets TIDAL publishes, and -- since the remediation -- the entire
+#: domain ``NoroConfig.liquidity_window_bps`` will accept. Before P3-1 was
+#: closed the config took any positive float and quietly answered off-bucket
+#: requests with whole-book depth.
 PUBLISHED_BUCKETS = DEPTH_BUCKETS_BPS
 
 
@@ -51,7 +65,7 @@ def venue(
     spread_bps: float = 2.0,
     quality: DataQuality = DataQuality.FRESH,
     symbol: str = SYMBOL,
-    exchange_ts: int = START_MS,
+    exchange_ts: int | None = START_MS,
     buckets: dict[float, tuple[float, float]] | None = None,
     full_book: tuple[float, float] | None = None,
     book: OrderBookSnapshot | None = None,
@@ -63,9 +77,9 @@ def venue(
     ``buckets`` maps a bps distance to ``(bid_notional, ask_notional)``; when
     omitted every published bucket carries ``liquidity`` on both sides, so the
     venue behaves identically at any window that hits a real bucket.
-    ``full_book`` sets the total (unbucketed) depth used by NORO's fallback
-    path, defaulting to the same value so the fallback is invisible unless a
-    test deliberately makes it visible.
+    ``full_book`` sets the total (unbucketed) depth. NORO v0.2 never reads it
+    -- that was the P3-1 fallback -- so tests set it to a deliberately
+    enormous value to prove the fallback stays closed.
     """
     bid_liq = bid_liquidity if bid_liquidity is not None else liquidity
     ask_liq = ask_liquidity if ask_liquidity is not None else liquidity
@@ -227,12 +241,15 @@ def opportunity(
 
 
 # ======================================================================
-# Audit-only comparator benchmarks (Section 60)
+# Audit-only comparator benchmarks
 # ======================================================================
 #
-# Production computes one benchmark: the liquidity-weighted mean of every
-# usable venue, INCLUDING the venue being judged. These are alternatives,
-# implemented only to measure how much that choice matters. None of them is a
+# Production (v0.2) computes ONE benchmark: the reliability-weighted median of
+# the contributors that are not participating in the opportunity. These are
+# alternatives, implemented only to measure how much that choice matters --
+# most importantly the liquidity-weighted mean, which is what production used
+# BEFORE the remediation and which several regression tests here compare
+# against to show the estimator genuinely changed. None of them is a
 # recommendation, and none may be wired into production.
 
 
@@ -240,30 +257,35 @@ def opportunity(
 class Contributor:
     venue: str
     price: float
+    #: Raw near-touch notional -- the *unbounded* quantity the pre-remediation
+    #: estimator weighted by. Production now bounds this into a reliability in
+    #: [0, 1]; the comparators keep the raw number precisely so a test can show
+    #: what the unbounded version would have done.
     liquidity: float
 
 
 def contributors(
     states: list[VenueMarketState], config: NoroConfig
 ) -> list[Contributor]:
-    """The (venue, price, liquidity) triples production would use."""
-    from agents.noro.fair_value import usable_liquidity
+    """The (venue, price, raw near-touch notional) triples production sees.
 
-    out = []
-    for state in states:
-        if not state.quality.is_usable:
-            continue
-        price = venue_price(state, config.microprice_weight)
-        if price is None:
-            continue
-        liquidity = usable_liquidity(state, config.liquidity_window_bps)
-        if liquidity <= 0:
-            continue
-        out.append(Contributor(state.venue, price, liquidity))
-    return out
+    Built from production's own ``build_contributors``, so the selection rules
+    (usable quality, priceable, an exactly-measured bucket with depth on both
+    sides) can never drift away from the agent's.
+    """
+    return [
+        Contributor(c.venue, c.price, c.near_touch_notional)
+        for c in build_contributors(SYMBOL, states, config)
+    ]
 
 
 def weighted_mean(items: list[Contributor]) -> float | None:
+    """The PRE-REMEDIATION estimator, kept as a comparison baseline.
+
+    Production no longer computes this. It is retained so the audit can keep
+    showing what it did: move with every outlier in proportion to its raw
+    depth, which is how one enormous venue came to define fair value.
+    """
     total = sum(c.liquidity for c in items)
     if total <= 0:
         return None
@@ -274,7 +296,8 @@ def leave_one_out(items: list[Contributor], venue_name: str) -> float | None:
     """The benchmark a venue would be judged against if it were excluded.
 
     The question this answers: does a venue's own weight in the benchmark
-    stop it from ever looking like an outlier?
+    stop it from ever looking like an outlier? Production v0.2 goes further
+    and excludes *both* opportunity venues -- see :func:`independent_of`.
     """
     others = [c for c in items if c.venue != venue_name]
     return weighted_mean(others)
@@ -282,22 +305,6 @@ def leave_one_out(items: list[Contributor], venue_name: str) -> float | None:
 
 def median_price(items: list[Contributor]) -> float | None:
     return statistics.median(c.price for c in items) if items else None
-
-
-def weighted_median(items: list[Contributor]) -> float | None:
-    """The price at which cumulative liquidity crosses half the total."""
-    if not items:
-        return None
-    ordered = sorted(items, key=lambda c: c.price)
-    total = sum(c.liquidity for c in ordered)
-    if total <= 0:
-        return None
-    seen = 0.0
-    for item in ordered:
-        seen += item.liquidity
-        if seen >= total / 2:
-            return item.price
-    return ordered[-1].price
 
 
 def trimmed_mean(items: list[Contributor], trim: float = 0.2) -> float | None:
@@ -315,12 +322,51 @@ def bps(value: float, reference: float) -> float:
 
 
 def deviations(fair: FairValue) -> dict[str, float]:
-    return {v.venue: v.deviation_bps for v in fair.venues}
+    """Each contributor's distance from the benchmark, in bps.
+
+    v0.2 does not store a per-contributor deviation -- the benchmark a
+    contributor is measured against depends on which opportunity is being
+    judged, so a deviation baked into the contributor would be meaningless.
+    It is derived here instead.
+    """
+    return {v.venue: fair.deviation_of(v.price) for v in fair.venues}
 
 
-def weights(fair: FairValue) -> dict[str, float]:
-    return {v.venue: v.weight for v in fair.venues}
+def reliabilities(fair: FairValue) -> dict[str, float]:
+    """Each contributor's bounded reliability weight, in [0, 1].
+
+    Replaces the old ``weights()``, which returned a normalised share of total
+    liquidity. Shares had to sum to 1, so one venue's depth necessarily
+    suppressed every other venue's influence; a bounded reliability does not,
+    which is the point of the change (P3-9).
+    """
+    return {v.venue: v.reliability for v in fair.venues}
 
 
 def fair_of(states: list[VenueMarketState], config: NoroConfig) -> FairValue | None:
+    """The symbol-wide DIAGNOSTIC valuation, over every usable contributor.
+
+    This is not what an opportunity is judged against -- see
+    :func:`independent_of`. Keeping the two apart is the P3-4 fix.
+    """
     return compute_fair_value(SYMBOL, states, config)
+
+
+def independent_of(
+    states: list[VenueMarketState],
+    config: NoroConfig,
+    *,
+    exclude: tuple[str, ...],
+) -> FairValue | None:
+    """The benchmark an opportunity on ``exclude`` is actually judged against.
+
+    Mirrors ``Noro.independent_valuation``: contributors minus the venues
+    participating in the opportunity, and ``None`` when nothing independent
+    remains.
+    """
+    independent = [
+        c for c in build_contributors(SYMBOL, states, config) if c.venue not in exclude
+    ]
+    if not independent:
+        return None
+    return valuation_from(SYMBOL, independent)

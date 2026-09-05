@@ -1,27 +1,39 @@
-"""Phase 3 audit, Sections 25 / 43 / 44: NORO on the real simulated market.
+"""P3-4 regression on the real simulated market.
 
-Everything else in this audit reasons about constructed states. This suite
-drives the REAL platform -- TIDAL, the detector, NORO, ZEPHR, consensus, RUNE,
-VESKA -- on its seeded synthetic market and measures what NORO actually does.
+Everything else in this suite reasons about constructed states. This one drives
+the REAL platform -- TIDAL, the detector, NORO, ZEPHR, consensus, RUNE, VESKA
+-- on its seeded synthetic market and measures what NORO actually does.
 
-The headline measurement, over 5,000 ticks (reproduced at a shorter length
-here so the suite stays fast; the full run is
-``scripts/audit_noro_simulation.py``):
+**What the audit measured**, over 5,000 ticks:
 
     distinct opportunities        82
     FIRST evaluations (entry)     82, of which 0 were negative
     RE-evaluations (monitoring) 1166, of which 48 were negative
 
-So NORO's ENTRY vote was positive every single time, and every rejection it
-produced came from continuous re-evaluation after entry -- where the market
-has moved away from the opportunity's original legs and the two-venue
-tautology no longer binds.
+NORO's entry vote was positive every single time, at a confidence pinned at
+1.0 -- and not because it agreed, but because it could not disagree. The
+simulated market has exactly two venues per symbol, which are exactly the two
+the detector picks, so the benchmark was built from the prices under judgement
+and confirmed them by construction. Every rejection came from continuous
+re-evaluation after entry, where the market had moved away from the
+opportunity's original legs.
+
+**The property this file now protects.** On a two-venue market NORO has no
+independent valuation evidence and says so: signal exactly 0.0, confidence
+``insufficient_breadth_confidence``, reason
+``INSUFFICIENT_INDEPENDENT_VALUATION_BREADTH``. It neither confirms nor
+contradicts, and the guaranteed positive entry vote is gone.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from agents.noro.agent import (
+    FAIR_VALUE_CONFIRMS_DISLOCATION,
+    FAIR_VALUE_CONTRADICTS_DISLOCATION,
+    INSUFFICIENT_INDEPENDENT_VALUATION_BREADTH,
+)
 from apps.orchestrator.wiring import build_platform
 from core.bus import InMemoryEventBus
 from core.clock import ManualClock
@@ -80,7 +92,7 @@ def run():
             await platform.orchestrator.tick()
         await bus.drain()
         await platform.stop()
-        return published, rows
+        return published, rows, settings
 
     return asyncio.run(drive())
 
@@ -88,6 +100,11 @@ def run():
 @pytest.fixture
 def rows(run):
     return run[1]
+
+
+@pytest.fixture
+def settings(run):
+    return run[2]
 
 
 @pytest.fixture
@@ -101,98 +118,133 @@ def re_evaluations(rows):
 
 
 class TestNoroAlwaysAnswers:
+    """Unchanged, and load-bearing: the neutral verdict is an ANSWER.
+
+    NORO is a required agent, so returning ``None`` on a two-venue market
+    would suspend the strategy on the commonest market there is. Missing and
+    neutral had to stay different things.
+    """
+
     def test_every_opportunity_received_an_opinion(self, run):
-        published, rows = run
+        published, rows, _ = run
         assert sum(published.values()) == len(rows), (
             "NORO answered every OPPORTUNITY_DETECTED event"
         )
 
     def test_a_meaningful_number_of_opportunities_occurred(self, run):
-        published, rows = run
+        published, rows, _ = run
         assert len(published) >= 10, f"only {len(published)} distinct opportunities"
         assert len(rows) >= 100
 
 
-class TestTheEntryVoteIsUnanimouslyPositive:
-    """The central production finding of this audit."""
+class TestP3_4_TheEntryVoteIsNoLongerGuaranteedPositive:
+    """The central production finding, inverted.
 
-    def test_no_entry_evaluation_was_ever_negative(self, first_evaluations):
-        negative = [p for p in first_evaluations if p["signal"] < 0]
+    The audit asserted "no entry evaluation was ever negative" and measured
+    82/82 positive. The property now is that none of them is positive either:
+    with only the detector's own two venues in the market there is nothing
+    independent to confirm with.
+    """
+
+    def test_no_entry_evaluation_is_positive(self, first_evaluations):
+        positive = [p for p in first_evaluations if p["signal"] > 0]
         assert first_evaluations, "there were entry evaluations to check"
-        assert negative == [], (
-            f"{len(negative)}/{len(first_evaluations)} entry votes were "
-            "negative -- the two-venue proof says zero"
+        assert positive == [], (
+            f"{len(positive)}/{len(first_evaluations)} entry votes were "
+            "positive -- with two venues there is no independent evidence to "
+            "be positive about"
         )
 
-    def test_every_entry_evaluation_saw_exactly_two_venues(self, first_evaluations):
-        counts = {p["detail"]["venues_priced"] for p in first_evaluations}
+    def test_every_entry_evaluation_is_exactly_neutral(self, first_evaluations):
+        signals = {p["signal"] for p in first_evaluations}
+        assert signals == {0.0}, signals
+
+    def test_every_entry_evaluation_saw_exactly_two_contributors(
+        self, first_evaluations
+    ):
+        counts = {p["detail"]["contributors"] for p in first_evaluations}
         assert counts == {2}, (
-            f"the simulated market is two-venue, so the tautology binds: {counts}"
+            f"the simulated market is two-venue, so no opportunity has an "
+            f"independent anchor: {counts}"
         )
 
-    def test_the_entry_votes_are_overwhelmingly_saturated(self, first_evaluations):
-        saturated = sum(1 for p in first_evaluations if p["signal"] >= 1.0)
-        share = saturated / len(first_evaluations)
-        assert share > 0.5, (
-            f"only {share:.1%} of entry votes saturated at +1"
-        )
+    def test_no_entry_evaluation_had_an_independent_contributor(
+        self, first_evaluations
+    ):
+        counts = {p["detail"]["independent_contributors"] for p in first_evaluations}
+        assert counts == {0}
 
 
-class TestRejectionComesFromReevaluation:
-    def test_every_negative_opinion_was_a_re_evaluation(self, rows):
-        negatives = [
+class TestEveryOpinionDeclinesToVote:
+    def test_no_opinion_anywhere_in_the_run_is_directional(self, rows):
+        directional = [
             (occurrence, payload["signal"])
             for _, occurrence, payload in rows
-            if payload["signal"] < 0
+            if payload["signal"] != 0.0
         ]
-        assert negatives, "the run produced some negative opinions"
-        assert all(occurrence > 1 for occurrence, _ in negatives), (
-            "a negative NORO opinion only ever arises after entry, when the "
-            "market has moved away from the opportunity's original legs"
+        assert directional == [], (
+            f"{len(directional)} directional votes on a two-venue market"
         )
 
-    def test_re_evaluation_is_where_noro_discriminates(self, re_evaluations):
-        assert re_evaluations
-        negative = sum(1 for p in re_evaluations if p["signal"] < 0)
-        assert negative > 0, (
-            "continuous re-evaluation is the one path where NORO's rejection "
-            "machinery actually fires in production"
+    def test_the_reason_code_is_always_the_breadth_one(self, rows):
+        codes = {tuple(payload["reason_codes"]) for _, _, payload in rows}
+        assert codes == {(INSUFFICIENT_INDEPENDENT_VALUATION_BREADTH,)}, codes
+
+    def test_no_confirmation_or_contradiction_is_ever_claimed(self, rows):
+        for _, _, payload in rows:
+            assert FAIR_VALUE_CONFIRMS_DISLOCATION not in payload["reason_codes"]
+            assert FAIR_VALUE_CONTRADICTS_DISLOCATION not in payload["reason_codes"]
+
+    def test_re_evaluation_declines_just_as_entry_does(self, re_evaluations):
+        """The audit found that all 48 rejections came from re-evaluation --
+        the one path where the tautology did not bind. That path now declines
+        for the same honest reason as entry.
+
+        Note the subset rather than equality: re-evaluations arise only while
+        an opportunity stays in flight, and a declined NORO vote can end that
+        earlier than a confirmed one did, so the set may legitimately be
+        empty. What must never appear in it is a directional vote.
+        """
+        assert {p["signal"] for p in re_evaluations} <= {0.0}
+
+
+class TestP3_8_ConfidenceIsNoLongerPinnedAtOne:
+    def test_confidence_is_the_configured_insufficient_breadth_value(
+        self, rows, settings
+    ):
+        confidences = {payload["confidence"] for _, _, payload in rows}
+        assert len(confidences) == 1, confidences
+        assert confidences.pop() == pytest.approx(
+            settings.noro.insufficient_breadth_confidence
         )
 
-
-class TestConfidenceIsSaturatedInPractice:
-    def test_confidence_is_essentially_always_one(self, rows):
-        confidences = [payload["confidence"] for _, _, payload in rows]
-        assert min(confidences) == pytest.approx(1.0), (
-            f"lowest confidence observed across the whole run: "
-            f"{min(confidences):.4f} -- the field carries no information here"
-        )
-
-    def test_because_simulated_liquidity_far_exceeds_the_hard_threshold(self, rows):
-        liquidity = [payload["detail"]["total_liquidity"] for _, _, payload in rows]
-        assert min(liquidity) > 250_000.0, (
-            "every observation is above the hard-coded $250k saturation point, "
-            "so the liquidity term is pinned at 1.0 throughout"
-        )
+    def test_it_is_far_below_the_old_pinned_value(self, rows):
+        """Measured across the whole audit run, the lowest confidence NORO
+        ever reported was 1.0. Every one of these is a fraction of that."""
+        assert max(payload["confidence"] for _, _, payload in rows) < 0.5
 
 
-class TestSignalDistribution:
-    def test_the_signal_lives_at_the_top_of_its_range(self, rows):
-        signals = [payload["signal"] for _, _, payload in rows]
-        saturated = sum(1 for s in signals if s >= 1.0)
-        assert saturated / len(signals) > 0.5, (
-            f"{saturated}/{len(signals)} opinions are exactly +1 -- above the "
-            "saturation point the signal stops distinguishing anything"
-        )
+class TestTheDetailExplainsTheDeclinedVote:
+    def test_it_names_the_contributors_it_did_have(self, first_evaluations):
+        for payload in first_evaluations:
+            assert payload["detail"]["contributor_venues"].count(",") == 1
 
-    def test_the_edge_routinely_exceeds_saturation_by_a_wide_margin(self, rows):
-        edges = [
-            payload["detail"]["confirmed_edge_bps"] for _, _, payload in rows
-        ]
-        saturation = load_settings().noro.saturation_bps
-        beyond = sum(1 for e in edges if e > 2 * saturation)
-        assert beyond / len(edges) > 0.5, (
-            f"{beyond}/{len(edges)} edges exceed twice saturation_bps "
-            f"({saturation}), so most of the measured signal is discarded by "
-            "the clamp"
-        )
+    def test_it_reports_no_benchmark(self, first_evaluations):
+        for payload in first_evaluations:
+            assert payload["detail"]["valuation_benchmark"] is None
+            assert payload["detail"]["weakest_confirmation_bps"] is None
+
+    def test_the_model_version_marks_the_new_semantics(self, rows):
+        versions = {payload["model_version"] for _, _, payload in rows}
+        assert versions == {"noro-0.2"}
+
+
+class TestFreshnessOnTheRealMarket:
+    def test_every_opinion_carries_a_contributor_timestamp(self, rows):
+        """P3-7: fail-closed means a published opinion always has one."""
+        for _, _, payload in rows:
+            assert payload["source_data_timestamp"] is not None
+
+    def test_the_stamp_never_leads_the_opinions_own_creation(self, rows):
+        for _, _, payload in rows:
+            assert payload["source_data_timestamp"] <= payload["created_at"]

@@ -157,12 +157,16 @@ class TestNoroSeesTheSnapshotThatCreatedTheOpportunity:
         )
         after = noro.evaluate(opp, START_MS)
 
-        assert at_detection.signal > 0
-        assert after.signal < 0, (
-            "the SAME opportunity is judged with opposite verdicts depending "
-            "only on which snapshot NORO last handled"
+        assert at_detection.signal == 0.0, (
+            "two venues, no independent evidence: NORO declines to vote"
         )
-        assert after.detail["fair_value"] != at_detection.detail["fair_value"]
+        assert after.signal < 0, (
+            "the SAME opportunity is judged differently depending only on "
+            "which snapshot NORO last handled -- the third venue turns a "
+            "declined vote into a contradiction"
+        )
+        assert at_detection.detail["valuation_benchmark"] is None
+        assert after.detail["valuation_benchmark"] is not None
 
     def test_the_opportunity_carries_no_snapshot_reference(self, config):
         """Why NORO cannot defend itself: nothing on the Opportunity says
@@ -217,15 +221,20 @@ class TestContinuousReevaluationIsDeliberate:
         cheap NOW", not "was it cheap at birth". A stale reference price on
         the opportunity cannot mislead it."""
         noro = build_noro(config)
-        noro.on_market_state(market(venue("A", 100.0), venue("B", 100.2)))
+        # Three venues, so the opinion is directional and the comparison has
+        # something to compare.
+        noro.on_market_state(
+            market(venue("A", 100.0), venue("B", 100.2), venue("C", 100.1))
+        )
         realistic = opportunity("A", "B", buy_price=100.0, sell_price=100.2)
         nonsense = opportunity("A", "B", buy_price=1.0, sell_price=999_999.0)
         assert noro.evaluate(realistic, START_MS).signal == pytest.approx(
             noro.evaluate(nonsense, START_MS).signal
         )
+        assert noro.evaluate(realistic, START_MS).signal != 0.0
 
     def test_the_source_confirms_leg_prices_are_unread(self, config):
-        source = inspect.getsource(build_noro(config).evaluate)
+        source = inspect.getsource(type(build_noro(config)))
         assert "leg.venue" in source
         assert "leg.side" in source
         assert "reference_price" not in source
@@ -281,8 +290,9 @@ class TestCorrelationIntegrity:
         btc = noro.evaluate(opportunity("A", "B", symbol=SYMBOL), START_MS)
         eth = noro.evaluate(opportunity("A", "B", symbol="ETH-USD"), START_MS)
         assert btc.symbol == SYMBOL and eth.symbol == "ETH-USD"
-        assert btc.detail["fair_value"] == pytest.approx(100.1)
-        assert eth.detail["fair_value"] == pytest.approx(3_015.0)
+        assert btc.detail["price_A"] == pytest.approx(100.0)
+        assert eth.detail["price_A"] == pytest.approx(3_000.0)
+        assert btc.detail["contributor_venues"] == eth.detail["contributor_venues"]
         assert btc.correlation_id != eth.correlation_id
 
     def test_back_to_back_opportunities_do_not_contaminate_each_other(
@@ -303,7 +313,9 @@ class TestCorrelationIntegrity:
         ]
         assert opinions[0].detail == opinions[2].detail
         assert opinions[1].detail == opinions[3].detail
-        assert opinions[0].detail["fair_value"] != opinions[1].detail["fair_value"]
+        assert opinions[0].detail["price_A"] != opinions[1].detail["price_A"], (
+            "the two symbols are priced from their own venues, not each other's"
+        )
 
     def test_every_opinion_is_stamped_noro(self, config):
         noro = build_noro(config)

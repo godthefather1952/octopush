@@ -1,43 +1,63 @@
-"""Phase 3 audit, Sections 12-14 / 26-27 / 38-39: does NORO add information?
+"""P3-4 / P3-5 regression: does NORO add information?
 
-The question this phase exists to answer. NORO is a REQUIRED consensus agent
+The question Phase 3 existed to answer. NORO is a REQUIRED consensus agent
 with weight 1.5, so its vote can suspend or carry a trade. That is only worth
 paying for if its answer is not already implied by the detector's question.
 
-**H4 -- the two-venue structure.** With exactly two contributors and positive
-weights, fair value is a convex combination of the two prices, so it lies
-strictly between them. If the detector's buy venue is also the cheaper venue
-by NORO's price measure, both confirmations are positive *by construction* and
-NORO cannot disagree. This suite derives the closed form, then measures how
-often the escape hatch -- the detector uses touch prices, NORO uses
-mid/microprice -- actually fires.
+**What the audit found (P3-4).** It was implied. The detector emits an
+opportunity only when the buy venue's ``best_ask`` is strictly below the sell
+venue's ``best_bid`` -- that is what a positive gross edge *means* -- so the
+two venues' quote intervals are disjoint. ``venue_price`` is a convex blend of
+mid and microprice, both of which lie inside ``[best_bid, best_ask]``.
+Therefore ``price_buy < price_sell`` for every opportunity the detector can
+emit; a fair value formed from those two prices lies strictly between them;
+and both confirmations are positive **by construction**. Measured: 0
+rejections in 25,027 random two-venue opportunities, and 82 positive entry
+votes out of 82 in production.
 
-**H5 -- self-inclusion.** Every venue is judged against a benchmark it is
-itself part of, weighted by its own liquidity. A deep venue therefore helps
-decide whether it is an outlier.
+**What the audit found (P3-5).** Every venue was judged against a benchmark it
+was itself part of, weighted by its own raw depth, so a deep venue helped
+decide whether it was an outlier -- and at extreme dominance simply became the
+benchmark.
 
-The audit-only comparators in ``helpers`` (leave-one-out, median, weighted
-median, trimmed mean) exist to size those effects. None is a recommendation.
+**What the remediation did.** The benchmark is built from the venues *not*
+participating in the opportunity, and the estimator is a reliability-weighted
+median with weights bounded at 1.0. When no independent venue exists, NORO
+returns an explicit neutral opinion instead of a confirmation it did not earn.
+
+The audit-only comparators in ``helpers`` (leave-one-out, weighted mean,
+median, trimmed mean) are retained to show what the pre-remediation estimator
+would have done on the same inputs.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from agents.noro.agent import (
+    FAIR_VALUE_CONFIRMS_DISLOCATION,
+    FAIR_VALUE_CONTRADICTS_DISLOCATION,
+    INSUFFICIENT_INDEPENDENT_VALUATION_BREADTH,
+)
 from core.config import NoroConfig
 from tests.audit.helpers import (
     SYMBOL,
     contributors,
     fair_of,
-    leave_one_out,
+    independent_of,
     median_price,
     trimmed_mean,
     venue,
     weighted_mean,
-    weighted_median,
-    weights,
 )
 from tests.audit.noro_fixtures import opinion_for
+
+ANCHOR = 100.0
+
+#: Depth at which every venue is past the reliability saturation point, so
+#: contributor weights are all exactly 1.0 and the weighted median reduces to
+#: the plain median. Used where a test is about ORDERING, not weighting.
+SATURATED = 200_000.0
 
 
 @pytest.fixture
@@ -45,180 +65,96 @@ def config() -> NoroConfig:
     return NoroConfig()
 
 
-def confirmations_for(fair, buy_venue: str, sell_venue: str) -> tuple[float, float]:
-    """Exactly what ``Noro.evaluate`` computes for a BUY/SELL pair."""
-    return (-fair.deviation(buy_venue), fair.deviation(sell_venue))
+def anchored(buy_bps: float, sell_bps: float, *, liquidity: float = 100_000.0) -> list:
+    """A (BUY), B (SELL) and C, an independent anchor at ``ANCHOR``.
+
+    Only C survives the opportunity-venue exclusion, so the benchmark is
+    exactly C's price and ``confirmation(A) = buy_bps``,
+    ``confirmation(B) = sell_bps``.
+    """
+    return [
+        venue("A", ANCHOR * (1 - buy_bps / 10_000), liquidity=liquidity),
+        venue("B", ANCHOR * (1 + sell_bps / 10_000), liquidity=liquidity),
+        venue("C", ANCHOR, liquidity=liquidity),
+    ]
 
 
 # ======================================================================
-# Section 12 — H4: the two-venue closed form
+# P3-4 — the two-venue tautology, closed
 # ======================================================================
 
 
-class TestH4_TwoVenueClosedForm:
-    def test_fair_value_lies_strictly_between_two_contributors(self, config):
-        for gap in (0.5, 1.0, 5.0, 50.0, 500.0):
-            states = [
-                venue("A", 100.0, liquidity=17_000.0),
-                venue("B", 100.0 * (1 + gap / 10_000), liquidity=83_000.0),
-            ]
-            fair = fair_of(states, config)
-            assert 100.0 < fair.fair_value < states[1].metrics.mid
+class TestP3_4_TwoVenuesProduceNoConfirmation:
+    """The central regression of the whole remediation.
 
-    def test_both_confirmations_are_positive_whenever_buy_price_is_lower(self, config):
-        """The tautology, stated exactly: when NORO's own price ordering
-        agrees with the trade direction, NORO cannot disagree."""
-        for w_a in (0.001, 0.1, 0.5, 0.9, 0.999):
-            liquidity = 1_000_000.0
-            states = [
-                venue("A", 100.0, liquidity=liquidity * w_a),
-                venue("B", 100.10, liquidity=liquidity * (1 - w_a)),
-            ]
-            fair = fair_of(states, config)
-            buy_conf, sell_conf = confirmations_for(fair, "A", "B")
-            assert buy_conf > 0 and sell_conf > 0, (
-                f"w_A={w_a}: ({buy_conf:.3f}, {sell_conf:.3f})"
-            )
-
-    def test_the_confirmations_are_exactly_the_gap_times_the_other_weight(
-        self, config
-    ):
-        """``-dev_A = w_B * G`` and ``dev_B = w_A * G``, where G is the raw
-        price gap in bps measured against fair value. Everything NORO adds in
-        the two-venue case is contained in that pair of weights."""
-        states = [
-            venue("A", 100.0, liquidity=250_000.0),
-            venue("B", 100.20, liquidity=750_000.0),
-        ]
-        fair = fair_of(states, config)
-        gap_bps = (states[1].metrics.mid - states[0].metrics.mid) / fair.fair_value * 10_000
-        w = weights(fair)
-        buy_conf, sell_conf = confirmations_for(fair, "A", "B")
-        assert buy_conf == pytest.approx(w["B"] * gap_bps, rel=1e-9)
-        assert sell_conf == pytest.approx(w["A"] * gap_bps, rel=1e-9)
-
-    def test_the_mean_term_is_exactly_half_the_gap_regardless_of_weighting(
-        self, config
-    ):
-        """The structural result. ``mean(confirmations) = G/2`` for every
-        weighting, so half of NORO's edge is the detector's own price gap,
-        re-expressed. Only ``min(confirmations) = min(w_A, w_B) * G`` carries
-        any liquidity information at all."""
-        for w_a in (0.01, 0.25, 0.5, 0.75, 0.99):
-            liquidity = 1_000_000.0
-            states = [
-                venue("A", 100.0, liquidity=liquidity * w_a),
-                venue("B", 100.20, liquidity=liquidity * (1 - w_a)),
-            ]
-            fair = fair_of(states, config)
-            gap = (states[1].metrics.mid - states[0].metrics.mid) / fair.fair_value * 10_000
-            buy_conf, sell_conf = confirmations_for(fair, "A", "B")
-            assert (buy_conf + sell_conf) / 2 == pytest.approx(gap / 2, rel=1e-9)
-
-    def test_the_edge_is_bounded_between_one_and_two_times_half_the_gap(
-        self, config
-    ):
-        """``edge = G * (min(w_A, w_B) + 1/2)``, so it spans exactly
-        ``[G/2, G]``. NORO's entire two-venue contribution is a factor-of-two
-        modulation of the detector's number."""
-        for w_a in (0.001, 0.1, 0.3, 0.5, 0.7, 0.9, 0.999):
-            liquidity = 1_000_000.0
-            states = [
-                venue("A", 100.0, liquidity=liquidity * w_a),
-                venue("B", 100.20, liquidity=liquidity * (1 - w_a)),
-            ]
-            fair = fair_of(states, config)
-            gap = (states[1].metrics.mid - states[0].metrics.mid) / fair.fair_value * 10_000
-            w = weights(fair)
-            opinion = opinion_for(states, config, "A", "B")
-            edge = opinion.detail["confirmed_edge_bps"]
-            assert edge == pytest.approx(gap * (min(w.values()) + 0.5), rel=1e-6)
-            assert gap * 0.5 - 1e-9 <= edge <= gap * 1.0 + 1e-9
-
-    def test_a_two_venue_signal_is_never_negative_when_prices_order_correctly(
-        self, config
-    ):
-        for gap in (0.1, 1.0, 4.0, 10.0, 100.0):
-            for w_a in (0.01, 0.5, 0.99):
-                liquidity = 1_000_000.0
-                states = [
-                    venue("A", 100.0, liquidity=liquidity * w_a),
-                    venue("B", 100.0 * (1 + gap / 10_000),
-                          liquidity=liquidity * (1 - w_a)),
-                ]
-                assert opinion_for(states, config, "A", "B").signal > 0
-
-
-class TestH4_TheTautologyIsComplete:
-    """There is NO escape hatch for a two-venue detector opportunity.
-
-    The hope was that the detector and NORO measure different prices -- the
-    detector picks the cheapest ``best_ask`` and the richest ``best_bid``,
-    NORO uses a mid/microprice blend -- so a wide or lopsided spread might
-    put the detector's buy venue ABOVE the sell venue by NORO's measure, and
-    NORO could then genuinely disagree.
-
-    It cannot happen, and the reason is a two-line proof:
-
-    1. The detector only emits an opportunity when
-       ``sell_bid - buy_ask > 0``. So the two venues' quote intervals are
-       DISJOINT, with the buy venue's entirely below the sell venue's.
-    2. ``venue_price`` is a convex blend of ``mid`` and ``microprice``, and
-       both of those lie within ``[best_bid, best_ask]`` (the microprice is
-       ``(bid*ask_size + ask*bid_size)/(bid_size+ask_size)``, a convex
-       combination of the two touch prices).
-
-    Therefore ``price_buy < price_sell`` for every opportunity the detector
-    can emit, fair value lies strictly between them, and both confirmations
-    are strictly positive. NORO's two-venue vote is positive by construction.
+    Before: a two-venue opportunity was confirmed by construction, with a
+    near-saturated signal and confidence around 1.0. Now NORO says it has no
+    independent evidence, and neither confirms nor contradicts.
     """
 
-    def test_a_positive_detector_edge_means_disjoint_quote_intervals(self, config):
-        from strategies.cross_venue.detector import find_dislocation
+    @staticmethod
+    def _pair(gap_bps: float = 20.0, liquidity: float = 100_000.0):
+        return [
+            venue("A", ANCHOR, liquidity=liquidity),
+            venue("B", ANCHOR * (1 + gap_bps / 10_000), liquidity=liquidity),
+        ]
 
-        a = venue("A", 100.0, best_bid=99.90, best_ask=100.00, liquidity=100_000.0)
-        b = venue("B", 100.2, best_bid=100.10, best_ask=100.30, liquidity=100_000.0)
-        dislocation = find_dislocation(SYMBOL, [a, b], None)
-        assert dislocation.gross_edge_bps > 0
-        assert a.metrics.best_ask < b.metrics.best_bid, (
-            "a positive edge IS the statement that the intervals are disjoint"
-        )
+    def test_noro_still_answers(self, config):
+        """Missing is not neutral. NORO is required, so silence would suspend
+        the strategy on the commonest market there is."""
+        assert opinion_for(self._pair(), config, "A", "B") is not None
 
-    def test_venue_price_always_lies_inside_the_touch(self, config):
-        """Step 2 of the proof, checked against the production function."""
-        from agents.noro.fair_value import venue_price
+    def test_the_signal_is_exactly_neutral(self, config):
+        opinion = opinion_for(self._pair(), config, "A", "B")
+        assert opinion.signal == 0.0
 
-        for micro_position in (0.0, 0.25, 0.5, 0.75, 1.0):
-            bid, ask = 99.0, 100.0
-            micro = bid + micro_position * (ask - bid)
-            state = venue(
-                "A", (bid + ask) / 2, best_bid=bid, best_ask=ask, microprice=micro
-            )
-            for weight in (0.0, 0.3, 0.5, 0.9, 1.0):
-                price = venue_price(state, weight)
-                assert bid <= price <= ask
+    def test_the_confidence_is_the_configured_insufficient_breadth_value(self, config):
+        opinion = opinion_for(self._pair(), config, "A", "B")
+        assert opinion.confidence == pytest.approx(config.insufficient_breadth_confidence)
 
-    def test_the_microprice_weight_cannot_break_it_either(self, config):
-        """Even at ``microprice_weight=1`` -- the most aggressive setting --
-        the buy venue's price stays below the sell venue's."""
-        from agents.noro.fair_value import venue_price
+    def test_the_breadth_reason_code_is_emitted(self, config):
+        opinion = opinion_for(self._pair(), config, "A", "B")
+        assert INSUFFICIENT_INDEPENDENT_VALUATION_BREADTH in opinion.reason_codes
 
-        buy = venue("A", 99.95, best_bid=99.90, best_ask=100.00, microprice=100.00)
-        sell = venue("B", 100.20, best_bid=100.10, best_ask=100.30, microprice=100.10)
-        for weight in (0.0, 0.5, 1.0):
-            assert venue_price(buy, weight) < venue_price(sell, weight)
+    def test_no_confirmation_is_claimed(self, config):
+        opinion = opinion_for(self._pair(), config, "A", "B")
+        assert FAIR_VALUE_CONFIRMS_DISLOCATION not in opinion.reason_codes
+        assert FAIR_VALUE_CONTRADICTS_DISLOCATION not in opinion.reason_codes
+
+    @pytest.mark.parametrize("gap_bps", [0.1, 1.0, 4.0, 10.0, 50.0, 100.0, 500.0])
+    def test_no_gap_however_wide_produces_a_positive_vote(self, config, gap_bps):
+        """The old suite asserted the opposite of this line: that a two-venue
+        signal was *never negative* when prices ordered correctly. It is now
+        never positive either -- it carries no direction at all."""
+        assert opinion_for(self._pair(gap_bps), config, "A", "B").signal == 0.0
+
+    @pytest.mark.parametrize("liquidity", [1_000.0, 100_000.0, 10_000_000.0])
+    def test_depth_cannot_manufacture_a_vote(self, config, liquidity):
+        assert opinion_for(self._pair(20.0, liquidity), config, "A", "B").signal == 0.0
+
+    def test_there_is_no_independent_benchmark_to_build(self, config):
+        assert independent_of(self._pair(), config, exclude=("A", "B")) is None
+
+    def test_the_diagnostic_valuation_still_exists(self, config):
+        """The symbol-wide fair value is kept for health and observability;
+        it is simply never what an opportunity is judged against."""
+        fair = fair_of(self._pair(), config)
+        assert fair is not None
+        assert {v.venue for v in fair.venues} == {"A", "B"}
+
+
+class TestP3_4_AgainstTheRealDetector:
+    """The empirical companion, over the same random search the audit ran.
+
+    The old assertion was ``rejected == 0`` -- the tautology, measured. The
+    new one is stronger and opposite in spirit: not one of these detector-real
+    opportunities produces a directional vote at all.
+    """
 
     @pytest.mark.parametrize("microprice_weight", [0.0, 0.5, 1.0])
-    def test_an_exhaustive_random_search_finds_no_rejection(
+    def test_no_two_venue_opportunity_receives_a_directional_vote(
         self, microprice_weight
     ):
-        """The empirical companion to the proof.
-
-        Random two-venue books, filtered to those the detector would actually
-        emit (edge >= ``min_dislocation_bps``), across the full range of
-        spreads and microprice positions. Not one produces a non-positive
-        NORO signal.
-        """
         import random
 
         from strategies.cross_venue.detector import find_dislocation
@@ -226,7 +162,7 @@ class TestH4_TheTautologyIsComplete:
         config = NoroConfig(microprice_weight=microprice_weight)
         rng = random.Random(11)
         emitted = 0
-        rejected = 0
+        directional = 0
         for _ in range(4_000):
             bid_a = rng.uniform(99.0, 101.0)
             spread_a = rng.uniform(0.0005, 0.6)
@@ -250,293 +186,265 @@ class TestH4_TheTautologyIsComplete:
             opinion = opinion_for(
                 [a, b], config, dislocation.buy_venue, dislocation.sell_venue
             )
-            if opinion is not None and opinion.signal <= 0:
-                rejected += 1
+            if opinion is not None and opinion.signal != 0.0:
+                directional += 1
         assert emitted > 1_000, f"only {emitted} opportunities generated"
-        assert rejected == 0, (
-            f"{rejected}/{emitted} rejections -- the proof above says zero"
+        assert directional == 0, (
+            f"{directional}/{emitted} two-venue opportunities produced a "
+            "directional NORO vote; with no independent evidence there is "
+            "nothing to be directional about"
         )
-
-    def test_noro_can_still_reject_when_the_detector_would_not_have_asked(
-        self, config
-    ):
-        """Completeness: NORO's rejection machinery works. It is simply
-        unreachable for a two-venue opportunity, because the only inputs that
-        trigger it are inputs the detector filters out first."""
-        from strategies.cross_venue.detector import find_dislocation
-
-        a = venue("A", 99.5, best_bid=99.0, best_ask=100.0, microprice=100.0,
-                  liquidity=100_000.0)
-        b = venue("B", 99.76, best_bid=99.51, best_ask=100.01, microprice=99.51,
-                  liquidity=100_000.0)
-        dislocation = find_dislocation(SYMBOL, [a, b], None)
-        assert dislocation.gross_edge_bps < 0, (
-            "overlapping quotes -- the detector would never emit this"
-        )
-        opinion = opinion_for([a, b], config, dislocation.buy_venue,
-                              dislocation.sell_venue)
-        assert opinion.signal < 0, "...and NORO would have rejected it"
 
 
 # ======================================================================
-# Section 14 — three or more venues
+# P3-4 — with a third venue, NORO becomes informative
 # ======================================================================
 
 
-class TestThreePlusVenuesCanDisagree:
-    def test_a_third_venue_clustering_with_the_sell_side_kills_the_trade(
-        self, config
-    ):
-        """Two venues: confirmed. Add a third that says the "rich" venue is
-        the normal one and the "cheap" venue is the outlier -- and NORO
-        reverses."""
-        a = venue("A", 100.00, liquidity=100_000.0)
-        b = venue("B", 100.20, liquidity=100_000.0)
-        assert opinion_for([a, b], config, "A", "B").signal > 0
+class TestP3_4_ThreeVenuesCarryInformation:
+    def test_case_a_an_independent_anchor_can_confirm(self, config):
+        """A below the anchor, B above it: both legs independently supported."""
+        opinion = opinion_for(anchored(10.0, 10.0), config, "A", "B")
+        assert opinion.signal > 0
+        assert FAIR_VALUE_CONFIRMS_DISLOCATION in opinion.reason_codes
+        assert opinion.detail["independent_venues"] == "C"
 
-        c = venue("C", 100.50, liquidity=800_000.0)
-        with_third = opinion_for([a, b, c], config, "A", "B")
-        assert with_third.signal < 0, (
-            f"the third venue turned a confirmed trade into a rejection: "
-            f"{with_third.signal:+.3f}"
-        )
-
-    def test_a_third_venue_between_them_leaves_it_confirmed(self, config):
-        a = venue("A", 100.00, liquidity=100_000.0)
-        b = venue("B", 100.20, liquidity=100_000.0)
-        c = venue("C", 100.10, liquidity=800_000.0)
-        assert opinion_for([a, b, c], config, "A", "B").signal > 0
-
-    def test_a_third_venue_clustering_with_the_buy_side_strengthens_it(
-        self, config
-    ):
-        a = venue("A", 100.00, liquidity=100_000.0)
-        b = venue("B", 100.20, liquidity=100_000.0)
-        two = opinion_for([a, b], config, "A", "B").signal
-        c = venue("C", 100.00, liquidity=800_000.0)
-        three = opinion_for([a, b, c], config, "A", "B").signal
-        assert three < two, (
-            "the sell leg is now far above fair value while the buy leg is "
-            "at it, so min(confirmations) collapses -- the edge falls even "
-            "though the third venue AGREES the buy venue is cheap"
-        )
-
-    def test_rejection_needs_a_third_venue_or_a_spread_inversion(self, config):
-        """The headline contrast for Section 14: with matched spreads, a
-        two-venue NORO cannot reject; a three-venue NORO can."""
-        a = venue("A", 100.00, spread_bps=2.0, liquidity=100_000.0)
-        b = venue("B", 100.20, spread_bps=2.0, liquidity=100_000.0)
-        outlier_anchor = venue("C", 100.50, spread_bps=2.0, liquidity=900_000.0)
-        assert opinion_for([a, b], config, "A", "B").signal > 0
-        assert opinion_for([a, b, outlier_anchor], config, "A", "B").signal < 0
-
-
-class TestRejectionIsReachableButVanishinglyRare:
-    """The measured answer to "can NORO ever reject a real opportunity?".
-
-    ``scripts/audit_noro_information_value.py`` runs the real detector and
-    the real agent over seeded random books:
-
-        venues   opportunities   rejected      rate
-             2          25,027          0    0.000%
-             3          35,311         13    0.037%
-             4          38,699          6    0.016%
-             5          39,650          0    0.000%
-             8          39,994          0    0.000%
-
-    Two venues: never, and provably so. Three or four: about one in three
-    thousand. Five or more: not observed -- with more venues the extremes get
-    more extreme and fair value falls back inside the interval.
-    """
-
-    def test_a_concrete_detector_driven_three_venue_rejection(self, config):
-        """One of the rare cases, pinned exactly.
-
-        V2 has a WIDE spread straddling both other venues: its bid does not
-        win the sell leg and its ask does not win the buy leg, so the detector
-        still targets V0 -> V1 -- but its mid pulls fair value ABOVE the sell
-        venue, so the sell leg lands on the wrong side.
-        """
-        from strategies.cross_venue.detector import find_dislocation
-
+    def test_case_b_an_independent_anchor_can_contradict(self, config):
+        """The anchor sits above BOTH opportunity venues, so the sell leg is
+        on the wrong side of it. NORO could not reach this verdict at all
+        before the remediation."""
         states = [
-            venue("V0", 100.3488, best_bid=100.3461, best_ask=100.3515,
-                  liquidity=3_475_515.0),
-            venue("V1", 100.4560, best_bid=100.3980, best_ask=100.5140,
-                  liquidity=362_187.0),
-            venue("V2", 100.7945, best_bid=100.3963, best_ask=101.1926,
-                  liquidity=4_210_864.0),
+            venue("A", 100.00, liquidity=100_000.0),
+            venue("B", 100.20, liquidity=100_000.0),
+            venue("C", 100.50, liquidity=100_000.0),
         ]
-        dislocation = find_dislocation(SYMBOL, states, None)
-        assert (dislocation.buy_venue, dislocation.sell_venue) == ("V0", "V1"), (
-            "the wide-spread anchor wins neither extreme"
-        )
-        assert dislocation.gross_edge_bps > 4.0, "the detector would emit this"
+        opinion = opinion_for(states, config, "A", "B")
+        assert opinion.signal < 0
+        assert FAIR_VALUE_CONTRADICTS_DISLOCATION in opinion.reason_codes
 
-        fair = fair_of(states, config)
-        assert fair.fair_value > 100.46, (
-            "the anchor pulled fair value ABOVE the sell venue"
-        )
-        opinion = opinion_for(states, config, "V0", "V1")
-        assert opinion.signal < 0, (
-            f"NORO rejected a real detector opportunity: {opinion.signal:+.3f}"
-        )
-        assert "FAIR_VALUE_CONTRADICTS_DISLOCATION" in opinion.reason_codes
+    def test_case_c_a_strong_leg_cannot_outvote_a_weak_contradiction(self, config):
+        """P3-2 and P3-4 meeting: the buy leg is confirmed by 30 bps, the sell
+        leg contradicted by half a basis point, and the verdict is negative."""
+        opinion = opinion_for(anchored(30.0, -0.5), config, "A", "B")
+        assert opinion.detail["confirmation_bps_A"] == pytest.approx(30.0, abs=1e-2)
+        assert opinion.detail["confirmation_bps_B"] == pytest.approx(-0.5, abs=1e-2)
+        assert opinion.signal < 0
 
-    def test_the_same_market_without_the_anchor_is_confirmed(self, config):
-        """Isolating the anchor's contribution: remove it and NORO agrees."""
+    def test_the_same_pair_flips_verdict_with_the_anchor_moved(self, config):
+        """The information NORO now adds, isolated: identical opportunity
+        venues, one independent venue moved, opposite verdicts."""
         pair = [
-            venue("V0", 100.3488, best_bid=100.3461, best_ask=100.3515,
-                  liquidity=3_475_515.0),
-            venue("V1", 100.4560, best_bid=100.3980, best_ask=100.5140,
-                  liquidity=362_187.0),
+            venue("A", 100.00, liquidity=100_000.0),
+            venue("B", 100.20, liquidity=100_000.0),
         ]
-        assert opinion_for(pair, config, "V0", "V1").signal > 0
+        below = opinion_for([*pair, venue("C", 100.10, liquidity=100_000.0)], config, "A", "B")
+        above = opinion_for([*pair, venue("C", 100.50, liquidity=100_000.0)], config, "A", "B")
+        assert below.signal > 0
+        assert above.signal < 0
 
-    def test_the_anchor_must_win_neither_extreme_to_have_any_effect(self, config):
-        """Why the rate is so low: a TIGHT venue priced outside the interval
-        simply becomes the new extreme, and the detector re-targets onto it --
-        producing a fresh pair that NORO confirms as usual."""
-        from strategies.cross_venue.detector import find_dislocation
-
-        a = venue("A", 100.00, spread_bps=2.0, liquidity=100_000.0)
-        b = venue("B", 100.20, spread_bps=2.0, liquidity=100_000.0)
-        tight_anchor = venue("C", 100.60, spread_bps=2.0, liquidity=900_000.0)
-        dislocation = find_dislocation(SYMBOL, [a, b, tight_anchor], None)
-        assert dislocation.sell_venue == "C", "the detector re-targeted"
-        assert opinion_for(
-            [a, b, tight_anchor], config, dislocation.buy_venue,
-            dislocation.sell_venue,
-        ).signal > 0
+    def test_a_fourth_venue_still_judges_from_outside_the_opportunity(self, config):
+        states = [
+            venue("A", 100.00, liquidity=100_000.0),
+            venue("B", 100.20, liquidity=100_000.0),
+            venue("C", 100.08, liquidity=100_000.0),
+            venue("D", 100.12, liquidity=100_000.0),
+        ]
+        opinion = opinion_for(states, config, "A", "B")
+        assert opinion.detail["independent_venues"] == "C,D"
+        assert opinion.detail["independent_contributors"] == 2
+        assert opinion.signal > 0
 
 
 # ======================================================================
-# Section 15 / 38 — H5: self-inclusion
+# P3-5 — self-inclusion is structurally impossible
 # ======================================================================
 
 
-class TestH5_SelfInclusion:
-    def test_the_deepest_venue_pulls_the_benchmark_onto_itself(self, config):
-        deep = venue("A", 100.0, liquidity=1_000_000.0)
-        thin = venue("B", 101.0, liquidity=10_000.0)
-        fair = fair_of([deep, thin], config)
-        assert abs(fair.deviation("A")) == pytest.approx(0.99, abs=0.05), (
-            "the deep venue looks nearly fair -- it IS the benchmark"
-        )
-        assert abs(fair.deviation("B")) == pytest.approx(99.0, abs=0.5), (
-            "the thin one absorbs essentially the whole 100 bps gap"
-        )
-        assert abs(fair.deviation("B")) > 90 * abs(fair.deviation("A")), (
-            "a 100:1 liquidity ratio becomes a 100:1 blame ratio"
-        )
-
-    def test_reversing_the_liquidity_reverses_who_looks_like_the_outlier(
-        self, config
-    ):
-        """Identical prices, opposite depth: the SAME price pair produces
-        opposite verdicts about which venue is mispriced."""
-        thin_cheap = fair_of(
-            [venue("A", 100.0, liquidity=10_000.0), venue("B", 101.0, liquidity=1_000_000.0)],
-            config,
-        )
-        deep_cheap = fair_of(
-            [venue("A", 100.0, liquidity=1_000_000.0), venue("B", 101.0, liquidity=10_000.0)],
-            config,
-        )
-        # 98.04 rather than 99.0: deviations are measured against fair value,
-        # which sits at the DEEP venue's price in each case, so the two are
-        # mirror images scaled by slightly different denominators.
-        assert abs(thin_cheap.deviation("A")) == pytest.approx(98.04, abs=0.5), (
-            "thin and cheap: A is the outlier"
-        )
-        assert abs(deep_cheap.deviation("A")) == pytest.approx(0.99, abs=0.05), (
-            "deep and cheap: the SAME price is now the benchmark"
-        )
-
-    @pytest.mark.parametrize("share", [0.01, 0.10, 0.50, 0.90, 0.99])
-    def test_an_outliers_own_weight_shrinks_its_measured_deviation(
-        self, config, share
-    ):
-        """Section 27: how easily can one deep outlier move the benchmark it
-        is judged by?"""
-        total = 1_000_000.0
-        states = [
-            venue("A", 100.0, liquidity=total * (1 - share) / 2),
-            venue("B", 100.0, liquidity=total * (1 - share) / 2),
-            venue("C", 150.0, liquidity=total * share),
+class TestP3_5_SelfInclusionIsClosed:
+    @staticmethod
+    def _four():
+        return [
+            venue("A", 100.00, liquidity=100_000.0),
+            venue("B", 100.20, liquidity=100_000.0),
+            venue("C", 100.08, liquidity=100_000.0),
+            venue("D", 100.12, liquidity=100_000.0),
         ]
-        fair = fair_of(states, config)
-        self_inclusive = abs(fair.deviation("C"))
-        items = contributors(states, config)
-        loo = leave_one_out(items, "C")
-        left_out = abs((150.0 - loo) / loo * 10_000)
-        assert left_out > self_inclusive, (
-            "excluding itself always makes an outlier look more extreme"
-        )
-        if share >= 0.9:
-            assert self_inclusive < left_out / 5, (
-                f"at {share:.0%} of the liquidity the outlier's own deviation "
-                f"is measured as {self_inclusive:.0f} bps instead of "
-                f"{left_out:.0f} bps"
-            )
 
-    def test_at_extreme_dominance_the_outlier_becomes_the_benchmark(self, config):
+    def test_opportunity_venues_are_absent_from_the_benchmark(self, config):
+        benchmark = independent_of(self._four(), config, exclude=("A", "B"))
+        assert [v.venue for v in benchmark.venues] == ["C", "D"]
+
+    def test_the_agent_reports_the_same_contributor_set(self, config):
+        opinion = opinion_for(self._four(), config, "A", "B")
+        independent = opinion.detail["independent_venues"].split(",")
+        assert independent == ["C", "D"]
+        assert "A" not in independent and "B" not in independent
+
+    @pytest.mark.parametrize("depth", [1_000.0, 100_000.0, 50_000_000.0])
+    def test_changing_an_opportunity_venues_depth_cannot_move_the_benchmark(
+        self, config, depth
+    ):
+        """P3-5's core property. A venue under judgement has no influence on
+        the number judging it, however deep it is."""
         states = [
-            venue("A", 100.0, liquidity=1_000.0),
-            venue("B", 100.0, liquidity=1_000.0),
+            venue("A", 100.00, liquidity=depth),
+            venue("B", 100.20, liquidity=depth),
+            venue("C", 100.08, liquidity=100_000.0),
+            venue("D", 100.12, liquidity=100_000.0),
+        ]
+        benchmark = independent_of(states, config, exclude=("A", "B"))
+        reference = independent_of(self._four(), config, exclude=("A", "B"))
+        assert benchmark.fair_value == pytest.approx(reference.fair_value)
+
+    @pytest.mark.parametrize("price", [50.0, 100.0, 100.2, 500.0])
+    def test_changing_an_opportunity_venues_price_cannot_move_it_either(
+        self, config, price
+    ):
+        states = [
+            venue("A", price, liquidity=100_000.0),
+            venue("B", 100.20, liquidity=100_000.0),
+            venue("C", 100.08, liquidity=100_000.0),
+            venue("D", 100.12, liquidity=100_000.0),
+        ]
+        benchmark = independent_of(states, config, exclude=("A", "B"))
+        assert benchmark.fair_value == pytest.approx(100.10, abs=1e-6), (
+            "the benchmark is C and D, and only C and D"
+        )
+
+    def test_an_outlier_can_no_longer_become_its_own_benchmark(self, config):
+        """The old extreme case: a venue holding 10M of depth against two
+        venues holding 1k each *became* fair value, and the two agreeing
+        venues were reported as the outliers.
+
+        Bounded weights end that wherever the other venues are themselves
+        credible. Note what the bound does and does not claim: it caps
+        *influence*, so a 10,000x depth advantage buys the same single vote as
+        anyone else past saturation. It does not promote a venue with almost
+        no near-touch depth, which remains genuinely weak evidence.
+        """
+        states = [
+            venue("A", 100.0, liquidity=SATURATED),
+            venue("B", 100.0, liquidity=SATURATED),
             venue("C", 1_000.0, liquidity=10_000_000.0),
         ]
         fair = fair_of(states, config)
-        assert fair.fair_value > 999, "the outlier IS fair value now"
-        assert abs(fair.deviation("C")) < 20
-        assert abs(fair.deviation("A")) > 8_000, (
-            "the two agreeing venues are reported as the outliers"
+        assert fair.fair_value == pytest.approx(100.0), (
+            "two agreeing venues outvote one enormous outlier"
         )
+        assert abs(fair.deviation_of(1_000.0)) > 8_000, "C is the outlier, and says so"
 
 
-class TestLeaveOneOutComparison:
-    """Section 38: audit-only comparator, quantified. No migration implied."""
+# ======================================================================
+# The estimator: a reliability-weighted median
+# ======================================================================
 
-    SCENARIOS = [
-        ("balanced three", [(100.0, 100_000.0), (100.0, 100_000.0), (100.5, 100_000.0)]),
-        ("deep outlier", [(100.0, 50_000.0), (100.0, 50_000.0), (150.0, 900_000.0)]),
-        ("thin outlier", [(100.0, 500_000.0), (100.0, 500_000.0), (150.0, 1_000.0)]),
-        ("two cheap one rich", [(100.0, 100_000.0), (100.1, 100_000.0), (100.4, 300_000.0)]),
-        ("five venues", [(100.0, 100_000.0), (100.05, 100_000.0), (100.1, 100_000.0),
-                         (100.15, 100_000.0), (101.0, 600_000.0)]),
-    ]
 
-    @pytest.mark.parametrize(("name", "spec"), SCENARIOS)
-    def test_leave_one_out_always_reports_a_larger_deviation(self, config, name, spec):
+class TestWeightedMedianRobustness:
+    @staticmethod
+    def _outlier_market():
+        # Two venues clustered near 100 and one far outlier at 150 holding
+        # 25x their depth. This is the shape that broke the weighted mean.
+        return [
+            venue("A", 100.0, liquidity=SATURATED),
+            venue("B", 100.1, liquidity=SATURATED),
+            venue("C", 150.0, liquidity=5_000_000.0),
+        ]
+
+    def test_the_benchmark_stays_with_the_cluster(self, config):
+        fair = fair_of(self._outlier_market(), config)
+        assert fair.fair_value == pytest.approx(100.1)
+
+    def test_the_pre_remediation_estimator_would_have_followed_the_outlier(
+        self, config
+    ):
+        """Evidence preserved: the old liquidity-weighted mean, run on the
+        same inputs, lands near the outlier. That is P3-5, quantified."""
+        items = contributors(self._outlier_market(), config)
+        assert weighted_mean(items) > 140.0
+        assert median_price(items) == pytest.approx(100.1)
+
+    @pytest.mark.parametrize("outlier_depth", [1e5, 1e6, 1e8, 1e12])
+    def test_raw_depth_cannot_drag_the_benchmark_continuously(
+        self, config, outlier_depth
+    ):
+        """The mean moved with depth in proportion. The median does not move
+        at all: past saturation the outlier's weight is 1.0, the same as
+        everyone else's."""
         states = [
-            venue(f"V{i}", price, liquidity=liq) for i, (price, liq) in enumerate(spec)
+            venue("A", 100.0, liquidity=SATURATED),
+            venue("B", 100.1, liquidity=SATURATED),
+            venue("C", 150.0, liquidity=outlier_depth),
+        ]
+        assert fair_of(states, config).fair_value == pytest.approx(100.1)
+
+    def test_the_result_is_invariant_under_input_permutation(self, config):
+        import itertools
+
+        states = self._outlier_market()
+        values = {
+            fair_of(list(order), config).fair_value
+            for order in itertools.permutations(states)
+        }
+        assert len(values) == 1, f"order-dependent benchmark: {values}"
+
+    def test_the_contributor_ordering_is_deterministic(self, config):
+        import itertools
+
+        states = self._outlier_market()
+        orders = {
+            tuple(v.venue for v in fair_of(list(order), config).venues)
+            for order in itertools.permutations(states)
+        }
+        assert orders == {("A", "B", "C")}
+
+    def test_ties_in_price_are_broken_by_venue_name(self, config):
+        """Deterministic tie handling: identical prices cannot make the result
+        depend on which venue happened to be seen first."""
+        states = [
+            venue("Z", 100.0, liquidity=SATURATED),
+            venue("A", 100.0, liquidity=SATURATED),
+            venue("M", 100.0, liquidity=SATURATED),
         ]
         fair = fair_of(states, config)
-        items = contributors(states, config)
-        for item in items:
-            loo = leave_one_out(items, item.venue)
-            loo_dev = (item.price - loo) / loo * 10_000
-            self_dev = fair.deviation(item.venue)
-            assert abs(loo_dev) >= abs(self_dev) - 1e-9, (
-                f"{name}/{item.venue}: LOO {loo_dev:.2f} vs self {self_dev:.2f}"
-            )
-            assert loo_dev * self_dev >= -1e-9, "the sign never flips"
+        assert [v.venue for v in fair.venues] == ["A", "M", "Z"]
+        assert fair.fair_value == pytest.approx(100.0)
 
-    def test_the_magnitude_difference_is_large_for_a_dominant_venue(self, config):
-        states = [
-            venue("A", 100.0, liquidity=50_000.0),
-            venue("B", 100.0, liquidity=50_000.0),
-            venue("C", 150.0, liquidity=900_000.0),
-        ]
-        fair = fair_of(states, config)
-        items = contributors(states, config)
-        loo = leave_one_out(items, "C")
-        assert abs(fair.deviation("C")) == pytest.approx(345, abs=15)
-        assert abs((150.0 - loo) / loo * 10_000) == pytest.approx(5_000, abs=50)
+    def test_the_benchmark_always_lies_within_the_contributor_range(self, config):
+        for spec in (
+            [(100.0, SATURATED)],
+            [(100.0, SATURATED), (101.0, SATURATED)],
+            [(100.0, 1_000.0), (101.0, 5_000_000.0)],
+            [(90.0, 1_000.0), (100.0, SATURATED), (150.0, 5_000_000.0)],
+            [(100.0, 1e3), (100.5, 1e4), (101.0, 1e5), (200.0, 1e9)],
+        ):
+            states = [
+                venue(f"V{i}", price, liquidity=liq)
+                for i, (price, liq) in enumerate(spec)
+            ]
+            fair = fair_of(states, config)
+            prices = [v.price for v in fair.venues]
+            assert min(prices) <= fair.fair_value <= max(prices)
+
+    def test_a_single_contributor_returns_its_own_price(self, config):
+        fair = fair_of([venue("A", 123.45, liquidity=SATURATED)], config)
+        assert fair.fair_value == pytest.approx(123.45)
+        assert fair.dispersion_bps == pytest.approx(0.0)
+
+    def test_two_equally_reliable_contributors_give_the_midpoint(self, config):
+        fair = fair_of(
+            [venue("A", 100.0, liquidity=SATURATED), venue("B", 102.0, liquidity=SATURATED)],
+            config,
+        )
+        assert fair.fair_value == pytest.approx(101.0)
 
 
-class TestRobustBenchmarkComparison:
-    """Section 39: how differently would other benchmarks behave?"""
+class TestComparatorBenchmarks:
+    """Audit-only comparison, retained from the Phase 3 evidence.
+
+    These measure how far apart the candidate estimators are on the shape that
+    motivated the change. Production now uses the reliability-weighted median;
+    none of the others may be wired in.
+    """
 
     @pytest.mark.parametrize("count", [2, 3, 5, 10])
     def test_without_an_outlier_every_benchmark_agrees(self, config, count):
@@ -546,24 +454,26 @@ class TestRobustBenchmarkComparison:
         ]
         items = contributors(states, config)
         assert weighted_mean(items) == pytest.approx(median_price(items), abs=0.01)
-        assert weighted_median(items) == pytest.approx(median_price(items), abs=0.01)
+        assert fair_of(states, config).fair_value == pytest.approx(
+            median_price(items), abs=0.01
+        )
 
-    def test_with_a_dominant_outlier_they_diverge_sharply(self, config):
+    def test_with_a_dominant_outlier_production_now_sides_with_the_median(
+        self, config
+    ):
         states = [
-            venue("A", 100.0, liquidity=50_000.0),
-            venue("B", 100.0, liquidity=50_000.0),
-            venue("C", 100.0, liquidity=50_000.0),
-            venue("D", 100.0, liquidity=50_000.0),
-            venue("E", 150.0, liquidity=1_000_000.0),
+            venue("A", 100.0, liquidity=SATURATED),
+            venue("B", 100.0, liquidity=SATURATED),
+            venue("C", 100.0, liquidity=SATURATED),
+            venue("D", 100.0, liquidity=SATURATED),
+            venue("E", 150.0, liquidity=5_000_000.0),
         ]
         items = contributors(states, config)
-        assert weighted_mean(items) > 140, "production follows the deep outlier"
-        assert median_price(items) == pytest.approx(100.0), "the median ignores it"
-        assert weighted_median(items) == pytest.approx(150.0), (
-            "the weighted median follows the liquidity mass instead"
-        )
-        assert trimmed_mean(items) == pytest.approx(100.0), (
-            "trimming discards the outlier entirely"
+        assert weighted_mean(items) > 140, "the pre-remediation estimator followed it"
+        assert median_price(items) == pytest.approx(100.0)
+        assert trimmed_mean(items) == pytest.approx(100.0)
+        assert fair_of(states, config).fair_value == pytest.approx(100.0), (
+            "production ignores it now"
         )
 
     def test_trimming_needs_at_least_five_venues_to_trim_anything(self, config):
@@ -576,22 +486,3 @@ class TestRobustBenchmarkComparison:
         ]
         items = contributors(states, config)
         assert trimmed_mean(items) == pytest.approx(112.5)
-
-    def test_the_spread_between_benchmarks_is_the_size_of_the_finding(
-        self, config
-    ):
-        states = [
-            venue("A", 100.0, liquidity=50_000.0),
-            venue("B", 100.0, liquidity=50_000.0),
-            venue("C", 150.0, liquidity=900_000.0),
-        ]
-        items = contributors(states, config)
-        candidates = {
-            "weighted_mean (production)": weighted_mean(items),
-            "median": median_price(items),
-            "weighted_median": weighted_median(items),
-            "trimmed_mean": trimmed_mean(items),
-        }
-        assert max(candidates.values()) - min(candidates.values()) > 45, (
-            f"benchmarks disagree by more than 45 price units: {candidates}"
-        )

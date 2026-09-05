@@ -1,19 +1,24 @@
-"""Phase 3 audit, Sections 16-20 / 32-34: quality, timestamps, health, coverage.
+"""P3-6 / P3-7 regression: quality, timestamps, health, leg coverage.
 
-Four separate questions, grouped because they all concern what NORO knows
-about the age and breadth of its own inputs.
+Four questions, grouped because they all concern what NORO knows about the
+age and breadth of its own inputs.
 
-* **Quality (17)** -- only FRESH contributes, and no stale fair value survives
-  a later snapshot.
-* **Source timestamp (19, H6)** -- ``evaluate`` stamps the MarketState's
-  global ``source_data_timestamp``, which is the newest observation anywhere
-  in the market. Phase 1 established (TIDAL-H4) that a multi-leg economic
-  claim must be as old as its OLDEST contributing leg, and added
-  ``MarketState.source_data_timestamp_for`` for exactly that.
-* **Health (16, 33, H7)** -- ``_heartbeat`` counts symbols that produced *a*
-  fair value, which one venue is enough for.
-* **Leg coverage (20)** -- how ``evaluate`` fails when a leg is not in the
-  benchmark.
+* **Quality (unchanged)** -- only FRESH contributes, and no stale valuation
+  survives a later snapshot. This was already correct and stays asserted.
+* **Source timestamp (P3-7)** -- ``evaluate`` used to stamp the MarketState's
+  global ``source_data_timestamp``: the newest observation anywhere in the
+  market, including symbols the valuation never touched. Phase 1 established
+  (TIDAL-H4) that a multi-leg economic claim is only as fresh as its OLDEST
+  contributor, and added ``MarketState.source_data_timestamp_for`` for exactly
+  that. NORO now uses it, over the contributors the conclusion actually rests
+  on, and fails closed when one has no exchange observation.
+* **Health (P3-6)** -- ``_heartbeat`` used to count symbols that produced *a*
+  valuation, which one venue was enough for, so NORO reported HEALTHY on a
+  market where no cross-venue valuation was possible at all. Readiness now
+  means at least one symbol with the two contributors a cross-venue valuation
+  needs.
+* **Leg coverage (unchanged)** -- how ``evaluate`` fails when a leg is not
+  priceable.
 """
 
 from __future__ import annotations
@@ -206,84 +211,90 @@ class TestSymbolIsolation:
 # ======================================================================
 
 
-class TestH6_SourceTimestampLaunderscontributorAge:
-    def test_noro_stamps_the_market_wide_newest_timestamp(self, config):
-        """The mechanism: ``self.market.source_data_timestamp``, not the
-        opportunity's own legs."""
+class TestP3_7_SourceTimestampIsTheOldestContributor:
+    """The opinion can never claim to be fresher than the data behind it."""
+
+    @staticmethod
+    def _mixed_ages(config):
+        """A at T-100, B at T-1000, independent C at T-500, unrelated ETH at T."""
         noro = build_noro(config, symbols=[SYMBOL, "ETH-USD"])
         state = market(
             venue("A", 100.0, exchange_ts=START_MS - 100),
             venue("B", 100.2, exchange_ts=START_MS - 1_000),
-            # An unrelated symbol, updated right now.
+            venue("C", 100.1, exchange_ts=START_MS - 500),
             venue("A", 3_000.0, symbol="ETH-USD", exchange_ts=START_MS),
         )
         noro.on_market_state(state)
+        return noro, state
+
+    def test_the_stamp_is_the_oldest_contributor_used(self, config):
+        noro, _ = self._mixed_ages(config)
         opinion = noro.evaluate(opportunity("A", "B"), START_MS)
-        assert opinion.source_data_timestamp == START_MS, (
-            "an unrelated ETH update made the BTC valuation look current"
+        assert opinion.source_data_timestamp == START_MS - 1_000, (
+            "B is the stalest venue the conclusion rests on"
         )
 
-    def test_the_oldest_contributing_leg_is_a_full_second_older(self, config):
-        noro = build_noro(config, symbols=[SYMBOL, "ETH-USD"])
-        state = market(
-            venue("A", 100.0, exchange_ts=START_MS - 100),
-            venue("B", 100.2, exchange_ts=START_MS - 1_000),
-            venue("A", 3_000.0, symbol="ETH-USD", exchange_ts=START_MS),
-        )
-        noro.on_market_state(state)
+    def test_an_unrelated_symbol_has_no_effect(self, config):
+        """The ETH venue is a full second fresher than anything in the BTC
+        valuation. It used to make that valuation look current."""
+        noro, state = self._mixed_ages(config)
         opinion = noro.evaluate(opportunity("A", "B"), START_MS)
-        honest = state.source_data_timestamp_for([("A", SYMBOL), ("B", SYMBOL)])
+        assert state.source_data_timestamp == START_MS, "ETH is the market's newest"
+        assert opinion.source_data_timestamp == START_MS - 1_000
+
+    def test_it_matches_the_helper_phase_1_added_for_this(self, config):
+        noro, state = self._mixed_ages(config)
+        opinion = noro.evaluate(opportunity("A", "B"), START_MS)
+        honest = state.source_data_timestamp_for(
+            [("A", SYMBOL), ("B", SYMBOL), ("C", SYMBOL)]
+        )
         assert honest == START_MS - 1_000
-        assert opinion.source_data_timestamp - honest == 1_000, (
-            "NORO's opinion claims to be 1000ms fresher than its own inputs"
-        )
+        assert opinion.source_data_timestamp == honest
 
-    def test_the_same_symbols_newer_leg_also_masks_the_older_one(self, config):
-        """Even without an unrelated symbol: the newest leg of THIS symbol
-        hides the oldest."""
-        noro = build_noro(config)
-        state = market(
-            venue("A", 100.0, exchange_ts=START_MS),
-            venue("B", 100.2, exchange_ts=START_MS - 1_900),
-        )
-        noro.on_market_state(state)
-        opinion = noro.evaluate(opportunity("A", "B"), START_MS)
-        assert opinion.source_data_timestamp == START_MS
-        assert state.source_data_timestamp_for(
-            [("A", SYMBOL), ("B", SYMBOL)]
-        ) == START_MS - 1_900
-
-    def test_three_contributors_report_the_newest_not_the_oldest(self, config):
+    def test_an_independent_contributor_can_be_the_oldest(self, config):
+        """The stamp covers every venue the conclusion reads, not only the
+        opportunity's own legs -- the benchmark is evidence too."""
         noro = build_noro(config)
         noro.on_market_state(
             market(
                 venue("A", 100.0, exchange_ts=START_MS - 100),
-                venue("B", 100.2, exchange_ts=START_MS - 500),
-                venue("C", 100.1, exchange_ts=START_MS - 2_000),
+                venue("B", 100.2, exchange_ts=START_MS - 200),
+                venue("C", 100.1, exchange_ts=START_MS - 3_000),
             )
         )
         opinion = noro.evaluate(opportunity("A", "B"), START_MS)
-        assert opinion.source_data_timestamp == START_MS - 100, (
-            "the fair value used all three, and reports the age of the newest"
+        assert opinion.source_data_timestamp == START_MS - 3_000, (
+            "the anchor judging the trade is three seconds old, and says so"
         )
 
-    def test_the_helper_phase_1_added_for_this_exists_and_is_unused_by_noro(self):
-        """Phase 1 (TIDAL-H4) added ``source_data_timestamp_for`` and moved
-        the three TradeIntent sites onto it, explicitly scoping AgentOpinion
-        out. That scope note is what this finding is about."""
-        import inspect
+    def test_the_newest_leg_no_longer_masks_the_oldest(self, config):
+        noro = build_noro(config)
+        noro.on_market_state(
+            market(
+                venue("A", 100.0, exchange_ts=START_MS),
+                venue("B", 100.2, exchange_ts=START_MS - 1_900),
+            )
+        )
+        opinion = noro.evaluate(opportunity("A", "B"), START_MS)
+        assert opinion.source_data_timestamp == START_MS - 1_900
 
-        from agents.noro import agent as noro_agent
-        from core.models.market import MarketState
+    def test_an_unknown_contributor_timestamp_fails_closed(self, config):
+        """Unknown stays unknown. An opinion whose age cannot be checked is
+        not publishable, so NORO returns nothing rather than a stamp it
+        cannot justify."""
+        noro = build_noro(config)
+        noro.on_market_state(
+            market(
+                venue("A", 100.0, exchange_ts=START_MS),
+                venue("B", 100.2, exchange_ts=None),
+            )
+        )
+        assert noro.evaluate(opportunity("A", "B"), START_MS) is None
 
-        assert hasattr(MarketState, "source_data_timestamp_for")
-        source = inspect.getsource(noro_agent.Noro.evaluate)
-        assert "self.market.source_data_timestamp" in source
-        assert "source_data_timestamp_for" not in source
-
-    def test_the_downstream_consumer_of_this_field(self, config):
-        """Where it matters: ``Envelope.data_age_ms`` is what age-based gates
-        read, and it is computed from this stamp."""
+    def test_the_downstream_consumer_now_reads_an_honest_age(self, config):
+        """``Envelope.data_age_ms`` is what age-based gates read, and it is
+        computed from this stamp. It used to under-report by the spread
+        between the newest and oldest contributor."""
         noro = build_noro(config)
         noro.on_market_state(
             market(
@@ -292,17 +303,30 @@ class TestH6_SourceTimestampLaunderscontributorAge:
             )
         )
         opinion = noro.evaluate(opportunity("A", "B"), START_MS + 50)
-        assert opinion.data_age_ms == 50, "reported age"
-        assert (START_MS + 50) - (START_MS - 1_900) == 1_950, "true oldest-leg age"
+        assert opinion.data_age_ms == 1_950, "the true oldest-contributor age"
+
+    def test_noro_no_longer_reads_the_market_wide_stamp(self):
+        """The mechanism, asserted directly: the old call site is gone."""
+        import inspect
+
+        from agents.noro import agent as noro_agent
+        from core.models.market import MarketState
+
+        assert hasattr(MarketState, "source_data_timestamp_for")
+        source = inspect.getsource(noro_agent.Noro.evaluate)
+        assert "source_data_timestamp_for" in source
+        assert "market.source_data_timestamp," not in source
 
 
 # ======================================================================
-# Sections 16 / 33 / H7 — health semantics
+# P3-6 — health expresses cross-venue valuation readiness
 # ======================================================================
 
 
-class TestH7_HealthDoesNotExpressCrossVenueReadiness:
-    def test_one_venue_per_symbol_reports_healthy(self, config):
+class TestP3_6_HealthExpressesValuationReadiness:
+    def test_one_venue_per_symbol_is_no_longer_healthy(self, config):
+        """The finding, closed. Two symbols, one venue each: a price exists
+        for both, and a cross-venue valuation for neither."""
         noro = build_noro(config, symbols=[SYMBOL, "ETH-USD"])
         noro.on_market_state(
             market(
@@ -310,27 +334,68 @@ class TestH7_HealthDoesNotExpressCrossVenueReadiness:
                 venue("B", 3_000.0, symbol="ETH-USD"),
             )
         )
-        assert noro.health.status_of("NORO") is HealthStatus.HEALTHY, (
-            "priced 2/2 symbols -- with one venue each, and therefore no "
-            "cross-venue valuation for either"
-        )
+        assert noro.health.status_of("NORO") is HealthStatus.DEGRADED
 
-    def test_although_neither_symbol_can_produce_an_opinion(self, config):
+    def test_two_venues_on_one_symbol_is_healthy(self, config):
         noro = build_noro(config, symbols=[SYMBOL, "ETH-USD"])
-        noro.on_market_state(
-            market(
-                venue("A", 100.0, symbol=SYMBOL),
-                venue("B", 3_000.0, symbol="ETH-USD"),
-            )
-        )
+        noro.on_market_state(market(venue("A", 100.0), venue("B", 100.2)))
         assert noro.health.status_of("NORO") is HealthStatus.HEALTHY
-        assert noro.evaluate(opportunity("A", "B"), START_MS) is None, (
-            "the second leg is not in the benchmark, so no opinion exists"
+
+    def test_no_usable_data_is_offline(self, config):
+        noro = build_noro(config, symbols=[SYMBOL])
+        noro.on_market_state(market())
+        assert noro.health.status_of("NORO") is HealthStatus.OFFLINE
+
+    def test_stale_venues_are_not_usable_data(self, config):
+        noro = build_noro(config, symbols=[SYMBOL])
+        noro.on_market_state(
+            market(
+                venue("A", 100.0, quality=DataQuality.STALE),
+                venue("B", 100.2, quality=DataQuality.STALE),
+            )
         )
+        assert noro.health.status_of("NORO") is HealthStatus.OFFLINE
+
+    def test_health_tracks_the_symbol_that_is_ready_not_the_symbol_count(
+        self, config
+    ):
+        """One symbol fully covered and one not present at all is HEALTHY:
+        NORO can genuinely value something. The old rule reported DEGRADED
+        here and HEALTHY on the unpriceable market above -- exactly backwards
+        for a required component."""
+        noro = build_noro(config, symbols=[SYMBOL, "ETH-USD"])
+        noro.on_market_state(market(venue("A", 100.0), venue("B", 100.2)))
+        assert noro.health.status_of("NORO") is HealthStatus.HEALTHY
+
+    def test_the_detail_distinguishes_ready_from_informative(self, config):
+        """A symbol at exactly two contributors is healthy and honest, but
+        will only ever return the neutral verdict. An operator must be able to
+        see that without reading opinions one by one."""
+        two = build_noro(config, symbols=[SYMBOL])
+        two.on_market_state(market(venue("A", 100.0), venue("B", 100.2)))
+        three = build_noro(config, symbols=[SYMBOL])
+        three.on_market_state(
+            market(venue("A", 100.0), venue("B", 100.2), venue("C", 100.1))
+        )
+
+        a = two.health.snapshot(now_ms=START_MS).components["NORO"]
+        b = three.health.snapshot(now_ms=START_MS).components["NORO"]
+        assert a.status is b.status is HealthStatus.HEALTHY
+        assert a.detail != b.detail, (
+            "the two markets are differently capable and the detail says so"
+        )
+        assert "1/1" in a.detail and "1/1" in b.detail
+        assert a.detail.startswith("1/1 symbols valuation-ready")
+
+    def test_a_degraded_detail_names_the_shortfall(self, config):
+        noro = build_noro(config, symbols=[SYMBOL])
+        noro.on_market_state(market(venue("A", 100.0)))
+        detail = noro.health.snapshot(now_ms=START_MS).components["NORO"].detail
+        assert "valuation-ready" in detail
+        assert "0/1" in detail
 
     def test_the_trading_path_still_fails_closed(self, config):
-        """The mitigation that keeps this an observability finding rather
-        than a trading-safety one: a missing NORO opinion makes consensus
+        """Unchanged mitigation: a missing NORO opinion makes consensus
         incomplete, which suspends the strategy."""
         from core.models.agent import ConsensusResult
         from strategies.consensus.engine import ConsensusEngine
@@ -339,39 +404,13 @@ class TestH7_HealthDoesNotExpressCrossVenueReadiness:
         noro.on_market_state(market(venue("A", 100.0)))
         assert noro.evaluate(opportunity("A", "B"), START_MS) is None
 
-        engine = ConsensusEngine(
-            noro.settings.consensus, noro.clock
-        )
+        engine = ConsensusEngine(noro.settings.consensus, noro.clock)
         result: ConsensusResult = engine.combine(
             symbol=SYMBOL, strategy="cross_venue", opinions={}, now_ms=START_MS
         )
         assert AgentId.NORO in result.missing_agents
         assert result.complete is False
         assert engine.entry_allowed(result) is False
-
-    def test_health_degrades_only_on_symbol_count_not_venue_breadth(self, config):
-        noro = build_noro(config, symbols=[SYMBOL, "ETH-USD"])
-        noro.on_market_state(market(venue("A", 100.0, symbol=SYMBOL)))
-        assert noro.health.status_of("NORO") is HealthStatus.DEGRADED, (
-            "1 of 2 symbols priced"
-        )
-        noro.on_market_state(market())
-        assert noro.health.status_of("NORO") is HealthStatus.OFFLINE
-
-    def test_a_single_venue_symbol_is_indistinguishable_from_a_healthy_one(
-        self, config
-    ):
-        """The observability gap in one assertion: the health record carries
-        no venue count, so an operator cannot tell these two apart."""
-        one_venue = build_noro(config, symbols=[SYMBOL])
-        one_venue.on_market_state(market(venue("A", 100.0)))
-        two_venue = build_noro(config, symbols=[SYMBOL])
-        two_venue.on_market_state(market(venue("A", 100.0), venue("B", 100.2)))
-
-        a = one_venue.health.snapshot(now_ms=START_MS).components["NORO"]
-        b = two_venue.health.snapshot(now_ms=START_MS).components["NORO"]
-        assert a.status is b.status is HealthStatus.HEALTHY
-        assert a.detail == b.detail == ""
 
 
 # ======================================================================
@@ -420,29 +459,27 @@ class TestLegCoverage:
             _legs(("Y", Side.BUY), ("Z", Side.SELL)), START_MS
         ) is None
 
-    def test_d_duplicate_venue_legs_are_evaluated_twice(self, config):
+    def test_d_duplicate_venue_legs_cannot_be_confirmed(self, config):
         """Not reachable from the detector (it refuses a same-venue pair),
-        but the function does not defend against it: the same deviation is
-        counted on both sides."""
+        but the function does not defend against it. Under the weakest-leg
+        rule the two opposite confirmations are exact negatives, so the
+        minimum is the negative one and the verdict is a rejection."""
         opinion = self._noro(config).evaluate(
             _legs(("A", Side.BUY), ("A", Side.SELL)), START_MS
         )
         assert opinion is not None
-        # confirmations are (-dev_A, +dev_A), so the mean is exactly zero and
-        # the edge is the negative one alone: min + 0 = -|dev_A|.
-        assert opinion.detail["confirmed_edge_bps"] == pytest.approx(
-            -abs(opinion.detail["deviation_bps_A"])
+        assert opinion.detail["weakest_confirmation_bps"] == pytest.approx(
+            -abs(opinion.detail["confirmation_bps_A"])
         )
         assert opinion.signal < 0, (
             "buying and selling the same venue can never be confirmed"
         )
 
     def test_e_a_single_leg_opportunity_is_accepted(self, config):
-        """``min + mean`` of one element is just ``2x`` that element, so a
-        one-leg opportunity produces a full-strength opinion."""
+        """One leg, judged against the venue it does not participate in."""
         opinion = self._noro(config).evaluate(_legs(("A", Side.BUY)), START_MS)
         assert opinion is not None
-        assert opinion.signal > 0
+        assert opinion.signal > 0, "A is below the independent benchmark, B"
 
     def test_f_a_three_leg_opportunity_is_accepted(self, config):
         noro = build_noro(config)
@@ -480,35 +517,65 @@ class TestLegCoverage:
 
 
 class TestOpinionObservability:
-    def test_the_detail_names_every_leg_but_not_every_contributor(self, config):
+    """P3-4 / P3-8 observability: the opinion must explain the new model.
+
+    The audit's complaint was that a bad valuation could not be diagnosed from
+    the opinion alone -- nothing said which venues contributed, which were
+    excluded, or how confident the agent was and why. The detail now names the
+    contributor set, the independent subset, the benchmark, the per-leg
+    confirmations, the dispersion and each confidence component.
+    """
+
+    @staticmethod
+    def _three(config):
         noro = build_noro(config)
         noro.on_market_state(
             market(venue("A", 100.0), venue("B", 100.2), venue("C", 100.4))
         )
-        opinion = noro.evaluate(opportunity("A", "B"), START_MS)
-        detail = opinion.detail
-        assert detail["venues_priced"] == 3
-        assert "deviation_bps_A" in detail and "deviation_bps_B" in detail
-        assert "deviation_bps_C" not in detail, (
-            "the third venue moved fair value and is not named in the opinion"
-        )
+        return noro
 
-    def test_no_weight_or_contributor_timestamp_is_published(self, config):
-        noro = build_noro(config)
-        noro.on_market_state(market(venue("A", 100.0), venue("B", 100.2)))
-        detail = noro.evaluate(opportunity("A", "B"), START_MS).detail
-        assert set(detail) == {
-            "fair_value", "total_liquidity", "venues_priced",
-            "deviation_bps_A", "deviation_bps_B", "confirmed_edge_bps",
-        }
-        for absent in ("weight", "excluded", "exchange_ts", "quality"):
-            assert not any(absent in key for key in detail)
+    def test_the_detail_names_every_contributor(self, config):
+        detail = self._three(config).evaluate(opportunity("A", "B"), START_MS).detail
+        assert detail["contributors"] == 3
+        assert detail["contributor_venues"] == "A,B,C"
+        for name in ("A", "B", "C"):
+            assert f"price_{name}" in detail
+            assert f"reliability_{name}" in detail
 
-    def test_a_bad_valuation_cannot_be_diagnosed_from_the_opinion_alone(
+    def test_the_detail_names_the_independent_subset(self, config):
+        """The venue that actually judged the trade -- which the old opinion
+        did not mention at all, even though it moved the verdict."""
+        detail = self._three(config).evaluate(opportunity("A", "B"), START_MS).detail
+        assert detail["independent_venues"] == "C"
+        assert detail["independent_contributors"] == 1
+
+    def test_the_detail_publishes_the_benchmark_and_the_weakest_leg(self, config):
+        detail = self._three(config).evaluate(opportunity("A", "B"), START_MS).detail
+        assert detail["valuation_benchmark"] == pytest.approx(100.4)
+        assert detail["weakest_confirmation_bps"] is not None
+        assert detail["valuation_dispersion_bps"] is not None
+
+    def test_the_detail_publishes_each_confidence_component(self, config):
+        detail = self._three(config).evaluate(opportunity("A", "B"), START_MS).detail
+        for key in (
+            "confidence_breadth",
+            "confidence_agreement",
+            "confidence_quality",
+        ):
+            assert key in detail
+
+    def test_per_leg_deviations_and_confirmations_are_both_present(self, config):
+        detail = self._three(config).evaluate(opportunity("A", "B"), START_MS).detail
+        for name in ("A", "B"):
+            assert f"deviation_bps_{name}" in detail
+            assert f"confirmation_bps_{name}" in detail
+
+    def test_an_excluded_venue_is_visible_by_its_absence_from_the_roll_call(
         self, config
     ):
-        """Two very different markets produce indistinguishable details apart
-        from the numbers -- nothing says WHICH venues were excluded or why."""
+        """A venue quoting 5x the price used to be silently dropped with
+        nothing recorded. The contributor roll-call now makes the exclusion
+        legible: C is not in it, and the count says so."""
         noro = build_noro(config)
         noro.on_market_state(
             market(
@@ -518,17 +585,30 @@ class TestOpinionObservability:
             )
         )
         detail = noro.evaluate(opportunity("A", "B"), START_MS).detail
-        assert detail["venues_priced"] == 2
-        assert not any("C" in key for key in detail), (
-            "a venue quoting 5x the price was silently excluded and the "
-            "opinion records nothing about it"
-        )
+        assert detail["contributors"] == 2
+        assert detail["contributor_venues"] == "A,B"
+        assert "price_C" not in detail
 
-    def test_the_model_version_is_present_for_future_changes(self, config):
-        """Section 57: the field exists, so a future algorithm change can be
-        made observable by bumping it."""
+    def test_the_neutral_path_reports_why_it_is_neutral(self, config):
+        noro = build_noro(config)
+        noro.on_market_state(market(venue("A", 100.0), venue("B", 100.2)))
+        detail = noro.evaluate(opportunity("A", "B"), START_MS).detail
+        assert detail["independent_contributors"] == 0
+        assert detail["independent_venues"] == ""
+        assert detail["valuation_benchmark"] is None
+        assert detail["weakest_confirmation_bps"] is None
+
+    def test_the_configured_thresholds_are_echoed(self, config):
+        detail = self._three(config).evaluate(opportunity("A", "B"), START_MS).detail
+        assert detail["saturation_bps"] == config.saturation_bps
+        assert detail["liquidity_window_bps"] == config.liquidity_window_bps
+
+    def test_the_model_version_records_the_semantic_change(self, config):
+        """The signal's MEANING changed -- independent benchmark, weakest-leg
+        governance, neutral on two venues -- so an 0.1 opinion and an 0.2
+        opinion carrying the same number do not say the same thing."""
         noro = build_noro(config)
         noro.on_market_state(market(venue("A", 100.0), venue("B", 100.2)))
         assert noro.evaluate(opportunity("A", "B"), START_MS).model_version == (
-            "noro-0.1"
+            "noro-0.2"
         )

@@ -168,12 +168,25 @@ class TestNoroCanFlipTheDecision:
             "at full confidence NORO commands more than half the score range"
         )
 
-    def test_noros_realistic_confidence_floor_is_already_influential(self, engine):
-        """0.55 is the minimum a two-venue NORO can report (see the
-        confidence suite), so this is its *weakest possible* influence."""
-        strong = self._with_noro(engine, 1.0, 0.55).score
-        weak = self._with_noro(engine, -1.0, 0.55).score
-        assert strong - weak > 0.4
+    def test_the_two_venue_confidence_floor_is_now_genuinely_weak(self, engine):
+        """The audit measured NORO's weakest possible influence at confidence
+        0.55 -- already commanding 40% of the score range. A two-venue NORO
+        now reports ``insufficient_breadth_confidence`` (0.1 by default), so
+        its declined vote barely moves the score, which is the point."""
+        floor = NoroConfig().insufficient_breadth_confidence
+        strong = self._with_noro(engine, 1.0, floor).score
+        weak = self._with_noro(engine, -1.0, floor).score
+        assert strong - weak < 0.15, (
+            f"a declined vote still commands {strong - weak:.3f} of the range"
+        )
+
+    def test_and_a_neutral_signal_at_that_confidence_barely_registers(self, engine):
+        """What a two-venue NORO actually contributes now: signal 0 at low
+        confidence, which neither carries nor blocks the trade on its own."""
+        floor = NoroConfig().insufficient_breadth_confidence
+        declined = self._with_noro(engine, 0.0, floor).score
+        confirmed = self._with_noro(engine, 1.0, 1.0).score
+        assert declined < confirmed
 
     def test_a_negative_noro_blocks_an_otherwise_strong_consensus(self, engine):
         opinions = {
@@ -183,8 +196,9 @@ class TestNoroCanFlipTheDecision:
         }
         result = score(engine, opinions)
         assert not engine.entry_allowed(result), (
-            "NORO's veto works -- which is why its inability to reject a "
-            "two-venue opportunity matters"
+            "NORO's veto works -- which is why it mattered that a two-venue "
+            "opportunity could never trigger it, and why the remediation "
+            "makes the vote truthful rather than removing the veto"
         )
 
 
@@ -273,80 +287,95 @@ class TestMissingIsNotNeutral:
 class TestSignalOverlap:
     """Do TIDAL, NORO and ZEPHR carry independent information?
 
-    NORO's two-venue edge is ``G * (min(w) + 1/2)`` where G is the price gap
-    the detector already measured (proved in the information-value suite). So
-    NORO's signal is a monotone function of the detector's own number,
-    modulated by at most a factor of two.
+    **What the audit found.** NORO's two-venue edge was
+    ``G * (min(w) + 1/2)`` where G is the price gap the detector already
+    measured -- so NORO's signal was a monotone function of the detector's own
+    number, modulated by at most a factor of two, and correlated with it at
+    r > 0.999. It was re-reporting the question as its answer.
+
+    **After the remediation.** A two-venue opportunity gets no directional
+    vote at all, and a three-venue one is driven by the independent anchor,
+    which the detector never saw. The correlation with the raw gap is gone
+    because the raw gap no longer determines the signal.
     """
 
-    def test_noros_signal_is_a_monotone_function_of_the_detector_gap(self):
-        config = NoroConfig()
-        signals = []
-        for gap_bps in (1, 2, 4, 6, 8, 10, 12, 14, 16, 20):
-            states = [
-                venue("A", 100.0, liquidity=100_000.0),
-                venue("B", 100.0 * (1 + gap_bps / 10_000), liquidity=100_000.0),
-            ]
-            signals.append(opinion_for(states, config, "A", "B").signal)
-        assert signals == sorted(signals)
+    @staticmethod
+    def _anchored(gap_bps: float, anchor: float = 100.0):
+        """A and B straddle 100.0 by ``gap_bps/2`` each; only C moves.
 
-    def test_the_correlation_with_the_raw_gap_is_essentially_perfect(self):
-        """Below saturation, and with balanced liquidity, NORO's signal IS
-        the detector's gap on a different scale."""
-        config = NoroConfig()
-        gaps, signals = [], []
-        for tenth in range(1, 71):
-            gap_bps = tenth / 10
-            states = [
-                venue("A", 100.0, liquidity=100_000.0),
-                venue("B", 100.0 * (1 + gap_bps / 10_000), liquidity=100_000.0),
-            ]
-            gaps.append(gap_bps)
-            signals.append(opinion_for(states, config, "A", "B").signal)
+        Holding the opportunity's own two prices fixed is the whole point: it
+        isolates the anchor as the only free variable.
+        """
+        return [
+            venue("A", 100.0 * (1 - gap_bps / 20_000), liquidity=100_000.0),
+            venue("B", 100.0 * (1 + gap_bps / 20_000), liquidity=100_000.0),
+            venue("C", anchor, liquidity=100_000.0),
+        ]
 
-        mean_g = sum(gaps) / len(gaps)
-        mean_s = sum(signals) / len(signals)
-        cov = sum((g - mean_g) * (s - mean_s) for g, s in zip(gaps, signals, strict=True))
-        var_g = sum((g - mean_g) ** 2 for g in gaps)
-        var_s = sum((s - mean_s) ** 2 for s in signals)
-        correlation = cov / (var_g * var_s) ** 0.5
-        assert correlation > 0.999, (
-            f"NORO signal vs raw detector gap: r={correlation:.6f}"
+    def test_the_detector_gap_alone_no_longer_determines_the_signal(self):
+        """The same A-B gap, three different anchors, three different votes.
+        Under the old model the gap fixed the answer."""
+        config = NoroConfig()
+        signals = {
+            anchor: opinion_for(self._anchored(20.0, anchor), config, "A", "B").signal
+            for anchor in (99.80, 100.0, 100.20)
+        }
+        assert len(set(signals.values())) == 3, signals
+        assert min(signals.values()) < 0 < max(signals.values()), (
+            f"identical detector gap, opposite verdicts: {signals}"
         )
 
-    def test_liquidity_balance_is_the_only_independent_input(self):
-        """The residual information: holding the gap fixed, the signal still
-        varies with how balanced the two venues' liquidity is -- by exactly
-        a factor of two, end to end."""
+    def test_a_two_venue_opportunity_contributes_no_signal_at_all(self):
         config = NoroConfig()
-        gap_bps = 6.0
+        for gap_bps in (1, 4, 10, 20, 50):
+            states = [
+                venue("A", 100.0, liquidity=100_000.0),
+                venue("B", 100.0 * (1 + gap_bps / 10_000), liquidity=100_000.0),
+            ]
+            assert opinion_for(states, config, "A", "B").signal == 0.0
+
+    def test_with_a_fixed_anchor_the_signal_is_still_monotone_in_the_gap(self):
+        """Monotonicity is preserved -- it was never the defect. What changed
+        is that the gap is measured against evidence the detector did not
+        supply."""
+        config = NoroConfig()
+        signals = [
+            opinion_for(self._anchored(float(gap)), config, "A", "B").signal
+            for gap in (1, 2, 4, 6, 8, 10, 12, 14, 16, 20)
+        ]
+        assert signals == sorted(signals)
+
+    def test_liquidity_balance_is_no_longer_an_input_at_all(self):
+        """The audit's "residual information" was a factor-of-two modulation
+        by liquidity balance. The weakest leg is now a pure price comparison,
+        so depth contributes nothing to the signal."""
+        config = NoroConfig()
         extremes = []
         for w_a in (0.5, 0.999):
             liquidity = 1_000_000.0
             states = [
-                venue("A", 100.0, liquidity=liquidity * w_a),
-                venue("B", 100.0 * (1 + gap_bps / 10_000),
+                venue("A", 100.0 * (1 - 6.0 / 20_000), liquidity=liquidity * w_a),
+                venue("B", 100.0 * (1 + 6.0 / 20_000),
                       liquidity=liquidity * (1 - w_a)),
+                venue("C", 100.0, liquidity=100_000.0),
             ]
             extremes.append(opinion_for(states, config, "A", "B").signal)
         balanced, lopsided = extremes
-        assert balanced == pytest.approx(2 * lopsided, rel=0.01), (
-            "the full range of NORO's liquidity information is one factor of 2"
+        assert balanced == pytest.approx(lopsided, rel=1e-9), (
+            "a 2000:1 liquidity imbalance moved the signal by nothing"
         )
 
-    def test_a_third_venue_is_what_makes_the_signal_independent(self):
-        """Contrast: with three venues the signal is no longer a function of
-        the A-B gap alone -- the same gap gives opposite votes."""
+    def test_the_anchor_is_what_makes_the_signal_independent(self):
         config = NoroConfig()
         a = venue("A", 100.0, liquidity=100_000.0)
         b = venue("B", 100.2, liquidity=100_000.0)
         near_buy = opinion_for(
-            [a, b, venue("C", 100.0, liquidity=800_000.0)], config, "A", "B"
+            [a, b, venue("C", 100.0, liquidity=100_000.0)], config, "A", "B"
         ).signal
         near_sell = opinion_for(
-            [a, b, venue("C", 100.5, liquidity=800_000.0)], config, "A", "B"
+            [a, b, venue("C", 100.5, liquidity=100_000.0)], config, "A", "B"
         ).signal
-        assert near_sell < 0 < near_buy, (
+        assert near_sell < 0 <= near_buy, (
             f"identical A-B gap, opposite verdicts: {near_buy:+.3f} vs "
             f"{near_sell:+.3f}"
         )
