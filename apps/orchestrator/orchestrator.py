@@ -41,10 +41,11 @@ from core.health import HealthRegistry
 from core.models.agent import AgentOpinion, ConsensusResult
 from core.models.common import AgentId, Millis, Side
 from core.models.execution import FillEvent, OrderStatus
-from core.models.market import MarketState
+from core.models.market import MarketState, safe_bps
 from core.models.opportunity import (
     STRATEGY_TRANSITIONS,
     CostBreakdown,
+    Opportunity,
     OpportunityLeg,
     StrategyState,
     TradeIntent,
@@ -927,9 +928,158 @@ class Orchestrator:
             return
         await self.transition(record, StrategyState.HEDGING)
 
+    def _monitor_opportunity(
+        self, opportunity: Opportunity, market: MarketState
+    ) -> Opportunity | None:
+        """The SAME trade, re-priced at the current touch.
+
+        LIVE EXIT ECONOMICS (Phase 3+4)
+        ===============================
+        ``_monitor`` republishes an opportunity every tick so the agents keep
+        voting after entry. Republishing the *original* record made that
+        vote incoherent: agents were handed the reference prices and the
+        gross edge observed at detection, so the question they answered was
+        "would this trade have been good back then?" — a question whose
+        answer cannot change, no matter what the market does afterwards.
+
+        Concretely, ``gross_edge_bps`` is what ZEPHR divides its modelled
+        costs against and what TIDAL's volatility penalty is scaled by. Frozen
+        at the entry value, an opportunity whose dislocation has completely
+        closed still presented ZEPHR with the entry edge, and ZEPHR still
+        reported that execution economics survived. The exit path exists to
+        notice decay, and it was being shown a snapshot in which decay was
+        impossible.
+
+        What is re-priced, and what is not:
+
+        * **Not the venues.** The position exists on the venues it was opened
+          on, and those are the venues that have to be unwound. Re-running
+          detection here would retarget the trade to whichever pair is
+          cheapest now and produce an edge for a position nobody holds. The
+          buy leg's venue and the sell leg's venue are carried through
+          untouched, and so are their sides.
+        * **Not the identity.** ``opportunity_id``, ``correlation_id``,
+          ``created_at`` and ``expires_at`` all belong to the original: the
+          attribution trail, the response barrier and the tick-time invariant
+          (an opportunity is stamped at the tick it was BORN in and never
+          restamped) all depend on them.
+        * **The prices.** ``current_buy_touch`` is the best ask available NOW
+          on the original buy venue — what closing would cost — and
+          ``current_sell_touch`` is the best bid available NOW on the original
+          sell venue. Touch to touch, the same reference frame the detector
+          used, so the monitored edge is directly comparable to the entry
+          edge rather than a differently-defined number.
+
+        The bps denominator is the midpoint of those two current touches, not
+        the consolidated reference price: it keeps the whole computation a
+        function of the two venues actually holding the position. The
+        difference is a fraction of a basis point either way — a denominator
+        only sets the scale — but "reads nothing but its own legs" is a
+        property worth being able to state without qualification.
+
+        Everything comes from ``market``, the tick's frozen snapshot. Nothing
+        here re-runs detection, disturbs the detector's in-flight registry, or
+        reads the clock.
+
+        Returns ``None`` when either leg has no usable state or no touch on
+        that side. That is fail-closed by design: an unpriceable leg means the
+        current economics are unknown, and the caller treats unknown the same
+        way it treats decayed — it exits — because a position whose value
+        cannot be observed is not a position to keep holding.
+        """
+        buy_leg = next((leg for leg in opportunity.legs if leg.side is Side.BUY), None)
+        sell_leg = next((leg for leg in opportunity.legs if leg.side is Side.SELL), None)
+        if buy_leg is None or sell_leg is None:
+            return None
+
+        buy_state = market.venue_state(buy_leg.venue, buy_leg.symbol)
+        sell_state = market.venue_state(sell_leg.venue, sell_leg.symbol)
+        if (
+            buy_state is None
+            or sell_state is None
+            or not buy_state.quality.is_usable
+            or not sell_state.quality.is_usable
+        ):
+            return None
+
+        current_buy_touch = buy_state.metrics.best_ask
+        current_sell_touch = sell_state.metrics.best_bid
+        if current_buy_touch is None or current_sell_touch is None:
+            return None
+
+        reference = (current_buy_touch + current_sell_touch) / 2
+        edge = safe_bps(current_sell_touch - current_buy_touch, reference)
+        if edge is None:
+            return None
+
+        legs = [
+            leg.model_copy(
+                update={
+                    "reference_price": (
+                        current_buy_touch if leg.side is Side.BUY else current_sell_touch
+                    )
+                }
+            )
+            for leg in opportunity.legs
+        ]
+        return opportunity.model_copy(
+            update={
+                "legs": legs,
+                "gross_edge_bps": edge,
+                # Re-derived for THIS snapshot, and still the oldest of the
+                # opportunity's own legs rather than the market-wide newest
+                # (TIDAL-H4). Carrying the detection-time value forward would
+                # tell every downstream age gate that a tick-old re-evaluation
+                # was as fresh as the moment of entry.
+                "source_data_timestamp": market.source_data_timestamp_for(
+                    (leg.venue, leg.symbol) for leg in opportunity.legs
+                ),
+                "reason_codes": [*opportunity.reason_codes, "MONITOR_REPRICED"],
+                "detail": {
+                    **opportunity.detail,
+                    "buy_price": current_buy_touch,
+                    "sell_price": current_sell_touch,
+                    "reference_price": reference,
+                    # Kept alongside so the decay is legible in the record
+                    # rather than having to be reconstructed from two events.
+                    "entry_gross_edge_bps": opportunity.gross_edge_bps,
+                },
+            }
+        )
+
     async def _monitor(self, record: OpportunityRecord, market: MarketState) -> None:
-        """Continuous re-evaluation: agents keep voting after entry."""
+        """Continuous re-evaluation: agents keep voting after entry.
+
+        The agents are asked about the position's CURRENT economics — see
+        :meth:`_monitor_opportunity`. ``record.opportunity`` is never mutated:
+        it is the historical record of what was detected and what the entry
+        decision was taken against, and attribution reads it after the trade
+        closes.
+        """
         opportunity = record.opportunity
+        monitored = self._monitor_opportunity(opportunity, market)
+        if monitored is None:
+            # A leg cannot be priced on this tick, so there is no honest
+            # question to put to the agents. Unwind rather than hold a
+            # position whose live economics are unobservable. This is the
+            # same outcome the old code reached by a longer route -- an
+            # unusable leg made the agents return None, consensus was
+            # incomplete, and an incomplete result is not a continuation --
+            # but it now says so directly instead of depending on every
+            # required agent independently failing closed.
+            log.warning(
+                "monitored opportunity cannot be re-priced; exiting",
+                extra={
+                    "opportunity_id": opportunity.opportunity_id,
+                    "symbol": opportunity.symbol,
+                },
+            )
+            for order_id in record.order_ids:
+                await self.veska.cancel(order_id, self.tick_time)
+            await self.transition(record, StrategyState.EXITING)
+            await self._submit_exit(record, market)
+            return
+
         self.barrier.expect(
             opportunity.opportunity_id, set(self.settings.consensus.required_agents)
         )
@@ -940,7 +1090,7 @@ class Orchestrator:
                 source=SERVICE,
                 schema_name="Opportunity",
                 correlation_id=opportunity.opportunity_id,
-                payload=opportunity.to_json_dict(),
+                payload=monitored.to_json_dict(),
             )
         )
         await self.bus.drain()

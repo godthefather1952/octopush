@@ -35,12 +35,20 @@ from venues.base.messages import BookDelta, ResyncRequest, VenueStatus
 log = logging.getLogger(__name__)
 
 SERVICE = "TIDAL"
-#: Bumped from ``tidal-0.1``: the opportunity opinion's *participation*
-#: semantics changed. A weak microstructure reading is now an abstention
-#: rather than a small directional vote, so a 0.1 opinion and a 0.2
-#: opinion carrying the same signal do not mean the same thing to
-#: consensus. The microstructure score itself is unchanged.
-VERSION = "tidal-0.2"
+#: ``tidal-0.2`` changed the opinion's *participation* semantics: a weak
+#: microstructure reading became an abstention rather than a small
+#: directional vote, so a 0.1 opinion and a 0.2 opinion carrying the same
+#: signal do not mean the same thing to consensus.
+#:
+#: ``tidal-0.3`` changes what the opinion is *derived from*. The score is
+#: still the same function of the same inputs, but those inputs now come
+#: exclusively from the tick's frozen ``MarketState`` rather than from books
+#: re-read against the live clock, and ``source_data_timestamp`` is now the
+#: oldest observation among the opportunity's own legs rather than the
+#: market-wide newest. Two opinions carrying identical signal and confidence
+#: no longer mean the same thing across versions: the 0.3 one is a claim
+#: about a specific, reproducible snapshot.
+VERSION = "tidal-0.3"
 
 
 class Tidal:
@@ -573,7 +581,19 @@ class Tidal:
     # -- opinion -----------------------------------------------------------
 
     def microstructure_metrics(self, venue: str, symbol: str) -> BookMetrics | None:
-        state = self.venue_state(venue, symbol)
+        """Microstructure for one venue, read from the published snapshot.
+
+        Deliberately not the ``venue_state`` builder: that rebuilds metrics
+        against whatever the clock says at the moment of the call, which is a
+        different market from the one the tick is reasoning about. Every
+        opinion-forming read in this class goes through the frozen
+        :attr:`state` for the reason spelled out in :meth:`evaluate`, and an
+        accessor that quietly did otherwise would be a standing invitation to
+        reintroduce exactly that bug. ``None`` before the first snapshot.
+        """
+        if self.state is None:
+            return None
+        state = self.state.venue_state(venue, symbol)
         return state.metrics if state is not None else None
 
     def evaluate(
@@ -593,18 +613,55 @@ class Tidal:
         decide its freshness at every later tick, so a live-clock read here
         would let an opinion outlive its replayed twin purely because
         dispatch was slower in one run than in the other.
+
+        CAUSAL SNAPSHOT (Phase 3+4)
+        ===========================
+        Every market read below comes from :attr:`state` -- the frozen
+        :class:`MarketState` this tick published -- and nothing here rebuilds
+        a venue state, recomputes metrics, or reads the clock.
+
+        That is the same guarantee ``now_ms`` gives for *time*, applied to
+        *observation*. The detector found this opportunity in one snapshot;
+        the orchestrator's ``tick_time`` is that snapshot's ``created_at``;
+        the opinion is supposed to answer "does the book, as it stood at that
+        instant, support these legs?". Rebuilding each leg through the
+        ``venue_state`` builder answered a different question: it re-derived
+        freshness and depth against a live clock read taken at whatever
+        moment the bus happened to dispatch this handler, which on a live
+        feed is strictly later than the snapshot and moves between runs.
+
+        Two consequences, both real. The agent could judge one leg FRESH and
+        another DEGRADED using ages the tick's own ``MarketState`` disagreed
+        with. And replay -- which pins the clock to the tick marker but
+        cannot reproduce dispatch latency -- would compute a different
+        ``age_ms``, a different confidence, and eventually a different
+        verdict from an identical recorded market.
+
+        No published snapshot means no observation to reason about, so there
+        is no opinion to give: ``None``, the same answer an unusable book
+        gets, and a required agent returning ``None`` suspends the strategy
+        rather than letting it proceed on a guess.
         """
+        market = self.state
+        if market is None:
+            return None
         now = now_ms
         supports: list[float] = []
         reasons: list[str] = []
         detail: dict[str, float | int | str | bool | None] = {}
         worst_quality_age = 0
 
+        # Collected once, in leg order, and reused for the volatility read
+        # below. Looking each leg up again would be a second read of the same
+        # frozen dict -- harmless but pointless -- and the old code's version
+        # of that pattern went through ``venue_state()``, which was neither.
+        leg_states: list[VenueMarketState] = []
         for leg in opportunity.legs:
-            state = self.venue_state(leg.venue, leg.symbol)
+            state = market.venue_state(leg.venue, leg.symbol)
             if state is None or not state.quality.is_usable:
                 # No usable book on a leg means no opinion at all.
                 return None
+            leg_states.append(state)
             metrics = state.metrics
             # Buying is supported by bid-side pressure, selling by ask-side.
             pressure = metrics.imbalance * leg.side.sign
@@ -619,15 +676,10 @@ class Tidal:
             return None
 
         # A market moving faster than the edge is a market that will have moved
-        # by the time the orders land.
-        vol = max(
-            (
-                self.venue_state(leg.venue, leg.symbol).metrics.short_vol_bps
-                for leg in opportunity.legs
-                if self.venue_state(leg.venue, leg.symbol) is not None
-            ),
-            default=0.0,
-        )
+        # by the time the orders land. Read from the states already gathered
+        # above -- the same objects, so the volatility that penalises the score
+        # and the volatility reported in ``detail`` cannot disagree.
+        vol = max((s.metrics.short_vol_bps for s in leg_states), default=0.0)
         vol_penalty = min(0.8, vol / max(1e-9, opportunity.gross_edge_bps) * 0.25)
         # The microstructure score itself. Unchanged: same inputs, same
         # coefficients, same volatility penalty. What changes below is only
@@ -686,7 +738,26 @@ class Tidal:
             agent_id=AgentId.TIDAL,
             symbol=opportunity.symbol,
             created_at=now,
-            source_data_timestamp=self.state.source_data_timestamp if self.state else None,
+            # The oldest exchange observation among THIS opportunity's own
+            # legs, not the market-wide newest (TIDAL-H4, the same finding
+            # closed for NORO as P3-7). ``MarketState.source_data_timestamp``
+            # is the freshest timestamp anywhere in the snapshot: an unrelated
+            # symbol ticking, or a fresh update on one leg while the other sat
+            # still, would have stamped this opinion as current while it was
+            # in fact reasoning about a stale book. Downstream age gates read
+            # this field, so overstating freshness here is how a stale opinion
+            # passes a check designed to stop it.
+            #
+            # Fails closed: a leg with no exchange observation makes the whole
+            # result ``None`` rather than silently averaging over the hole,
+            # and ``None`` is what the age gates treat as "unknown, block".
+            # Both legs were established usable above, and usability already
+            # requires an exchange timestamp, so ``None`` here means the
+            # snapshot changed shape underneath us -- exactly the case worth
+            # failing on.
+            source_data_timestamp=market.source_data_timestamp_for(
+                (leg.venue, leg.symbol) for leg in opportunity.legs
+            ),
             correlation_id=opportunity.opportunity_id,
             signal=signal,
             confidence=confidence,

@@ -31,7 +31,7 @@ from core.clock import ManualClock
 from core.config import Settings, TidalConfig, load_settings, simulated_venues
 from core.health import HealthRegistry
 from core.models.common import DataQuality, Side
-from core.models.market import BookMetrics, VenueMarketState
+from core.models.market import BookMetrics, MarketState, VenueMarketState
 from core.models.opportunity import Opportunity, OpportunityKind, OpportunityLeg
 from tests.conftest import START_MS
 
@@ -135,16 +135,50 @@ def opportunity(*, gross_edge_bps: float = 10.0) -> Opportunity:
     return opp
 
 
+def market_state(
+    states: dict[tuple[str, str], VenueMarketState | None],
+    *,
+    created_at: int = START_MS,
+) -> MarketState:
+    """A published snapshot carrying exactly ``states``.
+
+    A ``None`` entry means that venue/symbol is absent from the snapshot
+    entirely, which is how a leg goes MISSING.
+    """
+    return MarketState(
+        created_at=created_at,
+        source_data_timestamp=max(
+            (
+                s.exchange_ts
+                for s in states.values()
+                if s is not None and s.exchange_ts is not None
+            ),
+            default=None,
+        ),
+        venues={
+            f"{venue}:{symbol}": state
+            for (venue, symbol), state in states.items()
+            if state is not None
+        },
+    )
+
+
 def build_tidal(
     states: dict[tuple[str, str], VenueMarketState | None],
     config: TidalConfig | None = None,
 ) -> Tidal:
-    """A real ``Tidal`` whose venue states are supplied rather than derived.
+    """A real ``Tidal`` holding a published snapshot built from ``states``.
 
-    ``venue_state`` recomputes metrics from live books, which makes an exact
-    imbalance impossible to construct. Substituting the accessor — and only
-    the accessor — leaves the whole opinion path under test while letting the
-    microstructure inputs be set to the values the deadband is about.
+    Nothing is monkeypatched. ``evaluate`` reads the frozen
+    :class:`MarketState` on the agent, so supplying that snapshot directly is
+    both the production path and the only way to set an exact book imbalance
+    — deriving one from a synthetic ladder is not something ``compute_metrics``
+    lets a test control precisely enough for a deadband assertion.
+
+    This deliberately replaced an earlier version that substituted the
+    ``venue_state`` accessor. That patch is now meaningless: the opinion path
+    no longer calls it, and a test that kept patching it would have gone on
+    passing while measuring nothing.
     """
     clock = ManualClock(START_MS)
     settings: Settings = load_settings().model_copy(
@@ -156,9 +190,7 @@ def build_tidal(
         settings=settings,
         health=HealthRegistry(clock=clock),
     )
-    tidal.venue_state = (  # type: ignore[method-assign]
-        lambda venue, symbol, now_ms=None: states.get((venue, symbol))
-    )
+    tidal.state = market_state(states)
     return tidal
 
 
@@ -516,6 +548,8 @@ class TestDeterminismAndSerialisation:
         assert payload["signal"] == pytest.approx(0.4, abs=1e-9)
 
     def test_the_model_version_records_the_semantic_change(self):
-        """A tidal-0.1 opinion and a tidal-0.2 opinion carrying the same
-        signal do not mean the same thing to consensus."""
-        assert opinion_at(0.4).model_version == "tidal-0.2"
+        """Opinions carrying identical signals do not mean the same thing
+        across these versions: 0.2 changed whether a weak read participates
+        at all, and 0.3 changed what the read is derived from — a frozen,
+        reproducible snapshot rather than books re-read against the clock."""
+        assert opinion_at(0.4).model_version == "tidal-0.3"
