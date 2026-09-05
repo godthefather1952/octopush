@@ -7,11 +7,20 @@ session with no external services.
 
 from __future__ import annotations
 
+import itertools
 import json
+import math
 import os
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 from core.models.common import AgentId, TradingMode
 
@@ -288,7 +297,11 @@ class ExecutionConfig(BaseModel):
 class ZephrConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    #: Notional ladder used to find the maximum economical size.
+    #: Notional ladder used to find the maximum economical size. Validated to
+    #: be a non-empty, strictly ascending ladder of finite positive notionals:
+    #: an empty ladder makes every opportunity silently unpriceable, and a
+    #: duplicated or unsorted one makes ``max_economical_notional`` and the
+    #: net-edge-decays-with-size property both meaningless.
     size_ladder: list[float] = Field(
         default_factory=lambda: [1_000.0, 5_000.0, 10_000.0, 25_000.0, 50_000.0]
     )
@@ -297,10 +310,75 @@ class ZephrConfig(BaseModel):
     impact_exponent: float = Field(default=1.35, gt=0.0)
     #: Penalty applied for expected latency, in bps.
     latency_penalty_bps: float = Field(default=0.5, ge=0.0)
-    #: Cost assumed for the hedge leg, in bps.
+    #: Residual hedging allowance, in bps, charged once per opportunity.
+    #:
+    #: This is NOT the cost of the offsetting leg of a cross-venue trade: both
+    #: legs of such a trade are priced explicitly against their own books, and
+    #: charging a whole extra leg here would be a second helping of the same
+    #: cost. It is the allowance for the delta this platform is left holding
+    #: when the two priced legs do not cancel exactly -- partial fills, size
+    #: rounding, a leg that misses -- which OKAPI then has to hedge out with a
+    #: separate order. It is charged once per opportunity, never per leg.
     hedge_cost_bps: float = Field(default=1.0, ge=0.0)
     #: Edge below which a size is not considered economical.
+    #:
+    #: ZEPHR's own floor. The *effective* floor it applies is the stricter of
+    #: this and ``RiskLimits.min_expected_edge_bps``, because a size RUNE will
+    #: refuse to authorise is not an economical size -- see
+    #: :meth:`Settings.zephr_min_net_edge_bps`.
     min_net_edge_bps: float = Field(default=1.0, ge=0.0)
+    #: Opinion TTL. ZEPHR's own, rather than borrowing NORO's: the two agents
+    #: answer different questions over different horizons, and a shared TTL
+    #: silently couples ZEPHR's freshness to a valuation setting.
+    ttl_ms: int = Field(default=2_000, gt=0)
+    #: Multiple of the effective minimum net edge at which the signal
+    #: saturates to +1.
+    signal_saturation_multiple: float = Field(default=3.0, gt=0.0)
+    #: Confidence floor: what ZEPHR reports when it could price the trade at
+    #: all, before any liquidity credit.
+    confidence_floor: float = Field(default=0.4, ge=0.0, le=1.0)
+    #: Share of confidence driven by the bottleneck leg's usable liquidity.
+    confidence_liquidity_weight: float = Field(default=0.6, ge=0.0, le=1.0)
+    #: Bottleneck liquidity, in quote notional, at which that credit is full.
+    confidence_liquidity_saturation: float = Field(default=200_000.0, gt=0.0)
+    #: Confidence attached to a refusal. High, and deliberately independent of
+    #: the liquidity credit above: "this cannot be executed economically" is a
+    #: statement ZEPHR is sure of precisely when liquidity is poor.
+    refusal_confidence: float = Field(default=0.9, ge=0.0, le=1.0)
+
+    @field_validator("size_ladder")
+    @classmethod
+    def _ladder_is_strictly_ascending_and_positive(cls, v: list[float]) -> list[float]:
+        if not v:
+            raise ValueError(
+                "size_ladder cannot be empty: ZEPHR would price no size at all "
+                "and every opportunity would fail as unexecutable"
+            )
+        for notional in v:
+            if not math.isfinite(notional) or notional <= 0:
+                raise ValueError(
+                    f"size_ladder entries must be finite and positive, got {notional!r}"
+                )
+        for a, b in itertools.pairwise(v):
+            if b <= a:
+                raise ValueError(
+                    f"size_ladder must be strictly ascending, got {v!r}: a "
+                    "duplicated or out-of-order rung makes the largest feasible "
+                    "point ambiguous and breaks net-edge-decays-with-size"
+                )
+        return v
+
+    @model_validator(mode="after")
+    def _confidence_is_bounded(self) -> ZephrConfig:
+        ceiling = self.confidence_floor + self.confidence_liquidity_weight
+        if ceiling > 1.0:
+            raise ValueError(
+                f"confidence_floor ({self.confidence_floor}) plus "
+                f"confidence_liquidity_weight ({self.confidence_liquidity_weight}) "
+                f"is {ceiling}, above 1.0: the liquidity term would be clipped "
+                "away and confidence would stop responding to liquidity at all"
+            )
+        return self
 
 
 class NoroConfig(BaseModel):
@@ -436,6 +514,26 @@ class Settings(BaseModel):
             if v.name == name:
                 return v
         raise KeyError(f"unknown venue: {name}")
+
+    @property
+    def zephr_min_net_edge_bps(self) -> float:
+        """The net edge, in bps, below which a size is not worth quoting.
+
+        ZEPHR and RUNE both hold a minimum-edge number, and they used to
+        disagree: ZEPHR called a size "economical" at ``zephr.min_net_edge_bps``
+        (1 bps by default) while RUNE's ``MIN_EXPECTED_EDGE`` gate refused
+        anything under ``risk.min_expected_edge_bps`` (2 bps). Every size in
+        the gap was advertised by ZEPHR, sized into an intent, and then
+        rejected — ZEPHR reported executability it did not have.
+
+        The stricter of the two is the honest answer, and taking the maximum
+        resolves it in the only direction that cannot weaken RUNE: raising
+        ZEPHR's floor to meet the risk limit, never lowering the risk limit to
+        meet ZEPHR. If an operator sets ZEPHR's floor *above* RUNE's, that
+        stays authoritative too — the platform is then simply pickier than its
+        hard limit requires, which is always allowed.
+        """
+        return max(self.zephr.min_net_edge_bps, self.risk.min_expected_edge_bps)
 
 
 def default_venues() -> list[VenueConfig]:

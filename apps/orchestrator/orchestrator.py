@@ -824,17 +824,14 @@ class Orchestrator:
             return None
         best = curve.best
 
-        fees = sum(leg.fee_bps for leg in best.legs)
-        spread = sum(leg.spread_bps for leg in best.legs)
-        slippage = sum(leg.slippage_bps + leg.impact_bps for leg in best.legs)
-        latency = sum(leg.latency_bps for leg in best.legs)
-        costs = CostBreakdown(
-            fees_bps=fees,
-            spread_bps=spread,
-            slippage_bps=slippage,
-            latency_bps=latency,
-            hedge_bps=self.settings.zephr.hedge_cost_bps,
-        )
+        # One implementation of the cost arithmetic, owned by the curve that
+        # produced the quotes. Re-deriving the sum here meant two copies of
+        # one calculation had to be kept in step by hand: the moment they
+        # drifted, ZEPHR's ``net_edge_bps`` and this intent's
+        # ``expected_net_edge_bps`` would describe the same trade with
+        # different numbers -- and RUNE's MIN_EXPECTED_EDGE gate reads the
+        # second one.
+        costs = best.cost_breakdown()
         now = self.tick_time
         return TradeIntent(
             created_at=now,
@@ -853,6 +850,9 @@ class Orchestrator:
             notional=best.notional,
             gross_edge_bps=opportunity.gross_edge_bps,
             costs=costs,
+            # Identical to ``best.net_edge_bps`` by construction, because the
+            # breakdown above is the curve's own arithmetic rather than a
+            # second copy of it.
             expected_net_edge_bps=costs.net_from(opportunity.gross_edge_bps),
             consensus_score=result.score,
             consensus_agreement=result.agreement,

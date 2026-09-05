@@ -5,14 +5,24 @@ sits between the quoted edge and the money that actually lands is modelled
 here, in one place, so the orchestrator, ZEPHR and the paper executor all
 agree on what a trade costs.
 
-    gross edge
-      - fees          (venue schedule, maker or taker)
-      - spread        (crossing the touch)
+    gross edge (in a stated reference frame -- see EdgeFrame)
+      - spread        (crossing the touch, ONLY when the frame is mid-to-mid)
       - slippage      (walking the book beyond the touch)
-      - hedge         (the offsetting leg)
-      - funding       (perpetual carry, where applicable)
+      - impact        (pressure beyond the visible book)
+      - fees          (venue schedule, maker or taker)
       - latency       (adverse drift between decision and fill)
+      - hedge         (residual delta the priced legs do not cancel)
+      - funding       (perpetual carry, where applicable)
       = expected net edge
+
+The reference frame is not a detail. Every cost above is defined as the gap
+between some *reference* price and the price actually paid, so a cost is only
+a cost relative to a stated reference. Subtracting a component that the
+reference already accounts for charges it twice and understates the edge; the
+platform's own cross-venue detector measures its gross edge touch to touch
+(cheapest ask against richest bid), which already prices both crossings, so
+the spread term does not apply to it. :class:`EdgeFrame` makes that choice
+explicit at every call site instead of leaving it to be assumed.
 """
 
 from __future__ import annotations
@@ -20,9 +30,30 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from core.config import FeeSchedule, ZephrConfig
-from core.models.common import QTY_EPSILON, Side
+from core.models.common import QTY_EPSILON, Side, StrEnum
 from core.models.market import PriceLevel
 from core.models.opportunity import CostBreakdown
+
+
+class EdgeFrame(StrEnum):
+    """Which prices a gross edge was measured between.
+
+    :attr:`TOUCH_TO_TOUCH` is an edge measured between the prices actually
+    available to an aggressor -- the buy side's best ask against the sell
+    side's best bid. Crossing the touch is already paid for inside such a
+    number, so a taker leg adds no further spread cost; what remains is what
+    happens *beyond* the touch (slippage, impact) plus fees, latency and the
+    residual hedge. This is what
+    :func:`strategies.cross_venue.detector.find_dislocation` produces, and it
+    is the frame every opportunity in this platform is quoted in.
+
+    :attr:`MID_TO_MID` is an edge measured between mid prices. That number
+    ignores the spread entirely, so an aggressive leg must be charged the half
+    spread it crosses on top of everything else.
+    """
+
+    TOUCH_TO_TOUCH = "TOUCH_TO_TOUCH"
+    MID_TO_MID = "MID_TO_MID"
 
 
 @dataclass(frozen=True)

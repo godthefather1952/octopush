@@ -1,4 +1,5 @@
 from execution.costs import (
+    EdgeFrame,
     WalkResult,
     build_cost_breakdown,
     latency_cost_bps,
@@ -7,6 +8,7 @@ from execution.costs import (
 )
 
 __all__ = [
+    "EdgeFrame",
     "WalkResult",
     "build_cost_breakdown",
     "latency_cost_bps",
