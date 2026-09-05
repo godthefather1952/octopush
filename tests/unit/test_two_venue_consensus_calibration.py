@@ -289,9 +289,12 @@ def analyse(run: dict) -> dict:
                 (st, (threshold * (wt + wz) - wz * sz) / wt)
             )
         agreement = result.get("agreement")
-        if sz >= threshold and isinstance(agreement, (int, float)):
-            if agreement < threshold:
-                strong_zephr_blocked += 1
+        if (
+            sz >= threshold
+            and isinstance(agreement, (int, float))
+            and agreement < threshold
+        ):
+            strong_zephr_blocked += 1
 
     observed_tidal = [observed for observed, _ in tidal_pairs]
     required_tidal = [required for _, required in tidal_pairs]

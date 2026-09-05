@@ -35,7 +35,12 @@ from venues.base.messages import BookDelta, ResyncRequest, VenueStatus
 log = logging.getLogger(__name__)
 
 SERVICE = "TIDAL"
-VERSION = "tidal-0.1"
+#: Bumped from ``tidal-0.1``: the opportunity opinion's *participation*
+#: semantics changed. A weak microstructure reading is now an abstention
+#: rather than a small directional vote, so a 0.1 opinion and a 0.2
+#: opinion carrying the same signal do not mean the same thing to
+#: consensus. The microstructure score itself is unchanged.
+VERSION = "tidal-0.2"
 
 
 class Tidal:
@@ -624,16 +629,54 @@ class Tidal:
             default=0.0,
         )
         vol_penalty = min(0.8, vol / max(1e-9, opportunity.gross_edge_bps) * 0.25)
-        signal = max(-1.0, min(1.0, sum(supports) / len(supports) - vol_penalty))
+        # The microstructure score itself. Unchanged: same inputs, same
+        # coefficients, same volatility penalty. What changes below is only
+        # whether a reading this weak is allowed to count as a vote.
+        raw_signal = max(-1.0, min(1.0, sum(supports) / len(supports) - vol_penalty))
         detail["vol_penalty"] = round(vol_penalty, 4)
         detail["max_data_age_ms"] = worst_quality_age
+        detail["raw_microstructure_signal"] = round(raw_signal, 6)
 
-        reasons.append(
-            "MICROSTRUCTURE_SUPPORTS" if signal > 0 else "MICROSTRUCTURE_UNSUPPORTIVE"
-        )
+        # Below the deadband the book is telling us nothing directional, and
+        # saying so is not the same as saying "slightly bad". Book imbalance
+        # and trade flow are noisy around zero; publishing that noise as a
+        # directional vote hands a weighted consensus real negative mass built
+        # out of nothing. The Phase 3+4 calibration measured exactly that: 206
+        # opportunities, TIDAL between -0.126 and +0.061, ZEPHR finding 19-24
+        # bps of post-cost edge on every one, and consensus stuck at 0.571
+        # against a 0.60 threshold it could not have reached from any observed
+        # TIDAL state.
+        #
+        # Boundary: strictly inside the band abstains. At exactly +threshold
+        # or exactly -threshold TIDAL votes, so the deadband is the open
+        # interval (-threshold, +threshold) and the comparison is one-sided.
+        threshold = self.settings.tidal.informative_signal_threshold
+        abstain = abs(raw_signal) < threshold
+        detail["informative_signal_threshold"] = threshold
+
+        if abstain:
+            # Present, fresh, healthy — and inconclusive. Not missing: the
+            # book was read successfully, and an unreadable book still returns
+            # None above.
+            signal = 0.0
+            reasons.append("MICROSTRUCTURE_INCONCLUSIVE")
+        else:
+            signal = raw_signal
+            reasons.append(
+                "MICROSTRUCTURE_SUPPORTS"
+                if raw_signal > 0
+                else "MICROSTRUCTURE_UNSUPPORTIVE"
+            )
+        # Reported whatever the verdict: a fast market is worth flagging even
+        # when the directional read is inconclusive. Reason codes never affect
+        # consensus participation — only ``abstain`` does.
         if vol_penalty > 0.3:
             reasons.append("VOLATILITY_EXCEEDS_EDGE")
 
+        # Confidence is deliberately untouched, and keeps meaning "the market
+        # observation itself is reliable". Whether that observation is
+        # directionally informative is a separate dimension, and it is
+        # ``abstain`` that carries it.
         freshness = 1.0 - min(
             1.0, worst_quality_age / max(1, self.settings.risk.max_data_age_ms)
         )
@@ -647,6 +690,7 @@ class Tidal:
             correlation_id=opportunity.opportunity_id,
             signal=signal,
             confidence=confidence,
+            abstain=abstain,
             expires_at=now + self.settings.risk.max_data_age_ms,
             reason_codes=reasons,
             model_version=VERSION,

@@ -572,3 +572,136 @@ class TestAbstentionDefaults:
             "agreement": 0.5,
         }
         assert ConsensusResult.model_validate(legacy).abstained_agents == []
+
+
+class TestTidalAndNoroBothAbstain:
+    """The two-venue shape after the TIDAL deadband landed.
+
+    NORO has no independent valuation benchmark and abstains. TIDAL reads a
+    book that says nothing directional and abstains. ZEPHR has real execution
+    economics and votes. The trade is then decided on the one agent that
+    actually has evidence -- which is the correct outcome, and the whole
+    reason abstention had to be distinguishable from a missing agent.
+    """
+
+    @staticmethod
+    def _opinions(tidal_signal: float | None = None, tidal_confidence: float = 0.9):
+        opinions = {
+            AgentId.NORO: slot(AgentId.NORO, 0.0, 0.1, abstain=True),
+            AgentId.ZEPHR: slot(AgentId.ZEPHR, 1.0, 1.0),
+        }
+        opinions[AgentId.TIDAL] = (
+            slot(AgentId.TIDAL, 0.0, tidal_confidence, abstain=True)
+            if tidal_signal is None
+            else slot(AgentId.TIDAL, tidal_signal, tidal_confidence)
+        )
+        return opinions
+
+    def test_two_abstentions_still_leave_the_result_complete(self, engine):
+        """Neither abstention is a hole in the data, so the strategy is not
+        suspended."""
+        result = combine(engine, self._opinions())
+        assert result.complete is True
+
+    def test_both_abstainers_are_reported_as_abstaining(self, engine):
+        result = combine(engine, self._opinions())
+        assert set(result.abstained_agents) == {AgentId.TIDAL, AgentId.NORO}
+
+    def test_neither_abstainer_is_reported_as_missing(self, engine):
+        result = combine(engine, self._opinions())
+        assert AgentId.TIDAL not in result.missing_agents
+        assert AgentId.NORO not in result.missing_agents
+
+    def test_zephr_is_the_only_directional_contribution(self, engine):
+        result = combine(engine, self._opinions())
+        assert {c.agent_id for c in result.contributions} == {AgentId.ZEPHR}
+
+    def test_the_score_is_zephrs_own_score(self, engine):
+        """With one voter the weighted mean is that voter's signal -- no
+        renormalisation artefact, no residual mass from the abstainers."""
+        result = combine(engine, self._opinions())
+        assert result.score == pytest.approx(1.0)
+        assert result.agreement == pytest.approx(1.0)
+
+    def test_entry_is_allowed_on_the_unchanged_threshold(self, engine):
+        """No bypass and no special two-venue shortcut: 1.0 clears 0.60 the
+        ordinary way, and RUNE still runs afterward."""
+        result = combine(engine, self._opinions())
+        assert engine.config.entry_threshold == pytest.approx(0.60)
+        assert engine.entry_allowed(result) is True
+
+    def test_a_weaker_lone_zephr_still_has_to_clear_the_threshold(self, engine):
+        """Abstention does not lower the bar. If the only agent with evidence
+        is unconvinced, the trade does not happen."""
+        opinions = self._opinions()
+        opinions[AgentId.ZEPHR] = slot(AgentId.ZEPHR, 0.4, 1.0)
+        result = combine(engine, opinions)
+        assert result.complete is True
+        assert result.score == pytest.approx(0.4)
+        assert engine.entry_allowed(result) is False
+
+
+class TestTidalRetainsItsVeto:
+    """The deadband silences noise, not evidence.
+
+    A materially adverse microstructure read is above the deadband, so TIDAL
+    votes, carries its full weight, and can pull an otherwise strong ZEPHR
+    consensus below the entry threshold.
+    """
+
+    @staticmethod
+    def _with_tidal(signal: float, confidence: float = 0.9):
+        return {
+            AgentId.TIDAL: slot(AgentId.TIDAL, signal, confidence),
+            AgentId.NORO: slot(AgentId.NORO, 0.0, 0.1, abstain=True),
+            AgentId.ZEPHR: slot(AgentId.ZEPHR, 1.0, 1.0),
+        }
+
+    def test_a_voting_tidal_appears_in_the_contributions(self, engine):
+        result = combine(engine, self._with_tidal(-0.5))
+        assert {c.agent_id for c in result.contributions} == {
+            AgentId.TIDAL,
+            AgentId.ZEPHR,
+        }
+        assert AgentId.TIDAL not in result.abstained_agents
+
+    def test_an_adverse_tidal_lowers_the_score_below_zephr_alone(self, engine):
+        alone = combine(
+            engine,
+            {
+                AgentId.TIDAL: slot(AgentId.TIDAL, 0.0, 0.9, abstain=True),
+                AgentId.NORO: slot(AgentId.NORO, 0.0, 0.1, abstain=True),
+                AgentId.ZEPHR: slot(AgentId.ZEPHR, 1.0, 1.0),
+            },
+        )
+        opposed = combine(engine, self._with_tidal(-0.5))
+        assert opposed.score < alone.score
+
+    def test_a_strongly_adverse_tidal_blocks_the_trade(self, engine):
+        """The property that matters: TIDAL keeps the ability to stop a trade
+        its own evidence argues against."""
+        result = combine(engine, self._with_tidal(-0.5))
+        assert result.complete is True
+        assert engine.entry_allowed(result) is False
+
+    @pytest.mark.parametrize("signal", [-1.0, -0.75, -0.5, -0.25, -0.11])
+    def test_every_informative_negative_reading_suppresses_the_score(
+        self, engine, signal
+    ):
+        alone = combine(
+            engine,
+            {
+                AgentId.TIDAL: slot(AgentId.TIDAL, 0.0, 0.9, abstain=True),
+                AgentId.NORO: slot(AgentId.NORO, 0.0, 0.1, abstain=True),
+                AgentId.ZEPHR: slot(AgentId.ZEPHR, 1.0, 1.0),
+            },
+        )
+        assert combine(engine, self._with_tidal(signal)).score < alone.score
+
+    def test_a_supportive_tidal_is_not_penalised_for_voting(self, engine):
+        """Symmetry check: an informative positive read participates too, and
+        a lone ZEPHR at 1.0 cannot be improved on, so the score stays at the
+        ceiling rather than being dragged down by the extra weight."""
+        result = combine(engine, self._with_tidal(1.0))
+        assert result.score == pytest.approx(1.0)
+        assert engine.entry_allowed(result) is True

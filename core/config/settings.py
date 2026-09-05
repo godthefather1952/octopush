@@ -382,6 +382,41 @@ class ZephrConfig(BaseModel):
         return self
 
 
+class TidalConfig(BaseModel):
+    """TIDAL's microstructure-opinion settings.
+
+    TIDAL owns market data, microstructure observation and data quality. It
+    does not own fair value (NORO), execution economics (ZEPHR) or hard risk
+    (RUNE), and nothing here reaches into those.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Absolute microstructure score below which TIDAL abstains instead of
+    #: voting: an **information deadband**, not an entry, risk or price
+    #: threshold.
+    #:
+    #: Book imbalance and trade flow are noisy. A reading of -0.05 is not the
+    #: claim "this trade is slightly bad"; it is the absence of a claim, and
+    #: publishing it as a directional vote lets noise around zero drag a
+    #: weighted consensus down exactly as hard as real adverse evidence would.
+    #: The Phase 3+4 calibration measured that happening: across 206
+    #: opportunities TIDAL's signal ran from -0.126 to +0.061 with a median of
+    #: -0.057, while ZEPHR independently found 19-24 bps of post-cost edge on
+    #: every one of them. Consensus topped out at 0.571 against a 0.60
+    #: threshold, and reaching it would have needed a TIDAL signal of +0.124 --
+    #: twice the strongest reading observed.
+    #:
+    #: 0.10 is chosen as an information-strength boundary that clears that
+    #: near-zero band while leaving materially adverse microstructure free to
+    #: veto. It is deliberately NOT the 0.1238 the algebra demanded: tuning a
+    #: deadband to the entry requirement would make it an entry threshold
+    #: wearing a different name.
+    informative_signal_threshold: float = Field(
+        default=0.10, ge=0.0, lt=1.0, allow_inf_nan=False
+    )
+
+
 class NoroConfig(BaseModel):
     """NORO's valuation settings.
 
@@ -550,6 +585,7 @@ class Settings(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     zephr: ZephrConfig = Field(default_factory=ZephrConfig)
     noro: NoroConfig = Field(default_factory=NoroConfig)
+    tidal: TidalConfig = Field(default_factory=TidalConfig)
     lumen: LumenConfig = Field(default_factory=LumenConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
 
