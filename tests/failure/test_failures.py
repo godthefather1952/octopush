@@ -15,6 +15,7 @@ from core.bus import InMemoryEventBus
 from core.events import Event, EventType
 from core.models.common import AgentId, DataQuality, OrderType, Side, TimeInForce
 from core.models.execution import OrderStatus
+from core.models.opportunity import StrategyState
 from core.models.ops import HealthStatus
 from core.state import SystemState
 from risk.kill_switch import KillSwitch, KillSwitchInputs
@@ -424,9 +425,54 @@ class TestAgentFailures:
         assert platform.marin.reconcile().ok
 
     async def test_a_missing_required_agent_stops_the_strategy(self, platform):
+        """Losing a required agent must stop the strategy — not slow it down.
+
+        TERMINAL vs PENDING (Phase 3+4 harness cleanup)
+        ===============================================
+        This test used to require EVERY opportunity detected during the
+        failure window to be sitting in REJECTED/CONSENSUS_INCOMPLETE by the
+        time the loop stopped. That silently assumed every one of them had
+        already reached its response deadline.
+
+        It has not. ``consensus.agent_response_timeout_ms`` is 1,000ms and a
+        tick is 100ms, so the handful of opportunities detected in the last
+        ten ticks are legitimately still in AGENTS_EVALUATING: they are
+        WAITING for the agent that will never answer, which is the designed
+        behaviour and is safe — a waiting opportunity has no intent, no risk
+        decision and no orders. The assumption only held while opportunity
+        turnover was broken; restoring turnover exposed it.
+
+        So the records are partitioned rather than lumped together, and each
+        half carries the assertion that actually applies to it. Neither half
+        is allowed to have traded.
+        """
         await run_platform(platform, 200)
         state: SystemState = platform.state
         seen_before = set(state.opportunities)
+
+        # Watch what the platform actually executes from here on, by
+        # correlation id. Raw counts of ``oms.orders`` / ``account.fill_log``
+        # would not work: both are compacted during a long run (MARIN seals a
+        # verified prefix of the ledger and the OMS drops terminal orders), so
+        # a before/after count measures compaction as much as trading. The
+        # event stream is never compacted, and every execution event carries
+        # the opportunity's correlation id.
+        executed: list[tuple[str, str | None]] = []
+
+        async def _collect() -> None:
+            return None
+
+        platform.bus.subscribe(
+            lambda e: executed.append((e.type.value, e.correlation_id)) or _collect(),
+            types=[
+                EventType.TRADE_INTENT,
+                EventType.RISK_PASS,
+                EventType.EXECUTION_PLAN,
+                EventType.PAPER_ORDER_CREATED,
+                EventType.PAPER_FILL,
+            ],
+            name="execution-watch",
+        )
 
         # NORO goes away: it publishes no opinion at all -- as opposed to
         # publishing a neutral one, or an abstention.
@@ -442,6 +488,8 @@ class TestAgentFailures:
             platform.clock.advance(100)
             await platform.step_market(1)
             await platform.orchestrator.tick()
+        await platform.bus.drain()
+        now = platform.clock.now_ms()
 
         new_records = [
             record
@@ -449,13 +497,65 @@ class TestAgentFailures:
             if oid not in seen_before
         ]
         assert new_records, "expected further opportunities to be detected"
-        # None of them traded, and every one was stopped for want of a
-        # required agent.
-        assert all(record.rejected_reason == "CONSENSUS_INCOMPLETE" for record in new_records)
-        assert all(not record.order_ids for record in new_records)
-        assert all(
-            AgentId.NORO not in state.opinions_for(record.opportunity.opportunity_id)
-            for record in new_records
+
+        terminal = [r for r in new_records if r.state is StrategyState.REJECTED]
+        pending = [r for r in new_records if r.state is StrategyState.AGENTS_EVALUATING]
+
+        # There is no third category. Anything downstream of consensus --
+        # AUTHORIZED, EXECUTING, HEDGING, RECONCILING, MONITORING, EXITING,
+        # CLOSED -- would mean the platform proceeded past a missing required
+        # agent, which is the failure this test exists to catch.
+        assert len(terminal) + len(pending) == len(new_records), (
+            "opportunities detected without NORO reached states other than "
+            "rejected-or-waiting: "
+            f"{sorted({r.state.value for r in new_records})}"
+        )
+        assert terminal, (
+            "no opportunity was actually stopped; the injection may not have "
+            "taken effect"
+        )
+
+        # Terminal records were stopped for the ONE right reason. Accepting
+        # any other terminal reason (an expiry, say) would let the test pass
+        # on a platform that never noticed NORO was gone.
+        for record in terminal:
+            assert record.rejected_reason == "CONSENSUS_INCOMPLETE", (
+                f"{record.opportunity.opportunity_id} was stopped for "
+                f"{record.rejected_reason!r}, not for the missing agent"
+            )
+
+        # Pending records are provably still inside the response window, so
+        # they have not yet had a deadline to miss.
+        timeout_ms = platform.settings.consensus.agent_response_timeout_ms
+        for record in pending:
+            waited = now - record.opportunity.created_at
+            assert 0 <= waited < timeout_ms, (
+                f"{record.opportunity.opportunity_id} has been waiting "
+                f"{waited}ms on a {timeout_ms}ms deadline and should have "
+                "been rejected"
+            )
+
+        # Neither half traded, or even got as far as asking to.
+        for record in new_records:
+            assert record.intent is None
+            assert record.decision is None
+            assert not record.order_ids
+            assert record.filled_notional == 0.0
+            assert record.realized_pnl == 0.0
+            assert AgentId.NORO not in state.opinions_for(
+                record.opportunity.opportunity_id
+            )
+
+        # The direct proof: nothing the platform executed during the failure
+        # window belongs to any opportunity detected during it. Hedges and the
+        # unwinding of positions opened BEFORE the injection are expected to
+        # continue -- refusing to close an existing position because an
+        # intelligence agent is down would be the opposite of failing safely --
+        # so this is scoped by correlation id rather than by a global count.
+        new_ids = {r.opportunity.opportunity_id for r in new_records}
+        leaked = sorted({(kind, cid) for kind, cid in executed if cid in new_ids})
+        assert not leaked, (
+            f"a required agent was missing and the platform still executed: {leaked}"
         )
 
     async def test_opinions_do_not_accumulate_without_bound(self, platform):
