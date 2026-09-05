@@ -28,6 +28,7 @@ from core.models.execution import (
     PaperOrder,
 )
 from core.models.market import (
+    DEPTH_BUCKETS_BPS,
     BookMetrics,
     ConsolidatedView,
     MarketState,
@@ -35,6 +36,7 @@ from core.models.market import (
     PriceLevel,
     TradeEvent,
     VenueMarketState,
+    depth_bucket_key,
     safe_bps,
 )
 from core.models.opportunity import (
@@ -85,6 +87,7 @@ __all__ = [
     "AgentOpinion",
     "AgentScore",
     "Base",
+    "DEPTH_BUCKETS_BPS",
     "BookMetrics",
     "ConsensusResult",
     "ConsolidatedView",
@@ -136,5 +139,6 @@ __all__ = [
     "TradingMode",
     "VenueMarketState",
     "new_id",
+    "depth_bucket_key",
     "safe_bps",
 ]

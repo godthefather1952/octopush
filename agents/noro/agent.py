@@ -1,14 +1,30 @@
-"""NORO — fair-value agent.
+"""NORO — valuation agent.
 
-Answers one question about a proposed cross-venue trade: *does the valuation
-discrepancy actually exist?*  The signal is how much of the opportunity's
-direction is confirmed by the liquidity-weighted fair value, saturating at the
-configured deviation.
+Answers one question about a proposed cross-venue trade: *relative to
+independent market evidence, is this direction actually mispriced?*
+
+The word that carries the weight is **independent**. A benchmark built from the
+same two venues the detector picked confirms the detector by construction: the
+buy venue is the cheapest ask and the sell venue the richest bid, so a fair
+value formed from those two prices necessarily sits between them, and both legs
+necessarily look correct. NORO judged its own evidence and unsurprisingly
+agreed with it — in the Phase 3 audit, 82 out of 82 production entry votes were
+positive, none of them informative.
+
+So the benchmark is now built from the venues *not* participating in the
+opportunity. When such venues exist, NORO can genuinely confirm or contradict.
+When they do not — an ordinary two-venue market — it says exactly that, and
+neither confirms nor contradicts.
 """
 
 from __future__ import annotations
 
-from agents.noro.fair_value import FairValue, compute_fair_value
+from agents.noro.fair_value import (
+    FairValue,
+    VenueValuation,
+    build_contributors,
+    valuation_from,
+)
 from core.bus import EventBus
 from core.clock import Clock
 from core.config import Settings
@@ -17,11 +33,34 @@ from core.health import HealthRegistry
 from core.models.agent import AgentOpinion
 from core.models.common import AgentId, Millis, Side
 from core.models.market import MarketState
-from core.models.opportunity import Opportunity
+from core.models.opportunity import Opportunity, OpportunityLeg
 from core.models.ops import HealthStatus
 
 SERVICE = "NORO"
-VERSION = "noro-0.1"
+#: Bumped from ``noro-0.1``: the signal's *meaning* changed. It is now measured
+#: against a benchmark that excludes the venues under judgement, the weakest
+#: leg governs it outright, and a two-venue market yields a neutral vote rather
+#: than a guaranteed positive one. An 0.1 opinion and an 0.2 opinion carrying
+#: the same number do not say the same thing.
+VERSION = "noro-0.2"
+
+#: The smallest number of usable cross-venue contributors that constitutes a
+#: valuation at all. Below this there is a price, but no second opinion, and
+#: nothing to call a cross-venue valuation.
+MIN_VALUATION_CONTRIBUTORS = 2
+
+#: The smallest contributor count that can produce an *informative* verdict:
+#: both opportunity legs, plus at least one venue outside the opportunity to
+#: judge them against.
+MIN_INFORMATIVE_CONTRIBUTORS = 3
+
+FAIR_VALUE_CONFIRMS_DISLOCATION = "FAIR_VALUE_CONFIRMS_DISLOCATION"
+FAIR_VALUE_CONTRADICTS_DISLOCATION = "FAIR_VALUE_CONTRADICTS_DISLOCATION"
+FAIR_VALUE_NEUTRAL_ON_DISLOCATION = "FAIR_VALUE_NEUTRAL_ON_DISLOCATION"
+LEG_AGAINST_FAIR_VALUE = "LEG_AGAINST_FAIR_VALUE"
+INSUFFICIENT_INDEPENDENT_VALUATION_BREADTH = (
+    "INSUFFICIENT_INDEPENDENT_VALUATION_BREADTH"
+)
 
 
 def _clamp(value: float, low: float = -1.0, high: float = 1.0) -> float:
@@ -41,6 +80,9 @@ class Noro:
         self.settings = settings
         self.health = health
         self.market: MarketState | None = None
+        #: Symbol-wide diagnostic valuations, refreshed on every market state.
+        #: Observability and health only — an opportunity is never judged
+        #: against these, because they include the venues under judgement.
         self.fair_values: dict[str, FairValue] = {}
         self.evaluations = 0
         health.register(SERVICE, VERSION)
@@ -63,11 +105,19 @@ class Noro:
                 await self.publish(opinion)
 
     def on_market_state(self, state: MarketState) -> None:
-        """Recompute fair value for every symbol TIDAL can price."""
+        """Refresh the diagnostic valuation for every symbol TIDAL can price.
+
+        Recomputed from scratch each time: a contributor that has gone stale or
+        disappeared must leave the valuation immediately, and a cached value
+        from a previous tick is a stale price wearing a fresh timestamp.
+        """
         self.market = state
         self.fair_values = {}
         for symbol in self.settings.symbols:
-            fair = compute_fair_value(symbol, state.states_for(symbol), self.settings.noro)
+            contributors = build_contributors(
+                symbol, state.states_for(symbol), self.settings.noro
+            )
+            fair = valuation_from(symbol, contributors)
             if fair is not None:
                 self.fair_values[symbol] = fair
         self._heartbeat()
@@ -77,14 +127,37 @@ class Noro:
 
     # -- evaluation --------------------------------------------------------
 
+    def independent_valuation(
+        self, opportunity: Opportunity, contributors: list[VenueValuation]
+    ) -> FairValue | None:
+        """Benchmark built from venues outside the opportunity.
+
+        Both legs are then judged against the *same* benchmark, and neither
+        venue helped build the one that judges it. This is strictly stronger
+        than leaving out only the venue under judgement: with two venues,
+        leave-one-out judges A against B and B against A, which is the same
+        pair of prices the detector used and confirms it just as reliably.
+
+        ``None`` when nothing independent remains. That is not an error and not
+        a neutral benchmark — it is the absence of evidence, and the caller
+        must say so rather than substitute a number.
+        """
+        participating = {leg.venue for leg in opportunity.legs}
+        independent = [c for c in contributors if c.venue not in participating]
+        if not independent:
+            return None
+        return valuation_from(opportunity.symbol, independent)
+
     def evaluate(
         self, opportunity: Opportunity, now_ms: Millis
     ) -> AgentOpinion | None:
-        """Score how well fair value confirms the opportunity's direction.
+        """Score the opportunity against independent valuation evidence.
 
-        Returns ``None`` when NORO cannot form a view — the orchestrator then
-        sees a *missing* agent, which suspends the strategy.  It never sees a
-        fabricated neutral opinion.
+        Returns ``None`` only when a valuation genuinely cannot be formed — the
+        orchestrator then sees a *missing* required agent and suspends. Missing
+        is not neutral, so the common case of "no independent evidence exists"
+        is an explicit neutral opinion, not silence: silence would stop the
+        whole strategy on every ordinary two-venue market.
 
         ``now_ms`` is the request's logical time -- the tick that asked for
         this opinion, carried on the OPPORTUNITY_DETECTED event -- never a
@@ -94,64 +167,202 @@ class Noro:
         would let an opinion outlive its replayed twin purely because
         dispatch was slower in one run than in the other.
         """
-        fair = self.fair_values.get(opportunity.symbol)
-        if fair is None or self.market is None:
+        market = self.market
+        if market is None:
+            return None
+        config = self.settings.noro
+        symbol = opportunity.symbol
+
+        contributors = build_contributors(symbol, market.states_for(symbol), config)
+        if not contributors:
+            return None
+        by_venue = {c.venue: c for c in contributors}
+
+        # Every leg's own venue must be priceable, or NORO has no view of that
+        # leg at all. That is a genuine inability to value, not an absence of
+        # independent evidence, so it stays a missing opinion.
+        legs = list(opportunity.legs)
+        if not legs or any(leg.venue not in by_venue for leg in legs):
             return None
 
-        now = now_ms
-        reasons: list[str] = []
-        confirmations: list[float] = []
+        # Freshness of exactly the data this conclusion rests on (TIDAL-H4):
+        # every contributor whose price was read, which is the union of the
+        # opportunity's own legs and the independent venues judging them. The
+        # market-wide newest timestamp launders a stale contributor behind an
+        # unrelated fresh venue. Unknown stays unknown: an opinion whose age
+        # cannot be checked is not publishable.
+        source_ts = market.source_data_timestamp_for(
+            (c.venue, c.symbol) for c in contributors
+        )
+        if source_ts is None:
+            return None
+
+        benchmark = self.independent_valuation(opportunity, contributors)
+
         detail: dict[str, float | int | str | bool | None] = {
-            "fair_value": fair.fair_value,
-            "total_liquidity": fair.total_liquidity,
-            "venues_priced": len(fair.venues),
+            "contributors": len(contributors),
+            "contributor_venues": ",".join(c.venue for c in contributors),
+            "near_touch_notional": round(
+                sum(c.near_touch_notional for c in contributors), 2
+            ),
+            "saturation_bps": config.saturation_bps,
+            "liquidity_window_bps": config.liquidity_window_bps,
         }
+        for contributor in contributors:
+            detail[f"price_{contributor.venue}"] = contributor.price
+            detail[f"reliability_{contributor.venue}"] = round(
+                contributor.reliability, 4
+            )
 
-        for leg in opportunity.legs:
-            deviation = fair.deviation(leg.venue)
-            if deviation is None:
-                return None
-            detail[f"deviation_bps_{leg.venue}"] = deviation
-            # Buying should happen where the venue trades below fair value
-            # (negative deviation); selling where it trades above.
-            confirmation = -deviation if leg.side is Side.BUY else deviation
-            confirmations.append(confirmation)
-
-        if not confirmations:
-            return None
-
-        # The trade is only confirmed to the extent that *both* legs agree; the
-        # weakest leg governs, so a single rich venue cannot carry the trade.
-        edge_bps = min(confirmations) + sum(confirmations) / len(confirmations)
-        signal = _clamp(edge_bps / self.settings.noro.saturation_bps)
-        detail["confirmed_edge_bps"] = edge_bps
-
-        if signal > 0:
-            reasons.append("FAIR_VALUE_CONFIRMS_DISLOCATION")
+        if benchmark is None:
+            signal, confidence, reasons = self._no_independent_evidence(detail)
         else:
-            reasons.append("FAIR_VALUE_CONTRADICTS_DISLOCATION")
-        if any(c < 0 for c in confirmations):
-            reasons.append("LEG_AGAINST_FAIR_VALUE")
-
-        # Confidence rises with the liquidity behind the estimate and with the
-        # number of venues that could be priced.
-        liquidity_confidence = min(1.0, fair.total_liquidity / 250_000.0)
-        breadth = min(1.0, len(fair.venues) / 2.0)
-        confidence = _clamp(0.35 + 0.45 * liquidity_confidence + 0.2 * breadth, 0.0, 1.0)
+            scored = self._score_against(benchmark, legs, by_venue, detail)
+            if scored is None:
+                return None
+            signal, confidence, reasons = scored
 
         self.evaluations += 1
         return AgentOpinion(
             agent_id=AgentId.NORO,
-            symbol=opportunity.symbol,
-            created_at=now,
-            source_data_timestamp=self.market.source_data_timestamp,
+            symbol=symbol,
+            created_at=now_ms,
+            source_data_timestamp=source_ts,
             correlation_id=opportunity.opportunity_id,
             signal=signal,
             confidence=confidence,
-            expires_at=now + self.settings.noro.ttl_ms,
+            expires_at=now_ms + config.ttl_ms,
             reason_codes=reasons,
             model_version=VERSION,
             detail=detail,
+        )
+
+    def _no_independent_evidence(
+        self, detail: dict[str, float | int | str | bool | None]
+    ) -> tuple[float, float, list[str]]:
+        """Neither confirm nor contradict: there is nothing to judge against.
+
+        Every usable venue for this symbol is one of the opportunity's own two,
+        so any benchmark would be built from the very prices under judgement.
+        NORO reports a neutral signal at low confidence, which lets TIDAL and
+        ZEPHR carry the decision without NORO contributing a vote it has not
+        earned. Confidence is low rather than zero because "0 signal, full
+        confidence" would assert strong belief in neutrality, which is the
+        opposite of what is being said.
+        """
+        config = self.settings.noro
+        detail["independent_contributors"] = 0
+        detail["independent_venues"] = ""
+        detail["valuation_benchmark"] = None
+        detail["weakest_confirmation_bps"] = None
+        detail["valuation_dispersion_bps"] = None
+        detail["confidence_breadth"] = 0.0
+        detail["confidence_agreement"] = None
+        detail["confidence_quality"] = None
+        reasons = [INSUFFICIENT_INDEPENDENT_VALUATION_BREADTH]
+        return 0.0, config.insufficient_breadth_confidence, reasons
+
+    def _score_against(
+        self,
+        benchmark: FairValue,
+        legs: list[OpportunityLeg],
+        by_venue: dict[str, VenueValuation],
+        detail: dict[str, float | int | str | bool | None],
+    ) -> tuple[float, float, list[str]] | None:
+        """Confirm the opportunity against an independent benchmark.
+
+        The weakest leg governs, outright:
+
+            confirmed_edge_bps = min(per-leg confirmation)
+
+        The previous formula was ``min(confirmations) + mean(confirmations)``,
+        which let a strongly confirming leg buy off a contradicting one --
+        ``[-1, +10]`` came out positive, so "both legs must agree" was not what
+        the code did. Under ``min``, one negative leg makes the aggregate
+        negative and one neutral leg caps it at neutral, with no compensation
+        available.
+
+        That also lets ``saturation_bps`` finally mean what it says: the
+        aggregate is now a single leg's confirmation, so 15 bps of weakest-leg
+        confirmation maps to a signal of +1, and -15 bps to -1.
+        """
+        config = self.settings.noro
+        confirmations: list[float] = []
+        for leg in legs:
+            contributor = by_venue[leg.venue]
+            deviation = benchmark.deviation_of(contributor.price)
+            if deviation is None:
+                return None
+            detail[f"deviation_bps_{leg.venue}"] = round(deviation, 4)
+            # Buying is confirmed where the venue trades below the independent
+            # benchmark (negative deviation); selling where it trades above.
+            confirmation = -deviation if leg.side is Side.BUY else deviation
+            detail[f"confirmation_bps_{leg.venue}"] = round(confirmation, 4)
+            confirmations.append(confirmation)
+
+        weakest = min(confirmations)
+        signal = _clamp(weakest / config.saturation_bps)
+
+        independent = benchmark.venues
+        detail["independent_contributors"] = len(independent)
+        detail["independent_venues"] = ",".join(c.venue for c in independent)
+        detail["valuation_benchmark"] = benchmark.fair_value
+        detail["weakest_confirmation_bps"] = round(weakest, 4)
+        detail["valuation_dispersion_bps"] = round(benchmark.dispersion_bps, 4)
+
+        confidence = self._confidence(benchmark, detail)
+
+        reasons: list[str] = []
+        if weakest > 0:
+            reasons.append(FAIR_VALUE_CONFIRMS_DISLOCATION)
+        elif weakest < 0:
+            reasons.append(FAIR_VALUE_CONTRADICTS_DISLOCATION)
+            reasons.append(LEG_AGAINST_FAIR_VALUE)
+        else:
+            reasons.append(FAIR_VALUE_NEUTRAL_ON_DISLOCATION)
+        return signal, confidence, reasons
+
+    def _confidence(
+        self,
+        benchmark: FairValue,
+        detail: dict[str, float | int | str | bool | None],
+    ) -> float:
+        """How much NORO stands behind its own valuation.
+
+        Three components, deterministically combined at configured weights that
+        must sum to 1:
+
+        * **breadth** ``1 - 1/(1 + n)`` over independent contributors. Zero at
+          none, 0.5 at one, 0.667 at two, 0.75 at three -- diminishing, but it
+          never stops rising. The old formula saturated at exactly two venues,
+          so a fourth independent opinion was worth nothing.
+        * **agreement** falls linearly from 1 to 0 as the widest contributor
+          deviation approaches ``dispersion_tolerance_bps``. Venues that
+          disagree that much are not describing one price, and the old formula
+          did not look at disagreement at all.
+        * **quality** is the mean reliability weight of the contributors.
+
+        None of these measures how much could be traded. That is ZEPHR's
+        question, and answering it here is what pinned confidence near 1.0 in
+        production: a fixed $250k liquidity scale that every venue cleared by a
+        wide margin, so the term carried no information.
+        """
+        config = self.settings.noro
+        count = len(benchmark.venues)
+        breadth = 1.0 - 1.0 / (1.0 + count)
+        agreement = _clamp(
+            1.0 - benchmark.dispersion_bps / config.dispersion_tolerance_bps, 0.0, 1.0
+        )
+        quality = _clamp(benchmark.mean_reliability, 0.0, 1.0)
+        detail["confidence_breadth"] = round(breadth, 4)
+        detail["confidence_agreement"] = round(agreement, 4)
+        detail["confidence_quality"] = round(quality, 4)
+        return _clamp(
+            config.breadth_confidence_weight * breadth
+            + config.agreement_confidence_weight * agreement
+            + config.quality_confidence_weight * quality,
+            0.0,
+            1.0,
         )
 
     async def publish(self, opinion: AgentOpinion) -> None:
@@ -167,16 +378,54 @@ class Noro:
         )
 
     def _heartbeat(self) -> None:
-        priced = len(self.fair_values)
+        """Report *valuation readiness*, not merely "a price exists".
+
+        A single contributor gives a price but no second opinion, and calling
+        that "priced" reported NORO healthy on a market where no cross-venue
+        valuation was possible at all. Readiness now means a symbol has at
+        least :data:`MIN_VALUATION_CONTRIBUTORS` usable cross-venue
+        contributors.
+
+        The detail also names how many symbols reach
+        :data:`MIN_INFORMATIVE_CONTRIBUTORS`, because a symbol sitting at
+        exactly two contributors is one where NORO will only ever return the
+        neutral verdict -- healthy, answering honestly, and carrying no
+        information. An operator should be able to see that without reading
+        opinions one by one.
+        """
         expected = len(self.settings.symbols)
-        status = HealthStatus.HEALTHY
-        detail = ""
-        if priced == 0:
+        ready = [
+            fair
+            for fair in self.fair_values.values()
+            if fair.contributor_count >= MIN_VALUATION_CONTRIBUTORS
+        ]
+        informative = sum(
+            1
+            for fair in self.fair_values.values()
+            if fair.contributor_count >= MIN_INFORMATIVE_CONTRIBUTORS
+        )
+        widest = max(
+            (fair.contributor_count for fair in self.fair_values.values()), default=0
+        )
+
+        if not self.fair_values:
             status = HealthStatus.OFFLINE
-            detail = "no symbol priceable"
-        elif priced < expected:
+            detail = "no usable market data"
+        elif not ready:
             status = HealthStatus.DEGRADED
-            detail = f"priced {priced}/{expected} symbols"
+            detail = (
+                f"0/{expected} symbols valuation-ready: no symbol has the "
+                f"{MIN_VALUATION_CONTRIBUTORS} cross-venue contributors a "
+                f"valuation needs (widest: {widest})"
+            )
+        else:
+            status = HealthStatus.HEALTHY
+            detail = (
+                f"{len(ready)}/{expected} symbols valuation-ready, "
+                f"{informative} with the {MIN_INFORMATIVE_CONTRIBUTORS} "
+                "contributors needed to confirm or contradict an opportunity"
+            )
+
         self.health.heartbeat(
             SERVICE,
             status=status,

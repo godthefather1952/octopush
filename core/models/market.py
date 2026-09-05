@@ -104,6 +104,31 @@ class TradeEvent(Base):
         return self.price * self.size
 
 
+#: Distances from mid, in bps, at which resting depth is measured.
+#:
+#: This is the *contract* between the producer of :class:`BookMetrics` (TIDAL)
+#: and every consumer of its depth buckets. It lives here, beside the model
+#: that carries the buckets, rather than inside the producing agent, so a
+#: consumer can state which bucket it needs — and a configuration can be
+#: validated against the set — without importing an agent.
+#:
+#: Depth is measured at these distances and nowhere else. A consumer asking
+#: for 10.001 bps is asking for a measurement that was never taken, and the
+#: only honest answers are "reject the request" or "exclude the contributor" —
+#: never "here is the whole book instead", which silently answers a completely
+#: different question with a number one to two orders of magnitude larger.
+DEPTH_BUCKETS_BPS: tuple[float, ...] = (1.0, 5.0, 10.0, 25.0)
+
+
+def depth_bucket_key(window_bps: float) -> str:
+    """The :class:`BookMetrics` dict key for a depth bucket.
+
+    One formatting rule, shared by the producer and every consumer, so the two
+    cannot drift into writing ``"10"`` and reading ``"10.0"``.
+    """
+    return f"{window_bps:g}"
+
+
 class BookMetrics(Base):
     """Microstructure statistics derived from a single venue's book."""
 
@@ -131,6 +156,25 @@ class BookMetrics(Base):
         if total <= 0:
             return 0.0
         return (self.buy_volume - self.sell_volume) / total
+
+    def depth_within(self, window_bps: float) -> tuple[float, float] | None:
+        """``(bid, ask)`` notional resting within ``window_bps`` of mid.
+
+        ``None`` when that bucket was not measured on this snapshot — either
+        the distance is not one of :data:`DEPTH_BUCKETS_BPS`, or the book was
+        too poor for metrics to be computed at all. The caller must treat that
+        as *no evidence at this distance* and exclude the venue. There is
+        deliberately no fallback to :attr:`bid_depth_notional` /
+        :attr:`ask_depth_notional`: whole-book depth answers a different
+        question, and substituting it silently makes a venue that measured
+        nothing near the touch look like the deepest contributor in the market.
+        """
+        key = depth_bucket_key(window_bps)
+        bid = self.bid_depth_by_bps.get(key)
+        ask = self.ask_depth_by_bps.get(key)
+        if bid is None or ask is None:
+            return None
+        return bid, ask
 
 
 class VenueMarketState(Base):

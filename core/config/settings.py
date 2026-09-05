@@ -23,6 +23,7 @@ from pydantic import (
 )
 
 from core.models.common import AgentId, TradingMode
+from core.models.market import DEPTH_BUCKETS_BPS
 
 ENV_PREFIX = "TF_"
 
@@ -382,16 +383,98 @@ class ZephrConfig(BaseModel):
 
 
 class NoroConfig(BaseModel):
+    """NORO's valuation settings.
+
+    NORO owns *valuation*: whether the proposed direction is mispriced against
+    independent market evidence. It does not own *executability* -- how much
+    can actually be traded, and at what cost, is ZEPHR's question. Nothing here
+    is an execution-capacity setting; the depth window below is a measure of
+    how much price discovery stands behind a venue's quote, deliberately
+    bounded so that it cannot become a proxy for tradeable size.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    #: Depth window (bps from mid) used to weight each venue's contribution.
-    liquidity_window_bps: float = Field(default=10.0, gt=0.0)
+    #: Distance from mid, in bps, at which a venue's near-touch depth is read
+    #: as evidence of price-discovery reliability.
+    #:
+    #: Must be one of :data:`~core.models.market.DEPTH_BUCKETS_BPS`. TIDAL
+    #: measures depth at those distances and no others, so any other value
+    #: names a measurement that was never taken.
+    liquidity_window_bps: float = Field(default=10.0, gt=0.0, allow_inf_nan=False)
     #: Weight given to the microprice vs the mid when forming a venue price.
-    microprice_weight: float = Field(default=0.5, ge=0.0, le=1.0)
+    microprice_weight: float = Field(default=0.5, ge=0.0, le=1.0, allow_inf_nan=False)
+    #: Hard cap, in bps, on how far the microprice may displace a venue's
+    #: valuation price from its mid.
+    #:
+    #: The microprice always sits between bid and ask, so on a wide book its
+    #: distance from mid grows with the spread: a 40 bps book can hand the
+    #: valuation a 10 bps displacement out of pure touch imbalance, which then
+    #: outweighs every independent venue's evidence. Touch imbalance may refine
+    #: a price; it must not overpower the rest of the market.
+    microprice_max_displacement_bps: float = Field(
+        default=2.0, ge=0.0, allow_inf_nan=False
+    )
     #: Opinion TTL.
     ttl_ms: int = Field(default=2_000, gt=0)
-    #: Deviation, in bps, at which the signal saturates to |1|.
-    saturation_bps: float = Field(default=15.0, gt=0.0)
+    #: Weakest-leg confirmation, in bps, at which the signal saturates to |1|.
+    saturation_bps: float = Field(default=15.0, gt=0.0, allow_inf_nan=False)
+    #: Near-touch notional at which a venue's reliability weight reaches its
+    #: maximum. Weights are bounded at 1.0, so past this point extra depth buys
+    #: no extra influence -- that bound is what stops one enormous venue from
+    #: simply becoming the benchmark.
+    reliability_saturation_notional: float = Field(
+        default=100_000.0, gt=0.0, allow_inf_nan=False
+    )
+    #: Dispersion, in bps, among independent contributors at which agreement
+    #: confidence falls to zero. Venues that disagree this much are not
+    #: describing one price.
+    dispersion_tolerance_bps: float = Field(default=20.0, gt=0.0, allow_inf_nan=False)
+    #: Confidence components. The three weights must sum to exactly 1.
+    breadth_confidence_weight: float = Field(
+        default=0.4, ge=0.0, le=1.0, allow_inf_nan=False
+    )
+    agreement_confidence_weight: float = Field(
+        default=0.3, ge=0.0, le=1.0, allow_inf_nan=False
+    )
+    quality_confidence_weight: float = Field(
+        default=0.3, ge=0.0, le=1.0, allow_inf_nan=False
+    )
+    #: Confidence attached to a neutral opinion issued because no independent
+    #: valuation evidence exists. Low, because NORO is saying it does not know
+    #: -- but non-zero, so the opinion stays visible rather than vanishing from
+    #: the weighted consensus as though it had never been asked.
+    insufficient_breadth_confidence: float = Field(
+        default=0.1, ge=0.0, le=1.0, allow_inf_nan=False
+    )
+
+    @field_validator("liquidity_window_bps")
+    @classmethod
+    def _window_is_a_measured_bucket(cls, v: float) -> float:
+        if v not in DEPTH_BUCKETS_BPS:
+            supported = ", ".join(f"{b:g}" for b in DEPTH_BUCKETS_BPS)
+            raise ValueError(
+                f"liquidity_window_bps must name a measured depth bucket, got "
+                f"{v!r}; supported: {supported}. Depth is measured at those "
+                "distances and nowhere else, so any other value asks for a "
+                "measurement that was never taken"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _confidence_weights_sum_to_one(self) -> NoroConfig:
+        total = (
+            self.breadth_confidence_weight
+            + self.agreement_confidence_weight
+            + self.quality_confidence_weight
+        )
+        if abs(total - 1.0) > 1e-9:
+            raise ValueError(
+                f"breadth/agreement/quality confidence weights sum to {total}, "
+                "not 1.0: confidence would no longer span [0, 1] and could not "
+                "be compared against any other agent's"
+            )
+        return self
 
 
 class LumenConfig(BaseModel):

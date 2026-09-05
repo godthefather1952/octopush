@@ -9,10 +9,17 @@ from dataclasses import dataclass, field
 
 from agents.tidal.book import LocalOrderBook
 from core.models.common import Millis, Side
-from core.models.market import BookMetrics, safe_bps
+from core.models.market import (
+    DEPTH_BUCKETS_BPS,
+    BookMetrics,
+    depth_bucket_key,
+    safe_bps,
+)
 
-#: Distances from mid, in bps, at which resting depth is measured.
-DEPTH_BUCKETS_BPS = (1.0, 5.0, 10.0, 25.0)
+# DEPTH_BUCKETS_BPS is re-exported here, unchanged, for the callers that have
+# always imported it from this module. It now *lives* beside the model that
+# carries the buckets (core.models.market) so that consumers and configuration
+# can be validated against it without importing this agent.
 
 
 @dataclass
@@ -125,7 +132,7 @@ def compute_metrics(
     metrics.bid_depth_notional = sum(level.price * level.size for level in book.levels(Side.BUY))
     metrics.ask_depth_notional = sum(level.price * level.size for level in book.levels(Side.SELL))
     for bucket in DEPTH_BUCKETS_BPS:
-        key = f"{bucket:g}"
+        key = depth_bucket_key(bucket)
         metrics.bid_depth_by_bps[key] = depth_within_bps(book, Side.BUY, mid, bucket)
         metrics.ask_depth_by_bps[key] = depth_within_bps(book, Side.SELL, mid, bucket)
 
