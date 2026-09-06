@@ -359,3 +359,186 @@ class TestTheSnapshotIsDerivedNotStored:
 
     def test_an_empty_platform_reserves_nothing(self):
         assert committed(platform()).is_zero
+
+
+# ======================================================================
+# P5-18 — worst-case unhedged leg risk, derived from the same order walk
+# ======================================================================
+
+
+class TestPendingUnhedgedFillRisk:
+    """``unhedged_fill_risk`` is a bound on a residual that does not exist yet.
+
+    Not actual unhedged exposure — that is OKAPI's measurement of the FILLED
+    book — but the largest residual the orders currently working could produce
+    if their legs land in the most adverse order. Accumulated per symbol by
+    side, on the same walk over the same unresolved entry orders, so it cannot
+    describe a different set of orders from the rest of the snapshot.
+    """
+
+    def test_a_balanced_pair_still_bounds_one_whole_leg(self):
+        """The heart of P5-18. Net exposure nets to zero; the fill-sequence
+        bound does not, because between the first fill and the second the book
+        is one-sided by a full leg."""
+        proposed = intent()
+        snapshot = committed(
+            platform(
+                order("buy", intent_id=proposed.intent_id, side=Side.BUY),
+                order(
+                    "sell",
+                    intent_id=proposed.intent_id,
+                    side=Side.SELL,
+                    venue=VENUE_B,
+                ),
+                records=[entry_record("opp-1", proposed, ["buy", "sell"])],
+            )
+        )
+        assert snapshot.net_exposure == pytest.approx(0.0)
+        assert snapshot.gross_exposure == pytest.approx(20_000.0)
+        assert snapshot.unhedged_fill_risk == pytest.approx(10_000.0), (
+            "one whole leg, not the net (zero) and not the gross (20,000)"
+        )
+
+    def test_the_worse_side_wins_on_one_symbol(self):
+        """§21. 8,000 of BUY and 5,000 of SELL still working on one symbol
+        bounds at 8,000 — not 3,000 net, and not 13,000 gross. It is a
+        fill-SEQUENCE bound, which is neither of those things."""
+        proposed = intent()
+        record = entry_record("opp-1", proposed, ["b1", "b2", "s1"])
+        snapshot = committed(
+            platform(
+                order("b1", intent_id=proposed.intent_id, quantity=50.0),
+                order("b2", intent_id=proposed.intent_id, quantity=30.0),
+                order(
+                    "s1",
+                    intent_id=proposed.intent_id,
+                    side=Side.SELL,
+                    quantity=50.0,
+                    venue=VENUE_B,
+                ),
+                records=[record],
+            )
+        )
+        assert snapshot.unhedged_fill_risk == pytest.approx(8_000.0)
+
+    def test_symbols_are_summed_because_each_can_go_one_sided(self):
+        """§22. BTC balanced at 5k a side and ETH balanced at 4k a side bounds
+        at 9k: both symbols can be transiently one-sided at once, and
+        ``Okapi.total_unhedged`` sums absolute residuals per symbol."""
+        proposed = intent()
+        ids = ["btc-b", "btc-s", "eth-b", "eth-s"]
+        snapshot = committed(
+            platform(
+                order("btc-b", intent_id=proposed.intent_id, quantity=50.0),
+                order(
+                    "btc-s",
+                    intent_id=proposed.intent_id,
+                    side=Side.SELL,
+                    quantity=50.0,
+                    venue=VENUE_B,
+                ),
+                order(
+                    "eth-b",
+                    intent_id=proposed.intent_id,
+                    symbol="ETH-USD",
+                    quantity=40.0,
+                ),
+                order(
+                    "eth-s",
+                    intent_id=proposed.intent_id,
+                    symbol="ETH-USD",
+                    side=Side.SELL,
+                    quantity=40.0,
+                    venue=VENUE_B,
+                ),
+                records=[entry_record("opp-1", proposed, ids)],
+            )
+        )
+        assert snapshot.unhedged_fill_risk == pytest.approx(9_000.0)
+
+    def test_the_same_symbol_across_venues_still_offsets(self):
+        """Unhedged residual is a delta measured across venues, so a BUY on one
+        venue and a SELL on another are two positions but one symbol — they
+        cancel for this bound even though they never cancel for the position
+        limit."""
+        proposed = intent()
+        snapshot = committed(
+            platform(
+                order("a", intent_id=proposed.intent_id, venue=VENUE_A),
+                order(
+                    "b", intent_id=proposed.intent_id, venue=VENUE_B, side=Side.SELL
+                ),
+                records=[entry_record("opp-1", proposed, ["a", "b"])],
+            )
+        )
+        assert len(snapshot.position_exposure) == 2
+        assert snapshot.unhedged_fill_risk == pytest.approx(10_000.0)
+
+    @pytest.mark.parametrize(
+        ("filled", "expected"),
+        [(0.0, 10_000.0), (25.0, 7_500.0), (50.0, 5_000.0), (100.0, 0.0)],
+    )
+    def test_a_partial_fill_shrinks_the_pending_bound(self, filled, expected):
+        """§I. The filled part is no longer pending — it is an actual residual
+        OKAPI now measures. The bound shrinks by exactly what the measurement
+        gains, which is the same derived-state handoff P5-1 relies on."""
+        proposed = intent()
+        one = order(
+            "ord-1",
+            intent_id=proposed.intent_id,
+            filled_quantity=filled,
+            status=OrderStatus.PARTIALLY_FILLED,
+        )
+        snapshot = committed(
+            platform(one, records=[entry_record("opp-1", proposed, ["ord-1"])])
+        )
+        assert snapshot.unhedged_fill_risk == pytest.approx(expected)
+
+    @pytest.mark.parametrize("status", TERMINAL)
+    def test_a_terminal_entry_order_releases_the_bound(self, status):
+        """§J. Nothing left that can fill, so nothing left that can go
+        one-sided."""
+        proposed = intent()
+        one = order("ord-1", intent_id=proposed.intent_id, status=status)
+        snapshot = committed(
+            platform(one, records=[entry_record("opp-1", proposed, ["ord-1"])])
+        )
+        assert snapshot.unhedged_fill_risk == pytest.approx(0.0)
+
+    def test_an_unknown_entry_order_keeps_its_bound(self):
+        """§K. UNKNOWN means the venue-side truth is not known, not that the
+        order is gone — it may still fill and go one-sided."""
+        proposed = intent()
+        one = order("ord-1", intent_id=proposed.intent_id, status=OrderStatus.UNKNOWN)
+        snapshot = committed(
+            platform(one, records=[entry_record("opp-1", proposed, ["ord-1"])])
+        )
+        assert snapshot.unhedged_fill_risk == pytest.approx(10_000.0)
+
+    def test_exits_and_hedges_consume_no_pending_budget(self):
+        """§L. They reduce exposure. Charging them against the entry fill-risk
+        budget would make the platform's own risk reduction look like risk
+        taking — and could stop it hedging its way out of a breach."""
+        proposed = intent()
+        snapshot = committed(
+            platform(
+                order("exit-1", intent_id="int-exit", side=Side.SELL),
+                order("hedge-1", intent_id="int-hedge", side=Side.SELL),
+                records=[entry_record("opp-1", proposed, ["exit-1"])],
+                hedges={SYMBOL: ["hedge-1"]},
+            )
+        )
+        assert snapshot.unhedged_fill_risk == pytest.approx(0.0)
+        assert snapshot.is_zero
+
+    def test_an_unclassifiable_order_still_contributes(self):
+        """The fail-closed fallback covers this dimension too. An order
+        conservatively counted as an entry commitment must not vanish from the
+        fill-risk bound — that would reserve gross while ignoring the residual
+        the same order could create."""
+        snapshot = committed(platform(order("orphan", intent_id="int-gone")))
+        assert snapshot.gross_exposure == pytest.approx(10_000.0)
+        assert snapshot.unhedged_fill_risk == pytest.approx(10_000.0)
+
+    def test_an_empty_platform_has_no_pending_fill_risk(self):
+        assert committed(platform()).unhedged_fill_risk == pytest.approx(0.0)

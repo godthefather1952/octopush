@@ -192,13 +192,49 @@ class TestHardGates:
         assert "MAX_DRAWDOWN" in decision.reason_codes
 
     def test_unhedged_exposure_blocks(self, rune):
-        decision = rune.evaluate(intent(), context(unhedged_notional=50_000.0))
-        assert "MAX_UNHEDGED_EXPOSURE" in decision.reason_codes
+        """No trade is authorised while the residual is already past its limit.
 
-    def test_oversized_order_is_cut_to_the_limit(self, rune):
+        The rejection now arrives through MIN_TRADE_NOTIONAL rather than
+        naming the gate: MAX_UNHEDGED_EXPOSURE gained a headroom solver in
+        Phase 5 Remediation D (P5-18), so a state no reduction can rescue
+        leaves zero headroom and ``evaluate`` short-circuits — the same shape
+        every other size-sensitive limit already had.
+        """
+        decision = rune.evaluate(intent(), context(unhedged_notional=50_000.0))
+        assert decision.verdict is RiskVerdict.REJECTED
+        assert decision.approved_notional == 0.0
+
+    def test_oversized_order_is_cut_to_the_tightest_limit(self, rune):
+        """Under the shipped defaults the unhedged budget binds before the
+        order limit does.
+
+        ``max_order_notional`` is 25,000 and ``max_unhedged_notional`` is
+        10,000, and a two-leg delta-neutral trade holds one whole leg of
+        one-sided exposure between its first fill and its second — so the
+        largest safe per-leg size is the unhedged budget divided by the
+        slippage allowance, not the order limit (P5-18). Both gates pass on
+        the sized intent, which is the property that matters.
+        """
         decision = rune.evaluate(intent(notional=999_999.0), context())
         assert decision.verdict is RiskVerdict.APPROVED_REDUCED
-        assert decision.approved_notional == pytest.approx(rune.limits.max_order_notional)
+        assert decision.approved_notional < rune.limits.max_order_notional
+        assert decision.approved_notional == pytest.approx(
+            rune.limits.max_unhedged_notional / 1.001
+        )
+        assert gate(decision, "MAX_ORDER_NOTIONAL").result is GateResult.PASS
+        assert gate(decision, "MAX_UNHEDGED_EXPOSURE").result is GateResult.PASS
+
+    def test_the_order_limit_still_binds_when_it_is_the_tightest(self, clock):
+        """The control for the test above: with an ample unhedged budget the
+        cut is back to ``max_order_notional``."""
+        rune = RuneCore(RiskLimits(max_unhedged_notional=1_000_000.0), clock)
+        decision = rune.evaluate(
+            intent(notional=999_999.0), context(max_economical_notional=1_000_000.0)
+        )
+        assert decision.verdict is RiskVerdict.APPROVED_REDUCED
+        assert decision.approved_notional == pytest.approx(
+            rune.limits.max_order_notional
+        )
         assert gate(decision, "MAX_ORDER_NOTIONAL").result is GateResult.PASS
 
     def test_venue_exposure_caps_the_size(self, clock):

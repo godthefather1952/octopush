@@ -50,6 +50,9 @@ OPEN = dict(
     max_venue_exposure=1_000_000.0,
     max_strategy_exposure=10_000_000.0,
     max_leverage=1_000_000.0,
+    # MAX_UNHEDGED_EXPOSURE became size-sensitive in Remediation D (P5-18),
+    # so 'wide everywhere' now has to include it.
+    max_unhedged_notional=10_000_000.0,
 )
 OPEN_CTX = {"max_economical_notional": 10_000_000.0}
 

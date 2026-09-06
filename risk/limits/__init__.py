@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from core.config import RiskLimits
-from core.models.common import Millis
+from core.models.common import Millis, Side
 from core.models.opportunity import TradeIntent
 from core.models.ops import HealthStatus, KillSwitchState, SystemHealth
 from core.models.portfolio import PortfolioState
@@ -448,24 +448,139 @@ def gate_drawdown(portfolio: PortfolioState, limits: RiskLimits) -> GateCheck:
     )
 
 
-def gate_unhedged(unhedged_notional: float, limits: RiskLimits) -> GateCheck:
-    """Residual delta OKAPI has measured, against its limit.
+def unhedged_fill_factor(intent: TradeIntent) -> int:
+    """How many per-leg notionals of residual the intent can transiently hold.
 
-    DELIBERATELY TAKES NO COMMITTED-EXPOSURE ARGUMENT
-    ================================================
-    ``unhedged_notional`` is a *measurement* of delta OKAPI has observed in the
-    filled book, not a projection of what a trade might leave behind. Committed
-    exposure describes orders that have not filled, and an order that has not
-    filled has left no residual to hedge. Feeding one into the other would
-    manufacture a pre-trade unhedged number out of orders that may yet cancel —
-    a different finding with a different fix, not this one.
+    An intent's FINAL delta may be zero and its worst INTERMEDIATE delta still
+    be a full leg: a cross-venue BUY/SELL pair is delta-neutral only once both
+    legs have filled, and between the first fill and the second the book holds
+    one whole leg of one-sided exposure.
+
+    Legs are grouped by symbol, and each symbol contributes
+    ``max(buy_legs, sell_legs)``: if every BUY on that symbol fills before any
+    SELL, the transient residual is the BUY side; if the SELLs go first, it is
+    the SELL side; the worst magnitude is the larger of the two. Symbols are
+    then SUMMED, because each can independently become one-sided and OKAPI's
+    ``total_unhedged`` is itself ``sum(abs(residual per symbol))`` — the same
+    aggregation, so the bound is stated in the units the limit is measured in.
+
+    * 1 BUY BTC                                  -> 1
+    * BUY BTC + SELL BTC                         -> 1
+    * 2 BUY BTC + 1 SELL BTC                     -> 2
+    * BUY BTC + SELL ETH                         -> 2
+    * BUY BTC + SELL BTC + BUY ETH + SELL ETH    -> 2
     """
+    per_symbol: dict[str, list[int]] = {}
+    for leg in intent.legs:
+        counts = per_symbol.setdefault(leg.symbol, [0, 0])
+        counts[0 if leg.side is Side.BUY else 1] += 1
+    return sum(max(buys, sells) for buys, sells in per_symbol.values())
+
+
+def execution_multiplier(intent: TradeIntent) -> float:
+    """Conservative allowance for filling worse than the expected price.
+
+    VESKA sizes each leg as ``notional / routing.expected_price``, but a
+    marketable order may fill above that price — up to the slippage budget the
+    intent itself carries. Taking the worst-case filled quote exposure as
+    exactly ``notional`` therefore still permits a trade that lands slightly
+    over a hard limit.
+
+    Uses the intent's existing ``max_slippage_bps`` rather than a new
+    configurable buffer: that number is already the platform's own statement of
+    how far a fill may stray, and inventing a second one would give the same
+    question two answers.
+    """
+    return 1.0 + max(0.0, intent.max_slippage_bps) / 10_000.0
+
+
+def gate_unhedged(
+    intent: TradeIntent,
+    unhedged_notional: float,
+    limits: RiskLimits,
+    *,
+    committed: CommittedExposure | None = None,
+) -> GateCheck:
+    """Worst-case unhedged residual once this intent is working.
+
+    MAX_UNHEDGED_EXPOSURE IS SIZE-SENSITIVE
+    =======================================
+    It used to compare ``abs(ctx.unhedged_notional)`` — the residual already
+    present in the FILLED book — against the limit, and nothing else. That
+    treated the gate as a pure current-state check, and the default
+    configuration then let RUNE authorise 25,000 per leg against a 10,000 hard
+    unhedged ceiling: an ordinary two-leg delta-neutral trade whose final delta
+    is zero, but whose known worst intermediate state is one full leg of
+    one-sided exposure. The post-fill backstop caught it afterwards, correctly
+    and every time; the pre-trade projection was the incomplete half (P5-18).
+
+    Three terms, all in quote notional:
+
+    * ``actual``   — the residual OKAPI measures right now;
+    * ``pending``  — :attr:`CommittedExposure.unhedged_fill_risk`, the worst
+      case from entry orders already working and not yet filled;
+    * ``incoming`` — this intent, at ``notional * fill factor * execution
+      multiplier``.
+
+    WHY ADDING THEM IS DELIBERATELY CONSERVATIVE
+    ============================================
+    ``unhedged_notional`` is an unsigned aggregate: it does not retain the
+    signed direction of each per-symbol residual, so the sum cannot know that
+    an incoming first fill might offset an existing residual instead of adding
+    to it. The result is an upper bound that can overstate, never understate.
+    For a hard safety limit that is the correct direction to be wrong in, and
+    it is not offered as an exact post-fill predictor.
+    """
+    reserved = _resolved(committed)
+    actual = abs(unhedged_notional)
+    pending = reserved.unhedged_fill_risk
+    incoming = (
+        intent.notional * unhedged_fill_factor(intent) * execution_multiplier(intent)
+    )
+    projected = actual + pending + incoming
     return _check(
         "MAX_UNHEDGED_EXPOSURE",
-        abs(unhedged_notional) <= limits.max_unhedged_notional,
-        observed=abs(unhedged_notional),
+        projected <= limits.max_unhedged_notional,
+        observed=projected,
         limit=limits.max_unhedged_notional,
+        detail=(
+            f"{actual:,.2f} actual + {pending:,.2f} pending + "
+            f"{incoming:,.2f} incoming"
+        ),
     )
+
+
+def unhedged_headroom(
+    intent: TradeIntent,
+    unhedged_notional: float,
+    limits: RiskLimits,
+    *,
+    committed: CommittedExposure | None = None,
+) -> float:
+    """Largest per-leg notional keeping worst-case unhedged inside its limit.
+
+    Mirrors :func:`gate_unhedged` term for term, so a trade is sized against
+    exactly what it is then judged against. ``gate_unhedged`` computes
+    ``actual + pending + n * factor * multiplier <= limit``, which is linear in
+    ``n`` and rearranges to ``n <= (limit - actual - pending) / (factor *
+    multiplier)``.
+
+    Zero when the base alone already breaches: no reduction can help, and the
+    gate remains the fail-closed authority. A non-finite ``unhedged_notional``
+    also lands on zero, because every comparison against it is false and
+    ``max(0.0, nan)`` is ``0.0`` — an unknown residual is not an acceptable one.
+    """
+    reserved = _resolved(committed)
+    remaining = (
+        limits.max_unhedged_notional
+        - abs(unhedged_notional)
+        - reserved.unhedged_fill_risk
+    )
+    factor = unhedged_fill_factor(intent)
+    if factor <= 0:
+        # A legless intent creates no residual, so this limit does not bind.
+        return float("inf")
+    return max(0.0, remaining / (factor * execution_multiplier(intent)))
 
 
 def gate_open_orders(
@@ -589,6 +704,7 @@ __all__ = [
     "Gate",
     "GateCheck",
     "GateResult",
+    "execution_multiplier",
     "gate_consensus",
     "gate_daily_loss",
     "gate_data_age",
@@ -615,4 +731,6 @@ __all__ = [
     "leverage_headroom",
     "net_exposure_coefficient",
     "net_exposure_headroom",
+    "unhedged_fill_factor",
+    "unhedged_headroom",
 ]

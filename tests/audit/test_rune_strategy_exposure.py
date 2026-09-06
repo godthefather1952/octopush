@@ -62,6 +62,10 @@ LIMITS = RiskLimits(
     max_venue_exposure=1_000_000.0,
     max_net_exposure=1_000_000.0,
     max_leverage=100.0,
+    # Opened with the rest: MAX_UNHEDGED_EXPOSURE became
+    # size-sensitive in Remediation D (P5-18), and this
+    # fixture isolates a different limit.
+    max_unhedged_notional=1_000_000.0,
 )
 
 PER_LEG = 25_000.0

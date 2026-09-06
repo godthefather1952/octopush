@@ -73,17 +73,29 @@ def commit(reserved: CommittedExposure, proposed, approved_notional: float):
     net = reserved.net_exposure
     by_venue = dict(reserved.venue_exposure)
     by_position = dict(reserved.position_exposure)
+    # Per-symbol side totals, for the worst-case fill-sequence bound (P5-18).
+    # Rebuilt from this call's legs alone and added to the running total,
+    # because the previous snapshot keeps only the bound, not the sides.
+    buys: dict[str, float] = {}
+    sells: dict[str, float] = {}
     for one in proposed.legs:
         gross += approved_notional
         net += approved_notional * one.side.sign
         by_venue[one.venue] = by_venue.get(one.venue, 0.0) + approved_notional
         key = f"{one.venue}:{one.symbol}"
         by_position[key] = by_position.get(key, 0.0) + approved_notional
+        side = buys if one.side is Side.BUY else sells
+        side[one.symbol] = side.get(one.symbol, 0.0) + approved_notional
+    fill_risk = reserved.unhedged_fill_risk + sum(
+        max(buys.get(symbol, 0.0), sells.get(symbol, 0.0))
+        for symbol in set(buys) | set(sells)
+    )
     return CommittedExposure(
         gross_exposure=gross,
         net_exposure=net,
         venue_exposure=by_venue,
         position_exposure=by_position,
+        unhedged_fill_risk=fill_risk,
     )
 
 
@@ -208,6 +220,10 @@ class TestGrossExposureUnderConcurrentAuthorisation:
         max_net_exposure=1_000_000.0,
         max_strategy_exposure=1_000_000.0,
         max_leverage=100.0,
+        # Opened with the rest: MAX_UNHEDGED_EXPOSURE became
+        # size-sensitive in Remediation D (P5-18), and this
+        # fixture isolates a different limit.
+        max_unhedged_notional=1_000_000.0,
     )
 
     @staticmethod
@@ -302,6 +318,10 @@ class TestVenueExposureUnderConcurrentAuthorisation:
         max_net_exposure=1_000_000.0,
         max_strategy_exposure=1_000_000.0,
         max_leverage=100.0,
+        # Opened with the rest: MAX_UNHEDGED_EXPOSURE became
+        # size-sensitive in Remediation D (P5-18), and this
+        # fixture isolates a different limit.
+        max_unhedged_notional=1_000_000.0,
     )
 
     @staticmethod
@@ -384,6 +404,10 @@ class TestPositionExposureUnderConcurrentAuthorisation:
         max_net_exposure=1_000_000.0,
         max_strategy_exposure=1_000_000.0,
         max_leverage=100.0,
+        # Opened with the rest: MAX_UNHEDGED_EXPOSURE became
+        # size-sensitive in Remediation D (P5-18), and this
+        # fixture isolates a different limit.
+        max_unhedged_notional=1_000_000.0,
     )
 
     def test_two_authorisations_on_one_position_stay_within_its_limit(self):
@@ -461,6 +485,10 @@ class TestNetExposureUnderConcurrentAuthorisation:
         max_venue_exposure=1_000_000.0,
         max_strategy_exposure=1_000_000.0,
         max_leverage=100.0,
+        # Opened with the rest: MAX_UNHEDGED_EXPOSURE became
+        # size-sensitive in Remediation D (P5-18), and this
+        # fixture isolates a different limit.
+        max_unhedged_notional=1_000_000.0,
     )
 
     @staticmethod
@@ -552,6 +580,10 @@ class TestLeverageUnderConcurrentAuthorisation:
         max_venue_exposure=1_000_000.0,
         max_net_exposure=1_000_000.0,
         max_strategy_exposure=1_000_000.0,
+        # Opened with the rest: MAX_UNHEDGED_EXPOSURE became
+        # size-sensitive in Remediation D (P5-18), and this
+        # fixture isolates a different limit.
+        max_unhedged_notional=1_000_000.0,
     )
 
     @pytest.mark.parametrize("count", [1, 2, 3])
@@ -697,6 +729,10 @@ class TestSettledExposureIsCountedCorrectly:
         max_net_exposure=1_000_000.0,
         max_venue_exposure=1_000_000.0,
         max_leverage=100.0,
+        # Opened with the rest: MAX_UNHEDGED_EXPOSURE became
+        # size-sensitive in Remediation D (P5-18), and this
+        # fixture isolates a different limit.
+        max_unhedged_notional=1_000_000.0,
     )
 
     def test_a_filled_first_trade_blocks_the_third(self):

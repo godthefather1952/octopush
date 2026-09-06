@@ -186,7 +186,15 @@ class RuneCore:
             gates.gate_strategy_exposure(intent, ctx.strategy_exposure, self.limits),
             gates.gate_daily_loss(ctx.portfolio, self.limits),
             gates.gate_drawdown(ctx.portfolio, self.limits),
-            gates.gate_unhedged(ctx.unhedged_notional, self.limits),
+            # Worst-case unhedged, not just the residual already filled: a
+            # delta-neutral pair holds one whole leg of one-sided exposure
+            # between its first fill and its second (P5-18).
+            gates.gate_unhedged(
+                intent,
+                ctx.unhedged_notional,
+                self.limits,
+                committed=ctx.committed_exposure,
+            ),
             # The SIZED intent's leg count, which is also the original's:
             # reducing a notional never changes how many orders VESKA plans.
             gates.gate_open_orders(ctx.open_orders, len(intent.legs), self.limits),
@@ -246,6 +254,15 @@ class RuneCore:
         authorised (P5-7). Both are now solved for directly, next to the gates
         they mirror, in :mod:`risk.limits`.
 
+        A third was missing for a subtler reason. MAX_UNHEDGED_EXPOSURE was
+        classified as a pure current-state gate, because the residual it reads
+        is measured rather than projected. But an intent's WORST INTERMEDIATE
+        residual scales with its notional — a two-leg delta-neutral trade holds
+        one whole leg of one-sided exposure between its first fill and its
+        second — so the gate is size-sensitive after all, and the default
+        configuration let RUNE authorise 25,000 per leg against a 10,000 hard
+        unhedged ceiling (P5-18). It is now sized for here like the rest.
+
         The one deliberate exclusion is MAX_OPEN_ORDERS: an intent creates one
         order per leg regardless of its notional, so no reduction can make that
         gate pass and rejection is the only correct answer.
@@ -284,6 +301,9 @@ class RuneCore:
             ),
             gates.leverage_headroom(
                 intent, ctx.portfolio, self.limits, committed=committed
+            ),
+            gates.unhedged_headroom(
+                intent, ctx.unhedged_notional, self.limits, committed=committed
             ),
         ]
 
@@ -332,6 +352,12 @@ class RuneCore:
         the platform was fully committed against it. The committed share is
         also reported on its own, so a number that moved because an order was
         submitted is distinguishable from one that moved because a fill landed.
+
+        ``unhedged_notional`` is the ONE exception: it keeps meaning the ACTUAL
+        residual OKAPI measured in the filled book. Worst-case leg-fill risk is
+        reported alongside it as ``pending_unhedged_fill_risk`` rather than
+        folded into it, because a residual an order might create is not a
+        residual the platform holds (P5-18).
         """
         reserved = CommittedExposure() if committed is None else committed
         venue_exposure = portfolio.exposure_by_venue()
@@ -354,4 +380,5 @@ class RuneCore:
             max_strategy_exposure=self.limits.max_strategy_exposure,
             committed_gross_exposure=reserved.gross_exposure,
             committed_net_exposure=reserved.net_exposure,
+            pending_unhedged_fill_risk=reserved.unhedged_fill_risk,
         )

@@ -110,6 +110,26 @@ class CommittedExposure(Base):
     #: ``"venue:symbol"`` -> unsigned committed notional on that position, keyed
     #: exactly as ``PortfolioState.positions`` is.
     position_exposure: dict[str, float] = Field(default_factory=dict)
+    #: Worst-case ADDITIONAL unhedged quote notional that could arise from the
+    #: currently unresolved entry orders if their legs fill in the most adverse
+    #: sequence — every BUY on a symbol landing before any of its SELLs, or the
+    #: reverse — before their offsets do (P5-18).
+    #:
+    #: THIS IS NOT ACTUAL UNHEDGED EXPOSURE. Actual unhedged exposure is
+    #: OKAPI's measurement of the residual delta in the FILLED book; this is a
+    #: bound on a residual that does not exist yet and may never exist. The two
+    #: must not be confused:
+    #:
+    #: * it is deliberately absent from ``RiskUtilization.unhedged_notional``,
+    #:   which means, and must keep meaning, actual filled-book residual;
+    #: * it is deliberately never fed to the kill switch's live-breach
+    #:   predicate, which fires on state that exists, not on state an order
+    #:   could create — otherwise the emergency layer would engage merely
+    #:   because a trade is in flight.
+    #:
+    #: Pre-trade RUNE owns projected leg-fill risk; the post-fill backstop owns
+    #: the actual breached state. This field belongs to the first of those.
+    unhedged_fill_risk: float = 0.0
 
     @property
     def is_zero(self) -> bool:
@@ -118,6 +138,7 @@ class CommittedExposure(Base):
         return (
             self.gross_exposure == 0.0
             and self.net_exposure == 0.0
+            and self.unhedged_fill_risk == 0.0
             and not self.venue_exposure
             and not self.position_exposure
         )
@@ -148,6 +169,12 @@ class RiskUtilization(Base):
     #: totals already include it.
     committed_gross_exposure: float = 0.0
     committed_net_exposure: float = 0.0
+    #: Worst-case additional unhedged residual the unresolved entry orders
+    #: could produce (P5-18). Observability only, and deliberately NOT folded
+    #: into :attr:`unhedged_notional` above, which means actual filled-book
+    #: residual and must keep meaning that. It explains a pre-trade rejection
+    #: that the actual figure alone cannot.
+    pending_unhedged_fill_risk: float = 0.0
 
     @staticmethod
     def _pct(used: float, limit: float) -> float:

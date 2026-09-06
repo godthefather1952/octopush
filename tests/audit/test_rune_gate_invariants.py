@@ -119,7 +119,6 @@ class TestOneFailureIsEnough:
             ("INTENT_NOT_EXPIRED", {}, {"deadline_ms": START_MS - 1}),
             ("MIN_EXPECTED_EDGE", {}, {"expected_net_edge_bps": 0.0}),
             ("HEDGE_AVAILABLE", {"hedge_available": False}, {}),
-            ("MAX_UNHEDGED_EXPOSURE", {"unhedged_notional": 10_000_000.0}, {}),
             ("MAX_OPEN_ORDERS", {"open_orders": 20}, {}),
             ("MAX_ERROR_RATE", {"error_rate": 1.0}, {}),
         ],
@@ -132,6 +131,32 @@ class TestOneFailureIsEnough:
         assert name in blocking_names(decision)
         assert name in decision.reason_codes
         assert decision.approved_notional == 0.0
+
+    def test_an_impossible_unhedged_state_also_rejects(self):
+        """MAX_UNHEDGED_EXPOSURE left the parametrisation above in Remediation
+        D, and could not stay in it.
+
+        Once a gate is mirrored in ``_headroom`` it can no longer be reached as
+        a *blocking* gate: either the reduction makes it pass, or headroom is
+        zero and ``evaluate`` short-circuits on MIN_TRADE_NOTIONAL first. That
+        is true of every size-sensitive gate here — which is why the list above
+        contains none of them — and MAX_UNHEDGED_EXPOSURE became size-sensitive
+        when its worst intermediate leg risk was accounted for (P5-18).
+
+        The safety property is unchanged and asserted on both halves: the
+        decision authorises nothing, and the gate itself still fails the state.
+        """
+        from risk import limits as gates
+
+        decision = core().evaluate(
+            intent(), context(unhedged_notional=10_000_000.0), START_MS
+        )
+        assert decision.verdict is RiskVerdict.REJECTED
+        assert decision.approved_notional == 0.0
+        assert decision.reason_codes == ["MIN_TRADE_NOTIONAL"]
+        assert gates.gate_unhedged(
+            intent(), 10_000_000.0, core().limits
+        ).blocking
 
     def test_reason_codes_name_exactly_the_blocking_gates(self):
         """Not a superset and not a subset: an operator reading reason codes is

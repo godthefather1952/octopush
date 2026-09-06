@@ -580,6 +580,12 @@ class Orchestrator:
         precisely the case this exists for. A fully filled order releases here
         and appears as a position instead.
 
+        The same remaining quantity also drives
+        :attr:`CommittedExposure.unhedged_fill_risk`, accumulated per symbol by
+        side — so a partial fill shrinks the pending leg risk by exactly the
+        amount it adds to the actual residual OKAPI measures, and a terminal
+        order releases it entirely (P5-18).
+
         WHICH ORDERS: ENTRIES ONLY
         ==========================
         Exits and hedges REDUCE exposure. Counting them as new commitments
@@ -627,6 +633,12 @@ class Orchestrator:
         net = 0.0
         by_venue: dict[str, float] = {}
         by_position: dict[str, float] = {}
+        # Per SYMBOL, not per venue:symbol. Unhedged residual is a delta
+        # measured across venues (``PortfolioState.net_delta_by_symbol``), so a
+        # BUY on one venue and a SELL on another cancel for this purpose even
+        # though they are two distinct positions.
+        buy_remaining: dict[str, float] = {}
+        sell_remaining: dict[str, float] = {}
         for order in self.state.orders.values():
             if order.is_terminal:
                 continue
@@ -639,15 +651,31 @@ class Orchestrator:
                 continue
             gross += reserved
             net += reserved * order.side.sign
+            side_totals = buy_remaining if order.side is Side.BUY else sell_remaining
+            side_totals[order.symbol] = side_totals.get(order.symbol, 0.0) + reserved
             by_venue[order.venue] = by_venue.get(order.venue, 0.0) + reserved
             key = f"{order.venue}:{order.symbol}"
             by_position[key] = by_position.get(key, 0.0) + reserved
+
+        # Worst-case transient residual per symbol: if every BUY still working
+        # on it fills before any SELL, the book is temporarily long the whole
+        # BUY side; if the SELLs go first, short the whole SELL side. The worse
+        # magnitude is the larger side, NOT their net (which assumes the offset
+        # lands) and NOT their sum (which assumes both sides land one-sided at
+        # once). Symbols are summed because each can independently go one-sided
+        # and ``Okapi.total_unhedged`` aggregates the same way — a sum of
+        # per-symbol absolute residuals (P5-18).
+        fill_risk = sum(
+            max(buy_remaining.get(symbol, 0.0), sell_remaining.get(symbol, 0.0))
+            for symbol in set(buy_remaining) | set(sell_remaining)
+        )
 
         return CommittedExposure(
             gross_exposure=gross,
             net_exposure=net,
             venue_exposure=by_venue,
             position_exposure=by_position,
+            unhedged_fill_risk=fill_risk,
         )
 
     def _refresh_risk_utilization(self, portfolio: PortfolioState) -> None:

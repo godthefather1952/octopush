@@ -126,7 +126,7 @@ Read off `RuneCore._gate`, in evaluation order. All 21 are mandatory, so
 | 16 | `MAX_STRATEGY_EXPOSURE` | yes | — |
 | 17 | `MAX_DAILY_LOSS` | no | — |
 | 18 | `MAX_DRAWDOWN` | no | — |
-| 19 | `MAX_UNHEDGED_EXPOSURE` | no | — |
+| 19 | `MAX_UNHEDGED_EXPOSURE` | **yes** | classified `no` by this audit; refuted by production evidence and corrected in Remediation D (P5-18) — the residual it reads is measured, but the intent's worst INTERMEDIATE residual scales with its notional |
 | 20 | `MAX_OPEN_ORDERS` | no | — |
 | 21 | `MAX_ERROR_RATE` | no | — |
 
@@ -180,6 +180,16 @@ other term fixed at decision time, so both always admit a smaller passing size.
 `evaluate`'s own docstring says a size-based gate "can only fail if the
 reduction could not make it pass" — for these two it can fail while a reduction
 would have passed.
+
+**A third was absent for a different reason, and this audit's own
+classification is what missed it.** `MAX_UNHEDGED_EXPOSURE` was recorded above
+as not size-sensitive, because the residual it reads is a measurement of the
+filled book rather than a projection of the trade. That reasoning is about the
+gate's *input* and not about what the limit governs: an intent's worst
+INTERMEDIATE residual — one whole leg, held between the first fill and the
+second — is proportional to its notional. The classification was refuted by
+production evidence rather than by inspection (CI #38), and is corrected as
+P5-18.
 
 `min` over a candidate list containing NaN returns the running minimum rather
 than NaN only because the ZEPHR ceiling is appended last. That is append order,
@@ -488,6 +498,7 @@ Severities follow §46. Ranked most severe first.
 | **P5-15** | LOW | Configuration | Incoherent configurations are refused | The validator checks `min_trade ≤ max_order ≤ max_position ≤ max_gross` but not `max_order` against `max_venue_exposure`, nor `max_strategy_exposure` against `min_trade_notional × legs` | `test_rune_loss_boundaries.py::TestConfigCoherence` | A per-order cap larger than any venue may hold, or a strategy budget below the minimum trade, both load without warning and make the platform quietly untradeable | Extend `_limits_are_coherent` |
 | **P5-16** | LOW | Determinism | Nothing on the emergency path depends on a live clock read | `KillSwitch.engage()` / `clear()` call `self.clock.now_ms()` rather than accepting the tick instant | `test_rune_kill_switch.py::TestKillSwitchStateSemantics::test_the_switch_reads_a_live_clock_for_its_timestamps` | The economic actions are unaffected; the recorded causal ordering of a safety event can differ between a run and its replay | Thread `now_ms` through, as the fast loop already does |
 | **P5-17** | LOW | Kill switch | An action mapping names a response some trigger can deliver | `AGENT_FAILURE` has actions defined, no predicate in `TRIGGERS`, and no caller. Its action set is `(HALT_NEW_TRADES,)` — byte-identical to `SYSTEM_HEALTH_FAILURE`'s, whose predicate already covers a required agent going unhealthy | `test_rune_kill_switch.py::TestTriggerInventory::test_agent_failure_is_not_a_vestigial_mapping` | **Not an exposure gap and explicitly not part of P5-3.** Nothing is unprotected: a failing required agent is caught by `SYSTEM_HEALTH_FAILURE`, and a required agent that answers with nothing is caught by consensus completeness. The mapping is vestigial, and a dead entry in a safety table invites someone to assume a response exists that no code path delivers | Either give it a predicate that means something `SYSTEM_HEALTH_FAILURE` does not, or delete the mapping. Do not add a trigger without deciding what it should mean |
+| **P5-18** | HIGH | Pre-trade leg risk | An authorised multi-leg intent must not have a known execution sequence that necessarily crosses `max_unhedged_notional` | `gate_unhedged` compares only `ctx.unhedged_notional` — the residual already present in the FILLED book — and `_headroom` has no candidate for it at all, so the gate was classified as a pure current-state check. An intent's worst INTERMEDIATE residual scales with its notional: the ordinary two-leg delta-neutral trade holds one whole leg of one-sided exposure between its first fill and its second | `test_rune_leg_fill_risk.py`, `test_rune_committed_exposure.py::TestPendingUnhedgedFillRisk`, `test_rune_headroom.py::TestTheSizeSensitiveInventory` | With the shipped defaults (`max_order_notional` 25,000, `max_unhedged_notional` 10,000) RUNE authorises 2.5× the hard unhedged budget on every ordinary trade. CI #38 shows `RISK_LIMIT_BREACH` engaging during normal operation at ≈ START_MS + 15,200ms and latching, as designed; four unrelated long-run tests then halted because the emergency latch had correctly engaged, and the P5-3 breach-to-response probe PASSED — proving the backstop was reacting to a real state rather than to a test artifact. The backstop is correct; the pre-trade projection is the incomplete half | Project worst-case asynchronous fill risk — actual residual + pending entry fill risk + this intent at `notional × per-symbol worst side × slippage multiplier` — in both the gate and a matching `_headroom` candidate, so the entry is SIZED to fit the configured budget rather than authorised and caught afterwards |
 
 ### Expected conservative behaviour (not defects)
 

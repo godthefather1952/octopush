@@ -57,6 +57,12 @@ SIZE_SENSITIVE_GATES = [
     "MAX_LEVERAGE",
     "MAX_VENUE_EXPOSURE",
     "MAX_STRATEGY_EXPOSURE",
+    # Added by Remediation D. It was classified as a pure current-state
+    # gate because the residual it reads is measured rather than
+    # projected -- but an intent's worst INTERMEDIATE residual scales
+    # with its notional, and production evidence refuted the old
+    # classification (P5-18).
+    "MAX_UNHEDGED_EXPOSURE",
     "LIQUIDITY_SUFFICIENT",
 ]
 
@@ -70,6 +76,7 @@ OPEN_LIMITS = RiskLimits(
     max_venue_exposure=1_000_000.0,
     max_strategy_exposure=10_000_000.0,
     max_leverage=1_000_000.0,
+    max_unhedged_notional=10_000_000.0,
 )
 OPEN_CTX = {"max_economical_notional": 1_000_000.0}
 
@@ -142,7 +149,9 @@ class TestTheSizeSensitiveInventory:
         because what matters is that ``_headroom`` bounds the size by it at
         all. MAX_NET_EXPOSURE and MAX_LEVERAGE were bounded by neither, so a
         trade breaching either was rejected where a smaller one would have
-        passed (P5-7).
+        passed (P5-7). MAX_UNHEDGED_EXPOSURE joined them in Remediation D,
+        for the same reason arrived at from the other direction: it was
+        thought not to be size-sensitive at all (P5-18).
         """
         from risk import limits as gates
 
@@ -150,6 +159,10 @@ class TestTheSizeSensitiveInventory:
         solvers = {
             "MAX_NET_EXPOSURE": ("max_net_exposure", "net_exposure_headroom"),
             "MAX_LEVERAGE": ("max_leverage", "leverage_headroom"),
+            "MAX_UNHEDGED_EXPOSURE": (
+                "max_unhedged_notional",
+                "unhedged_headroom",
+            ),
             "MAX_GROSS_EXPOSURE": ("max_gross_exposure", None),
             "MAX_STRATEGY_EXPOSURE": ("max_strategy_exposure", None),
             "MAX_VENUE_EXPOSURE": ("max_venue_exposure", None),
@@ -173,6 +186,9 @@ class TestTheSizeSensitiveInventory:
             gates.net_exposure_headroom
         )
         assert "limits.max_leverage" in inspect.getsource(gates.leverage_headroom)
+        assert "limits.max_unhedged_notional" in inspect.getsource(
+            gates.unhedged_headroom
+        )
 
     def test_the_open_order_gate_is_deliberately_not_reducible(self):
         """The one size-sensitive-looking gate with no headroom candidate.
@@ -265,7 +281,14 @@ class TestReducibleGatesAreActuallyReduced:
 
     def test_max_order_notional_is_reduced(self):
         decision = core(
-            RiskLimits(max_order_notional=10_000.0, max_position_notional=50_000.0)
+            RiskLimits(
+                max_order_notional=10_000.0,
+                max_position_notional=50_000.0,
+                # Opened with the rest. MAX_UNHEDGED_EXPOSURE became
+                # size-sensitive in Remediation D (P5-18), so a fixture that
+                # isolates one limit has to open this one too.
+                max_unhedged_notional=1_000_000.0,
+            )
         ).evaluate(intent(notional=24_000.0), context(), START_MS)
         assert decision.verdict is RiskVerdict.APPROVED_REDUCED
         assert decision.approved_notional == pytest.approx(10_000.0)
@@ -277,6 +300,7 @@ class TestReducibleGatesAreActuallyReduced:
             # Raised so the directional book below breaches gross, not net --
             # this case isolates one limit at a time.
             max_net_exposure=100_000.0,
+            max_unhedged_notional=1_000_000.0,
         )
         book = portfolio_with(position(VENUE_A, quantity=400.0))  # 40,000 gross
         decision = core(limits).evaluate(
@@ -288,7 +312,11 @@ class TestReducibleGatesAreActuallyReduced:
         assert gate_named(decision, "MAX_GROSS_EXPOSURE").observed <= 60_000.0 + 1e-9
 
     def test_venue_exposure_is_reduced(self):
-        limits = RiskLimits(max_venue_exposure=30_000.0, max_net_exposure=100_000.0)
+        limits = RiskLimits(
+            max_venue_exposure=30_000.0,
+            max_net_exposure=100_000.0,
+            max_unhedged_notional=1_000_000.0,
+        )
         book = portfolio_with(position(VENUE_A, quantity=250.0))  # 25,000 on A
         decision = core(limits).evaluate(
             intent(notional=20_000.0), context(portfolio=book), START_MS
@@ -301,6 +329,7 @@ class TestReducibleGatesAreActuallyReduced:
             max_position_notional=30_000.0,
             max_order_notional=25_000.0,
             max_net_exposure=100_000.0,
+            max_unhedged_notional=1_000_000.0,
         )
         book = portfolio_with(position(VENUE_A, quantity=200.0))  # 20,000 on A:BTC
         decision = core(limits).evaluate(
@@ -310,7 +339,9 @@ class TestReducibleGatesAreActuallyReduced:
         assert decision.approved_notional == pytest.approx(10_000.0)
 
     def test_strategy_exposure_is_reduced(self):
-        limits = RiskLimits(max_strategy_exposure=60_000.0)
+        limits = RiskLimits(
+            max_strategy_exposure=60_000.0, max_unhedged_notional=1_000_000.0
+        )
         decision = core(limits).evaluate(
             intent(notional=20_000.0), context(strategy_exposure=40_000.0), START_MS
         )
@@ -335,7 +366,9 @@ class TestNetExposureIsReducible:
     MAX_NET_EXPOSURE. The sizing contract says such a trade is reduced.
     """
 
-    LIMITS = RiskLimits(max_net_exposure=10_000.0)
+    LIMITS = RiskLimits(
+        max_net_exposure=10_000.0, max_unhedged_notional=1_000_000.0
+    )
     ONE_LEG = {"legs": [leg(VENUE_A, Side.BUY)], "notional": 20_000.0}
 
     def test_a_smaller_size_would_have_passed_the_net_exposure_gate(self):
@@ -396,6 +429,7 @@ class TestLeverageIsReducible:
         max_position_notional=100_000.0,
         max_order_notional=60_000.0,
         max_net_exposure=60_000.0,
+        max_unhedged_notional=1_000_000.0,
     )
     REQUESTED = 60_000.0
     #: What leverage alone permits: ``(max_leverage * equity - gross) / legs``
@@ -582,7 +616,8 @@ class TestHeadroomDividesGrossAndStrategyByLegCount:
 
     def test_gross_headroom_is_divided_by_the_leg_count(self):
         limits = RiskLimits(max_gross_exposure=20_000.0, max_position_notional=20_000.0,
-                            max_order_notional=20_000.0)
+                            max_order_notional=20_000.0,
+                            max_unhedged_notional=1_000_000.0)
         two_leg = core(limits).evaluate(
             intent(notional=20_000.0), context(), START_MS
         )
@@ -596,7 +631,8 @@ class TestHeadroomDividesGrossAndStrategyByLegCount:
 
     def test_the_resulting_projection_lands_exactly_on_the_limit(self):
         limits = RiskLimits(max_gross_exposure=20_000.0, max_position_notional=20_000.0,
-                            max_order_notional=20_000.0)
+                            max_order_notional=20_000.0,
+                            max_unhedged_notional=1_000_000.0)
         decision = core(limits).evaluate(intent(notional=20_000.0), context(), START_MS)
         check = gate_named(decision, "MAX_GROSS_EXPOSURE")
         assert check.observed == pytest.approx(20_000.0)

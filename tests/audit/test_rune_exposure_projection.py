@@ -370,30 +370,65 @@ class TestLeverageIsNeverUnderstated:
 
 
 class TestUnhedgedExposure:
-    @pytest.mark.parametrize("unhedged", [0.0, -9_999.0, 9_999.0, -10_000.0, 10_000.0])
-    def test_the_gate_uses_absolute_value(self, unhedged):
+    """Rewritten by Remediation D. The old scope note here recorded that the
+    unhedged gate read OKAPI's current measurement and added nothing for the
+    trade being judged — "a perfectly balanced two-leg trade leaves nothing".
+
+    That is true of its FINAL delta and false of its worst INTERMEDIATE one:
+    between the first leg filling and the second, the book holds one whole leg
+    of one-sided exposure. Production evidence settled it — the default
+    configuration authorised 25,000 per leg against a 10,000 hard unhedged
+    ceiling and the post-fill backstop fired every time (P5-18).
+    """
+
+    @pytest.mark.parametrize("unhedged", [0.0, -4_000.0, 4_000.0])
+    def test_the_current_residual_is_read_as_a_magnitude(self, unhedged):
+        """Direction still does not matter for the actual term: a short
+        residual is as unhedged as a long one."""
         decision = core(RiskLimits()).evaluate(
-            intent(), context(unhedged_notional=unhedged), START_MS
+            intent(notional=1_000.0), context(unhedged_notional=unhedged), START_MS
         )
         check = gate_named(decision, "MAX_UNHEDGED_EXPOSURE")
-        assert check.observed == pytest.approx(abs(unhedged))
+        assert check.observed == pytest.approx(
+            abs(unhedged) + 1_000.0 * gates.execution_multiplier(intent())
+        )
+        assert f"{abs(unhedged):,.2f} actual" in check.detail
         assert not check.blocking
 
+    def test_the_projection_includes_the_intents_own_worst_leg(self):
+        """The correction itself. A balanced two-leg intent has factor 1, so
+        one full per-leg notional is projected on top of the current
+        residual."""
+        proposed = intent(notional=1_000.0)
+        decision = core(RiskLimits()).evaluate(
+            proposed, context(unhedged_notional=0.0), START_MS
+        )
+        check = gate_named(decision, "MAX_UNHEDGED_EXPOSURE")
+        assert gates.unhedged_fill_factor(proposed) == 1
+        assert check.observed == pytest.approx(1_001.0), (
+            "1,000 of per-leg notional at a 10bps slippage budget"
+        )
+        assert "1,000.00 actual" not in check.detail
+        assert "0.00 actual" in check.detail
+
     @pytest.mark.parametrize("unhedged", [-10_000.01, 10_000.01, 50_000.0])
-    def test_beyond_the_limit_blocks_in_both_directions(self, unhedged):
+    def test_beyond_the_limit_authorises_nothing_in_either_direction(self, unhedged):
+        """A current residual already past the limit leaves no headroom at any
+        size, so the decision short-circuits on MIN_TRADE_NOTIONAL rather than
+        reaching the gate — the same shape non-positive equity takes for
+        MAX_LEVERAGE. The safety property is what matters and is unchanged: no
+        notional is authorised."""
         decision = core(RiskLimits()).evaluate(
             intent(), context(unhedged_notional=unhedged), START_MS
         )
-        assert gate_named(decision, "MAX_UNHEDGED_EXPOSURE").blocking
+        assert decision.verdict is RiskVerdict.REJECTED
+        assert decision.approved_notional == pytest.approx(0.0)
+        assert decision.reason_codes == ["MIN_TRADE_NOTIONAL"]
 
-    def test_the_gate_does_not_project_the_intents_own_residual(self):
-        """Recorded scope: the unhedged gate reads OKAPI's current measurement
-        and does not add what this trade might leave behind. A perfectly
-        balanced two-leg trade leaves nothing, so for the current strategy the
-        distinction does not bite -- but it is the shape of the guarantee."""
-        import inspect
-
-        from risk import limits as gates
-
-        source = inspect.getsource(gates.gate_unhedged)
-        assert "intent" not in source
+    @pytest.mark.parametrize("unhedged", [-10_000.01, 10_000.01, 50_000.0])
+    def test_and_the_gate_itself_still_fails_on_that_state(self, unhedged):
+        """Asked of the gate directly, since ``evaluate`` no longer reaches
+        it: the projection is over the limit whatever the direction."""
+        check = gates.gate_unhedged(intent(), unhedged, RiskLimits())
+        assert check.blocking
+        assert check.observed > RiskLimits().max_unhedged_notional

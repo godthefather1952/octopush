@@ -18,7 +18,7 @@ from __future__ import annotations
 import pytest
 
 from core.config import RiskLimits, Settings, load_settings, simulated_venues
-from core.models.risk import GateResult
+from core.models.risk import GateResult, RiskVerdict
 from risk.kill_switch import KillSwitchInputs
 from risk.kill_switch import _daily_loss as kill_daily_loss
 from risk.kill_switch import _drawdown as kill_drawdown
@@ -286,10 +286,23 @@ class TestNumericSafety:
         )
 
     def test_a_nan_unhedged_notional_cannot_pass(self):
+        """An unknown residual is not an acceptable one.
+
+        Since MAX_UNHEDGED_EXPOSURE gained a headroom solver (P5-18) the
+        rejection arrives one step earlier: every comparison against NaN is
+        false and ``max(0.0, nan)`` is ``0.0``, so the headroom candidate is
+        zero and ``evaluate`` short-circuits. Fail-closed either way — what
+        must never happen is a NaN residual authorising a trade.
+        """
+        from risk import limits as gates
+
         decision = core(LIMITS).evaluate(
             intent(), context(unhedged_notional=float("nan")), START_MS
         )
-        assert "MAX_UNHEDGED_EXPOSURE" in blocking_names(decision)
+        assert decision.verdict is RiskVerdict.REJECTED
+        assert decision.approved_notional == pytest.approx(0.0)
+        assert gates.unhedged_headroom(intent(), float("nan"), LIMITS) == 0.0
+        assert gates.gate_unhedged(intent(), float("nan"), LIMITS).blocking
 
     def test_an_infinite_economical_ceiling_does_not_grow_the_trade(self):
         decision = core(LIMITS).evaluate(
@@ -367,6 +380,8 @@ class TestConfigCoherence:
             max_strategy_exposure=20_000.0,
             max_order_notional=25_000.0,
             max_position_notional=50_000.0,
+            # Opened so the strategy budget is what binds (P5-18).
+            max_unhedged_notional=1_000_000.0,
         )
         decision = core(limits).evaluate(intent(notional=25_000.0), context(), START_MS)
         assert decision.approved_notional == pytest.approx(10_000.0)
