@@ -86,13 +86,14 @@ class TestTriggerInventory:
         ``TRIGGERS`` is what actually fires. A mapping with no predicate and no
         caller is a safety response nothing can invoke.
 
-        External validation reported TWO such mappings, and they are different
-        findings, so each has its own test below rather than being lumped into
-        one list. This test records the inventory that produced them.
+        External validation reported TWO such mappings, and they were
+        different findings, so each has its own test below rather than being
+        lumped into one list. This test records the inventory.
 
         ``RISK_LIMIT_BREACH`` left the list in Remediation C, which gave it a
-        predicate in :data:`TRIGGERS`. ``AGENT_FAILURE`` (P5-17) is
-        deliberately untouched and is the only dead mapping that remains.
+        predicate in :data:`TRIGGERS`. ``AGENT_FAILURE`` left it in E1, which
+        removed it — the list is now empty, and MANUAL remains the one
+        deliberate operator-only mapping.
         """
         callers = _explicit_engage_calls()
         unreachable = sorted(
@@ -101,9 +102,12 @@ class TestTriggerInventory:
             # MANUAL is operator-invoked by design; see the test below.
             if name != "MANUAL" and name not in TRIGGERS and name not in callers
         )
-        assert unreachable == ["AGENT_FAILURE"], (
-            "the set of unreachable action mappings changed; the findings "
-            f"below are scoped to the old set. Now: {unreachable}"
+        assert unreachable == [], (
+            "every automatic action mapping must have a predicate that can "
+            "reach it. RISK_LIMIT_BREACH gained one in Remediation C; "
+            "AGENT_FAILURE was removed in E1 rather than given one, because "
+            "no distinct safety condition was ever defined for it. Now: "
+            f"{unreachable}"
         )
 
     def test_risk_limit_breach_is_reachable(self):
@@ -121,30 +125,30 @@ class TestTriggerInventory:
             "max_position_notional or max_leverage is never detected."
         )
 
-    def test_agent_failure_is_not_a_vestigial_mapping(self):
-        """A separate, lower-severity finding — NOT part of P5-3.
+    def test_agent_failure_is_no_longer_a_vestigial_mapping(self):
+        """P5-17, resolved by removal rather than by invention.
 
-        ``AGENT_FAILURE`` is a dead mapping rather than a missing safety
-        response. Its action set is ``(HALT_NEW_TRADES,)``, which is exactly
-        what ``SYSTEM_HEALTH_FAILURE`` already delivers when a required
-        component stops being HEALTHY — and a failing agent is precisely that.
-        A missing required agent is separately caught by consensus
-        completeness. So nothing is unprotected; the mapping simply names a
-        response that another trigger provides.
+        ``AGENT_FAILURE`` had actions defined, no predicate and no caller. Its
+        action set was ``(HALT_NEW_TRADES,)`` — byte-identical to
+        ``SYSTEM_HEALTH_FAILURE``'s, whose predicate already covers a required
+        component ceasing to be HEALTHY, and a required agent that answers
+        with nothing is separately caught by consensus completeness. So
+        nothing was unprotected; the entry named a response another trigger
+        already delivered.
+
+        Giving it a predicate would have meant inventing a safety condition
+        nobody had defined. It was removed instead. This test now guards
+        against its reintroduction without one.
         """
         callers = _explicit_engage_calls()
-        reachable = "AGENT_FAILURE" in TRIGGERS or "AGENT_FAILURE" in callers
-        assert TRIGGER_ACTIONS["AGENT_FAILURE"] == TRIGGER_ACTIONS[
-            "SYSTEM_HEALTH_FAILURE"
-        ], "premise: the two action sets are identical"
-        assert reachable, (
-            "AGENT_FAILURE has actions defined but no predicate and no caller. "
-            "It is a vestigial mapping, not an exposure gap: "
-            f"{[a.value for a in TRIGGER_ACTIONS['AGENT_FAILURE']]} is already "
-            "delivered by SYSTEM_HEALTH_FAILURE, whose predicate covers a "
-            "required agent going unhealthy. Either give it a predicate that "
-            "means something SYSTEM_HEALTH_FAILURE does not, or remove it."
+        assert "AGENT_FAILURE" not in TRIGGER_ACTIONS, (
+            "AGENT_FAILURE is back in the action table. A safety mapping must "
+            "name a response some predicate or caller can actually invoke; if "
+            "it has been reintroduced, it needs a predicate meaning something "
+            "SYSTEM_HEALTH_FAILURE does not."
         )
+        assert "AGENT_FAILURE" not in TRIGGERS
+        assert "AGENT_FAILURE" not in callers
 
     def test_manual_is_reachable_by_design(self):
         """MANUAL has no predicate on purpose — an operator engages it through
@@ -326,12 +330,27 @@ class TestLatencyTriggerMeasuresLatency:
         source = inspect.getsource(ks._latency)
         assert "inputs.max_latency_ms > settings.risk.max_data_age_ms * 5" in source
 
-    def test_the_orchestrator_feeds_data_age_not_transport_latency(self):
-        """The premise, read off production."""
+    def test_the_orchestrator_feeds_transport_latency(self):
+        """P5-10, inverted. ``EXCESSIVE_LATENCY`` used to be fed
+        ``max(s.age_ms)`` — a second, looser staleness check wearing a
+        latency-shaped name, with genuine transport latency unmonitored."""
         source = inspect.getsource(Orchestrator._protect)
-        assert "s.age_ms or 0 for s in market.venues.values()" in source
-        assert "max_latency_ms=float(max_age)" in source
-        assert "latency_ms" not in source.split("max_age = max(")[1].split(")")[0]
+        assert "float(s.latency_ms or 0.0) for s in market.venues.values()" in source
+        assert "max_latency_ms=max_latency" in source
+        assert "max_latency_ms=float(max_age)" not in source
+
+    def test_data_age_keeps_its_own_protections(self):
+        """§12 — the latency correction must not quietly remove staleness
+        cover. ``market_data_ok`` still gates on usable venue data, and RUNE's
+        own MARKET_DATA_FRESH gate is untouched."""
+        source = inspect.getsource(Orchestrator._protect)
+        assert "market_data_ok=bool(tradeable_symbols)" in source
+        assert "if s.quality.is_usable" in source
+
+        from risk import limits as gates
+
+        age_gate = inspect.getsource(gates.gate_data_age)
+        assert "limits.max_data_age_ms" in age_gate
 
     def test_venue_state_reports_the_two_as_different_numbers(self):
         """``age_ms`` is ``as_of - last_update_ts``; ``latency_ms`` is the
@@ -357,36 +376,72 @@ class TestLatencyTriggerMeasuresLatency:
         assert stale_but_quick.latency_ms == 1.0
         assert isinstance(fresh_but_slow, VenueMarketState)
 
-    async def test_high_transport_latency_with_fresh_data_does_not_fire(self):
-        """What the trigger's name promises, against what it measures."""
+    async def test_high_transport_latency_fires_after_its_confirmations(self):
+        """§15. Fresh data, slow transport: the trigger now sees the number
+        its name promises and engages once the streak is met."""
         engine = switch()
         threshold = engine.settings.risk.max_data_age_ms * 5
-        # The orchestrator would report age, which is 0 here.
-        fired = await engine.evaluate(inputs(max_latency_ms=0.0))
-        assert "EXCESSIVE_LATENCY" not in fired
-        # And with the number the trigger's name implies:
-        engine2 = switch()
+        fired = []
         for _ in range(CONFIRMATIONS["EXCESSIVE_LATENCY"]):
-            fired2 = await engine2.evaluate(inputs(max_latency_ms=threshold + 1.0))
-        assert "EXCESSIVE_LATENCY" in fired2, (
-            "the predicate does fire on a large input; the question is which "
-            "number the orchestrator puts into it"
-        )
+            fired = await engine.evaluate(inputs(max_latency_ms=threshold + 1.0))
+        assert "EXCESSIVE_LATENCY" in fired
+        assert not engine.state.trading_allowed
+
+    async def test_stale_data_with_quick_transport_does_not_fire_it(self):
+        """§15, the other half. High age with low latency is a staleness
+        problem, and staleness has its own protections; this trigger must not
+        double as a second one under a misleading name."""
+        engine = switch()
+        for _ in range(CONFIRMATIONS["EXCESSIVE_LATENCY"] + 2):
+            fired = await engine.evaluate(inputs(max_latency_ms=1.0))
+            assert "EXCESSIVE_LATENCY" not in fired
+        assert "EXCESSIVE_LATENCY" not in engine.state.triggered_by
+
+    def test_the_threshold_itself_is_unchanged(self):
+        """§14 — P5-10 is an input-semantics fix, not a calibration one."""
+        import risk.kill_switch as ks
+
+        source = inspect.getsource(ks._latency)
+        assert "inputs.max_latency_ms > settings.risk.max_data_age_ms * 5" in source
 
     def test_the_input_field_is_named_for_latency(self):
         assert "max_latency_ms" in KillSwitchInputs.__dataclass_fields__
 
 
-class TestTriggerExceptionsAreSwallowed:
-    """§30 — a mandatory safety predicate that raises is skipped, and the
-    evaluation continues as though the condition were absent."""
+class TestTriggerExceptionsFailClosed:
+    """P5-12 — a mandatory safety predicate that cannot be evaluated has not
+    been satisfied.
 
-    def test_evaluate_catches_and_continues(self):
+    It used to be logged and skipped, so a crashing predicate silently stopped
+    protecting while the platform carried on trading believing it had one more
+    safety condition than it did. The same fail-closed rule RUNE applies to an
+    UNKNOWN gate now applies here."""
+
+    def test_the_exception_path_engages_rather_than_continuing(self):
         source = inspect.getsource(KillSwitch.evaluate)
-        assert "except Exception:" in source
-        assert "continue" in source.split("except Exception:")[1]
+        after = source.split("except Exception:")[1]
+        assert "self.engage(" in after
+        assert '"SYSTEM_HEALTH_FAILURE",' in after
+        assert "continue" in after, (
+            "the loop still moves on to the remaining predicates; what changed "
+            "is that it engages first rather than moving on silently"
+        )
 
-    async def test_a_raising_predicate_does_not_engage_anything(self, monkeypatch):
+    def test_it_reuses_the_existing_health_response(self):
+        """§17 — no new exposure trigger is invented for this."""
+        source = inspect.getsource(KillSwitch.evaluate)
+        assert "SYSTEM_HEALTH_FAILURE" in source.split("except Exception:")[1]
+        assert "PREDICATE_FAILURE" not in source
+
+    def test_the_exception_path_does_not_recurse(self):
+        """§18 — ``engage`` applies state and actions directly. Neither the
+        failing predicate nor ``evaluate`` is called again, so this stays safe
+        even when the predicate that raised was SYSTEM_HEALTH_FAILURE."""
+        after = inspect.getsource(KillSwitch.evaluate).split("except Exception:")[1]
+        assert "self.evaluate(" not in after
+        assert "predicate(" not in after
+
+    async def test_a_raising_predicate_halts_trading(self, monkeypatch):
         import risk.kill_switch as ks
 
         def exploding(_inputs, _settings):
@@ -394,14 +449,37 @@ class TestTriggerExceptionsAreSwallowed:
 
         monkeypatch.setitem(ks.TRIGGERS, "MAX_DRAWDOWN_BREACHED", exploding)
         engine = switch()
-        book = portfolio(cash=0.0, peak_equity=100_000.0)
-        assert book.drawdown >= engine.settings.risk.max_drawdown
-        fired = await engine.evaluate(inputs(portfolio=book))
-        assert "MAX_DRAWDOWN_BREACHED" not in fired, (
-            "recorded: a raising safety predicate fails open — the condition "
-            "it was watching goes unobserved and the platform keeps trading"
-        )
-        assert engine.state.trading_allowed
+        fired = await engine.evaluate(inputs())
+        assert "SYSTEM_HEALTH_FAILURE" in fired
+        assert "SYSTEM_HEALTH_FAILURE" in engine.state.triggered_by
+        assert not engine.state.trading_allowed
+
+    async def test_the_exception_itself_does_not_propagate(self, monkeypatch):
+        """§19 — one broken predicate must not take the evaluation loop with
+        it; the remaining predicates still run."""
+        import risk.kill_switch as ks
+
+        def exploding(_inputs, _settings):
+            raise RuntimeError("predicate exploded")
+
+        monkeypatch.setitem(ks.TRIGGERS, "MAX_DRAWDOWN_BREACHED", exploding)
+        engine = switch()
+        fired = await engine.evaluate(inputs(book_corruption=True))
+        assert "BOOK_CORRUPTION" in fired
+
+    async def test_a_failing_health_predicate_still_fails_closed(self, monkeypatch):
+        """§18's edge case: the predicate that raised IS the one whose
+        trigger the exception path engages."""
+        import risk.kill_switch as ks
+
+        def exploding(_inputs, _settings):
+            raise RuntimeError("health predicate exploded")
+
+        monkeypatch.setitem(ks.TRIGGERS, "SYSTEM_HEALTH_FAILURE", exploding)
+        engine = switch()
+        fired = await engine.evaluate(inputs())
+        assert "SYSTEM_HEALTH_FAILURE" in fired
+        assert not engine.state.trading_allowed
 
 
 class TestDisableExecutionRecovery:
@@ -412,17 +490,80 @@ class TestDisableExecutionRecovery:
         assert "if self.kill_switch.state.execution_disabled:" in source
         assert "self.veska.executor.execution_disabled = True" in source
 
-    def test_nothing_in_production_ever_clears_the_executor_flag(self):
-        """Read across the whole application rather than one function."""
+    def test_exactly_one_component_clears_the_executor_flag(self):
+        """P5-5, inverted, and scoped.
+
+        Nothing used to reset ``PaperExecutor.execution_disabled``, so a
+        cleared switch left the platform permanently unable to submit. Now the
+        ORCHESTRATOR does, and only the orchestrator: it is the component that
+        applied the latch, and the kill switch must not hold a reference to
+        the executor.
+        """
         import apps.orchestrator.orchestrator as orch
         import execution.paper.executor as executor
         import risk.kill_switch as ks
 
-        for module in (orch, ks, executor):
-            source = inspect.getsource(module)
-            assert "execution_disabled = False" not in source, (
-                f"{module.__name__} does clear the flag; recheck this audit"
+        assert "execution_disabled = False" in inspect.getsource(orch)
+        for module in (ks, executor):
+            assert "execution_disabled = False" not in inspect.getsource(module), (
+                f"{module.__name__} clears the flag; recovery belongs to the "
+                "orchestrator, which owns application-side effects"
             )
+
+    def test_the_kill_switch_holds_no_reference_to_the_executor(self):
+        """§6 — architectural boundary. Safety state and trigger evaluation on
+        one side, application effects on the other.
+
+        Checked as imports and constructor dependencies rather than as any
+        mention of the word: the module's prose necessarily explains which
+        component owns the latch it cannot reach.
+        """
+        import risk.kill_switch as ks
+
+        imported = [
+            line.strip()
+            for line in inspect.getsource(ks).splitlines()
+            if line.startswith(("import ", "from "))
+        ]
+        for line in imported:
+            for forbidden in ("execution", "veska", "apps."):
+                assert forbidden not in line.lower(), (
+                    f"risk.kill_switch imports {line!r}; it must not reach into "
+                    "the components that apply its actions"
+                )
+        assert set(inspect.signature(KillSwitch.__init__).parameters) == {
+            "self",
+            "bus",
+            "clock",
+            "settings",
+        }
+        assert not any(
+            hasattr(switch(), attr) for attr in ("executor", "veska", "orchestrator")
+        )
+
+    def test_clearing_is_never_automatic(self):
+        """§7 — recovery requires an explicit operator request. If the unsafe
+        condition still holds, the next protected tick engages again, which is
+        correct rather than a failure of the clear."""
+        callers = [
+            name
+            for name in (
+                "_protect",
+                "_manage",
+                "_seek",
+                "_measure",
+                "_settle",
+                "tick",
+                "_heartbeat",
+            )
+            if "clear_kill_switch" in inspect.getsource(getattr(Orchestrator, name))
+            or "kill_switch.clear(" in inspect.getsource(getattr(Orchestrator, name))
+        ]
+        assert callers == [], (
+            f"the kill switch is cleared automatically from {callers}; a "
+            "condition that stopped trading must be understood before trading "
+            "resumes"
+        )
 
     async def test_clearing_the_switch_resets_the_switch_state(self):
         """The premise: the switch itself does recover."""
@@ -437,11 +578,11 @@ class TestDisableExecutionRecovery:
     async def test_a_recovery_path_exists_for_the_executor_latch(self):
         """H10, stated as the invariant.
 
-        The orchestrator latches ``PaperExecutor.execution_disabled = True``
-        and there is no assignment anywhere that sets it back. A manual clear
-        therefore restores the kill-switch state while leaving the platform
-        permanently unable to submit, and no operator action exists to undo
-        that for the life of the process.
+        The orchestrator latches ``PaperExecutor.execution_disabled = True``.
+        Something must be able to set it back, or a manual clear restores the
+        kill-switch state while leaving the platform permanently unable to
+        submit, with no operator action able to undo it for the life of the
+        process (P5-5). ``Orchestrator.clear_kill_switch`` is that path.
         """
         import apps.orchestrator.orchestrator as orch
         import execution.paper.executor as executor
@@ -599,16 +740,240 @@ class TestKillSwitchStateSemantics:
         await engine.evaluate(inputs(market_data_ok=True))
         assert "MARKET_DATA_OUTAGE" not in engine.streaks
 
-    async def test_the_switch_reads_a_live_clock_for_its_timestamps(self):
-        """§43 — ``engage`` and ``clear`` call ``self.clock.now_ms()`` rather
-        than taking the tick's instant. Recorded: the economic ACTIONS do not
-        depend on it, but the recorded causal ordering of a safety event does.
-        """
+    async def test_a_manual_engage_still_falls_back_to_the_live_clock(self):
+        """An operator action happens outside any tick, so the clock remains
+        the right default for it (§24)."""
         engine = switch()
-        source = inspect.getsource(KillSwitch.engage)
-        assert "now = self.clock.now_ms()" in source
-        assert "now_ms" not in inspect.signature(KillSwitch.engage).parameters
-
+        assert "now_ms" in inspect.signature(KillSwitch.engage).parameters
         engine.clock.advance(5_000)
         await engine.engage("BOOK_CORRUPTION")
         assert engine.state.triggered_at == START_MS + 5_000
+
+
+class TestAutomaticSafetyEventsUseLogicalTime:
+    """P5-16 — an automatic engagement belongs to the tick that observed the
+    state justifying it.
+
+    The economic actions never depended on which instant was stamped, but the
+    recorded causal ordering of a safety event did: a live clock read at
+    publish time could place the event after work the tick had already done,
+    so a replay could order it differently from the run that produced it.
+    """
+
+    def test_the_interface_accepts_an_explicit_instant(self):
+        for method in (KillSwitch.engage, KillSwitch.clear, KillSwitch.evaluate):
+            assert "now_ms" in inspect.signature(method).parameters, method
+
+    def test_the_clock_is_the_fallback_never_the_primary(self):
+        for method in (KillSwitch.engage, KillSwitch.clear, KillSwitch.evaluate):
+            source = inspect.getsource(method)
+            assert "self.clock.now_ms() if now_ms is None else now_ms" in source
+
+    async def test_an_engagement_is_stamped_at_the_instant_it_was_given(self):
+        """§26. The clock is 5,000ms ahead; the decision was made at T."""
+        engine = switch()
+        engine.clock.advance(5_000)
+        await engine.engage("BOOK_CORRUPTION", "audit", now_ms=START_MS)
+        assert engine.state.triggered_at == START_MS
+        assert engine.history[-1][0] == START_MS
+
+    async def test_the_published_event_carries_the_same_instant(self):
+        from core.events import EventType
+
+        seen: list[tuple[int, int]] = []
+
+        async def collect(event):
+            seen.append((event.ts_ms, event.payload["created_at"]))
+
+        engine = switch()
+        engine.bus.subscribe(
+            collect, types=[EventType.KILL_SWITCH_TRIGGERED], name="stamp-observer"
+        )
+        engine.clock.advance(5_000)
+        await engine.engage("BOOK_CORRUPTION", "audit", now_ms=START_MS)
+        await engine.bus.drain()
+        assert seen == [(START_MS, START_MS)]
+
+    async def test_evaluate_threads_one_instant_into_every_engagement(self):
+        """§22 — including the confirmation path."""
+        engine = switch()
+        engine.clock.advance(5_000)
+        fired = await engine.evaluate(inputs(book_corruption=True), now_ms=START_MS)
+        assert "BOOK_CORRUPTION" in fired
+        assert engine.state.triggered_at == START_MS
+
+    async def test_the_fail_closed_path_uses_it_too(self, monkeypatch):
+        """§22 — P5-12's engagement is an automatic one and must be stamped
+        like any other."""
+        import risk.kill_switch as ks
+
+        def exploding(_inputs, _settings):
+            raise RuntimeError("predicate exploded")
+
+        monkeypatch.setitem(ks.TRIGGERS, "MAX_DRAWDOWN_BREACHED", exploding)
+        engine = switch()
+        engine.clock.advance(5_000)
+        fired = await engine.evaluate(inputs(), now_ms=START_MS)
+        assert "SYSTEM_HEALTH_FAILURE" in fired
+        assert engine.state.triggered_at == START_MS
+
+    async def test_a_clear_can_be_stamped_explicitly(self):
+        from core.events import EventType
+
+        seen: list[int] = []
+
+        async def collect(event):
+            seen.append(event.ts_ms)
+
+        engine = switch()
+        engine.bus.subscribe(
+            collect, types=[EventType.KILL_SWITCH_CLEARED], name="clear-observer"
+        )
+        engine.clock.advance(5_000)
+        await engine.clear("audit", now_ms=START_MS)
+        await engine.bus.drain()
+        assert seen == [START_MS]
+
+    def test_the_orchestrator_passes_its_tick_time(self):
+        """§23 — automatic evaluation uses the same canonical instant as the
+        market snapshot, portfolio and risk decisions beside it."""
+        source = inspect.getsource(Orchestrator._protect)
+        assert "now_ms=self.tick_time," in source
+
+    def test_the_operator_clear_reads_the_clock_once(self):
+        """§25 — one read at the orchestration boundary, threaded through, so
+        the state reset and its event share an instant."""
+        source = inspect.getsource(Orchestrator.clear_kill_switch)
+        assert source.count("self.clock.now_ms()") == 1
+        assert "now_ms=now" in source
+
+
+class TestOperatorRecoveryRestoresTheExecutor:
+    """P5-5, end to end on a real platform.
+
+    The switch latches ``PaperExecutor.execution_disabled`` through
+    ``_protect``; clearing the switch's own state left that latch set, so the
+    platform reported itself recovered while rejecting every submission for
+    the rest of the process. ``Orchestrator.clear_kill_switch`` is the one
+    coordinated path that undoes both halves.
+    """
+
+    @staticmethod
+    def _plan(platform):
+        from core.models.common import OrderType, Side, TimeInForce
+        from core.models.opportunity import ExecutionPlan, PlannedOrder
+
+        return ExecutionPlan(
+            created_at=platform.orchestrator.tick_time,
+            intent_id="recovery-probe-intent",
+            strategy="cross_venue",
+            symbol="BTC-USD",
+            orders=[
+                PlannedOrder(
+                    venue="VENUE_A",
+                    symbol="BTC-USD",
+                    side=Side.BUY,
+                    quantity=0.01,
+                    order_type=OrderType.LIMIT,
+                    time_in_force=TimeInForce.GTC,
+                    limit_price=100.0,
+                    expected_price=100.0,
+                    expected_fee_bps=1.0,
+                    ttl_ms=5_000,
+                )
+            ],
+            deadline_ms=platform.orchestrator.tick_time + 10_000,
+            max_slippage_bps=10.0,
+            notional=1.0,
+        )
+
+    async def test_clearing_restores_the_platforms_ability_to_submit(self, platform):
+        await platform.start(record=False, feeds=False)
+        await platform.step_market(1)
+
+        # 1-2. Engage a trigger that disables execution, then let the tick
+        #      latch it onto the executor exactly as production does.
+        await platform.kill_switch.engage("RECONCILIATION_MISMATCH", "audit")
+        assert platform.kill_switch.state.execution_disabled is True
+        await platform.orchestrator.tick()
+        assert platform.veska.executor.execution_disabled is True
+
+        # 3. Ordinary submission is refused while the latch is set.
+        before = platform.veska.executor.rejected_submissions
+        report = await platform.veska.executor.submit(
+            self._plan(platform), platform.orchestrator.tick_time
+        )
+        assert platform.veska.executor.rejected_submissions == before + 1
+        assert any("execution disabled" in note for note in report.notes)
+
+        # 4. The explicit operator recovery.
+        state = await platform.orchestrator.clear_kill_switch("operator investigated")
+
+        # 5. Both halves are restored.
+        assert not state.engaged
+        assert state.execution_disabled is False
+        assert state.trading_allowed
+        assert platform.veska.executor.execution_disabled is False
+        assert platform.state.kill_switch is state
+
+        # 6. And a later submission is no longer refused for that reason.
+        rejected = platform.veska.executor.rejected_submissions
+        after = await platform.veska.executor.submit(
+            self._plan(platform), platform.orchestrator.tick_time
+        )
+        assert platform.veska.executor.rejected_submissions == rejected
+        assert not any("execution disabled" in note for note in after.notes)
+        await platform.stop()
+
+    async def test_the_api_clear_goes_through_the_orchestrator(self):
+        """§8 — the endpoint must not call ``platform.kill_switch.clear``
+        directly, because that restores only half the state."""
+        from apps.api import app as api
+
+        source = inspect.getsource(api)
+        assert "platform.orchestrator.clear_kill_switch(reason)" in source
+        assert "platform.kill_switch.clear(" not in source
+
+    async def test_the_engage_endpoint_is_unchanged(self, platform):
+        """§9 — recovery is a separate action; engaging still only stops
+        things."""
+        from apps.api import app as api
+
+        source = inspect.getsource(api)
+        assert "platform.kill_switch.engage(trigger, detail)" in source
+        engage_block = source.split('@app.post("/api/kill-switch")')[1].split(
+            '@app.post("/api/kill-switch/clear")'
+        )[0]
+        assert "execution_disabled = False" not in engage_block
+        assert "clear" not in engage_block.split("async def engage")[1].split(
+            "return"
+        )[0]
+
+    async def test_a_still_unsafe_condition_engages_again_on_the_next_tick(
+        self, platform
+    ):
+        """§7 — clearing acknowledges an emergency; it does not resolve one.
+        Re-engagement is the correct outcome, not a failed recovery."""
+        await platform.start(record=False, feeds=False)
+        await platform.step_market(1)
+        await platform.kill_switch.engage("RECONCILIATION_MISMATCH", "audit")
+        await platform.orchestrator.tick()
+        assert platform.veska.executor.execution_disabled is True
+
+        await platform.orchestrator.clear_kill_switch("operator investigated")
+        assert platform.state.kill_switch.trading_allowed
+
+        # Inject the same unsafe condition and tick again.
+        import risk.kill_switch as ks
+
+        original = ks.TRIGGERS["RECONCILIATION_MISMATCH"]
+        ks.TRIGGERS["RECONCILIATION_MISMATCH"] = lambda _inputs, _settings: True
+        try:
+            await platform.step_market(1)
+            await platform.orchestrator.tick()
+        finally:
+            ks.TRIGGERS["RECONCILIATION_MISMATCH"] = original
+
+        assert "RECONCILIATION_MISMATCH" in platform.kill_switch.state.triggered_by
+        assert not platform.state.kill_switch.trading_allowed
+        await platform.stop()

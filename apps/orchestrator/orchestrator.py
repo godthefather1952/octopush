@@ -58,7 +58,7 @@ from execution.veska import Veska
 from monitoring import metrics as M
 from monitoring.attribution import AttributionBuilder, Scorecard
 from monitoring.metrics import MetricsRegistry
-from risk.kill_switch import KillSwitch, KillSwitchInputs
+from risk.kill_switch import KillSwitch, KillSwitchInputs, KillSwitchState
 from strategies.consensus import ConsensusEngine
 from strategies.cross_venue import REQUIRED_COMPONENTS, STRATEGY, CrossVenueDetector
 
@@ -740,9 +740,19 @@ class Orchestrator:
             for symbol in self.settings.symbols
             if sum(1 for s in market.states_for(symbol) if s.quality.is_usable) >= 2
         ]
-        max_age = max(
-            (s.age_ms or 0 for s in market.venues.values()),
-            default=0,
+        # TRANSPORT LATENCY, NOT DATA AGE (P5-10).
+        #
+        # ``EXCESSIVE_LATENCY`` used to be fed ``max(s.age_ms)`` — how long
+        # since a venue last said anything — which made it a second, looser
+        # copy of the staleness check under a name that promised something
+        # else, and left genuine transport latency unmonitored. ``latency_ms``
+        # is what the name claims: ``received_ts - exchange_ts``, floored at
+        # zero. Data age keeps its own protections: TIDAL's quality
+        # classification, RUNE's MARKET_DATA_FRESH gate, and ``market_data_ok``
+        # below, none of which change here.
+        max_latency = max(
+            (float(s.latency_ms or 0.0) for s in market.venues.values()),
+            default=0.0,
         )
         await self.okapi.publish_deltas(portfolio)
         # Derived once, here, and passed in. The kill switch's live-breach
@@ -763,7 +773,7 @@ class Orchestrator:
                 book_corruption=any(
                     book.crossed for book in self.tidal.books.values()
                 ),
-                max_latency_ms=float(max_age),
+                max_latency_ms=max_latency,
                 storage_ok=self._storage_ok(),
                 # The catastrophic-anomaly level. A breach of
                 # ``max_unhedged_notional`` itself is caught one layer earlier,
@@ -774,7 +784,14 @@ class Orchestrator:
                 committed_exposure=committed,
                 strategy_exposure=strategy_exposure,
                 unhedged_notional=unhedged,
-            )
+            ),
+            # An automatic safety decision belongs to the tick that observed
+            # the state justifying it, so every KILL_SWITCH_TRIGGERED event
+            # this raises carries the same instant as the market snapshot,
+            # portfolio and risk decisions beside it. Without that, a replay
+            # could order the safety event differently from the run that
+            # produced it (P5-16).
+            now_ms=self.tick_time,
         )
         self.state.kill_switch = self.kill_switch.state
         self.metrics.set(
@@ -791,6 +808,45 @@ class Orchestrator:
         if self.kill_switch.state.flatten_requested:
             await self._flatten(market)
             self.kill_switch.acknowledge_flatten()
+
+    async def clear_kill_switch(
+        self, reason: str = "manual operator clear"
+    ) -> KillSwitchState:
+        """The one coordinated recovery path from an engaged kill switch.
+
+        WHY THE ORCHESTRATOR OWNS IT
+        ============================
+        ``RECONCILIATION_MISMATCH`` and ``UNEXPECTED_POSITION`` set
+        ``KillSwitchState.execution_disabled``, and ``_protect`` latches that
+        onto ``PaperExecutor.execution_disabled``. ``KillSwitch.clear()``
+        builds a fresh state where the flag is False — but nothing was
+        unlatching the executor, so the switch reported itself cleared while
+        every submission kept being rejected for the rest of the process
+        (P5-5). Recovery has to undo both halves, and only the component that
+        applied the effect can undo it: the kill switch owns safety state and
+        trigger evaluation, the orchestrator owns application-side effects.
+        Handing ``KillSwitch`` a reference to the executor would invert that.
+
+        DELIBERATELY MANUAL
+        ===================
+        Nothing calls this automatically — not ``_protect``, not ``_manage``,
+        not a heartbeat, not reconciliation. A condition that stopped trading
+        should be understood before trading resumes. If the unsafe condition
+        still exists, the next protected tick will engage the switch again,
+        which is the correct outcome rather than a failure of this method.
+
+        One clock read, at this boundary, threaded into ``clear`` so the state
+        reset and its published event share an instant (P5-16).
+        """
+        now = self.clock.now_ms()
+        state = await self.kill_switch.clear(reason, now_ms=now)
+        self.state.kill_switch = state
+        self.veska.executor.execution_disabled = False
+        log.warning(
+            "kill switch cleared by operator",
+            extra={"reason": reason, "at": now},
+        )
+        return state
 
     async def _manage(self, market: MarketState, portfolio: PortfolioState) -> None:
         """Re-evaluate open opportunities and exit those that have decayed."""

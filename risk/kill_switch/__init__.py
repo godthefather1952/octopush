@@ -35,6 +35,7 @@ from core.bus import EventBus
 from core.clock import Clock
 from core.config import Settings
 from core.events import Event, EventType
+from core.models.common import Millis
 from core.models.ops import (
     HealthStatus,
     KillAction,
@@ -83,7 +84,13 @@ TRIGGER_ACTIONS: dict[str, tuple[KillAction, ...]] = {
     "UNEXPECTED_POSITION": (KillAction.HALT_NEW_TRADES, KillAction.DISABLE_EXECUTION),
     "SYSTEM_HEALTH_FAILURE": (KillAction.HALT_NEW_TRADES,),
     "EXCESSIVE_LATENCY": (KillAction.HALT_NEW_TRADES,),
-    "AGENT_FAILURE": (KillAction.HALT_NEW_TRADES,),
+    # ``AGENT_FAILURE`` used to sit here with ``(HALT_NEW_TRADES,)`` and no
+    # predicate and no caller (P5-17). It was removed rather than given one:
+    # its action set was byte-identical to SYSTEM_HEALTH_FAILURE's, whose
+    # predicate already covers a required agent going unhealthy, and a
+    # required agent that answers with nothing is separately caught by
+    # consensus completeness. A dead entry in a safety table invites the
+    # reader to assume a response exists that no code path delivers.
     "STORAGE_FAILURE": (KillAction.HALT_NEW_TRADES,),
     "RISK_LIMIT_BREACH": (
         KillAction.HALT_NEW_TRADES,
@@ -310,11 +317,23 @@ class KillSwitch:
             elif action is KillAction.DISABLE_EXECUTION:
                 self.state.execution_disabled = True
 
-    async def engage(self, trigger: str, detail: str = "") -> KillSwitchState:
-        """Fire a trigger by name. Idempotent for an already-fired trigger."""
+    async def engage(
+        self, trigger: str, detail: str = "", now_ms: Millis | None = None
+    ) -> KillSwitchState:
+        """Fire a trigger by name. Idempotent for an already-fired trigger.
+
+        ``now_ms`` is the caller's canonical logical time. An AUTOMATIC
+        engagement happens because of state the orchestrator observed during
+        one tick, so it must be stamped at that tick's instant rather than at
+        whatever the live clock reads by the time the event is published
+        (P5-16): the economic action is deterministic either way, but the
+        recorded causal ordering of a safety event would otherwise differ
+        between a run and its replay. The clock remains the fallback for a
+        genuinely manual operator action, which happens outside any tick.
+        """
         if trigger in self.state.triggered_by:
             return self.state
-        now = self.clock.now_ms()
+        now: Millis = self.clock.now_ms() if now_ms is None else now_ms
         self.state.triggered_by = [*self.state.triggered_by, trigger]
         self.state.triggered_at = self.state.triggered_at or now
         self._apply(TRIGGER_ACTIONS.get(trigger, (KillAction.HALT_NEW_TRADES,)))
@@ -345,8 +364,34 @@ class KillSwitch:
         )
         return self.state
 
-    async def evaluate(self, inputs: KillSwitchInputs) -> list[str]:
-        """Run every trigger; engage those that fire. Returns the new ones."""
+    async def evaluate(
+        self, inputs: KillSwitchInputs, now_ms: Millis | None = None
+    ) -> list[str]:
+        """Run every trigger; engage those that fire. Returns the new ones.
+
+        ONE INSTANT PER EVALUATION
+        ==========================
+        Every engagement this call produces is stamped at ``now_ms`` — the
+        orchestrator's tick time — so a safety event lands in the same logical
+        instant as the market snapshot, portfolio and risk decisions that
+        justified it (P5-16).
+
+        A PREDICATE THAT RAISES IS A SAFETY FAILURE
+        ===========================================
+        It used to be logged and skipped, which meant a crashing predicate
+        silently stopped protecting and the platform carried on trading with
+        one fewer safety condition than it believed it had — fail-open on the
+        emergency boundary (P5-12).
+
+        Now it engages SYSTEM_HEALTH_FAILURE. That is the honest
+        classification: a mandatory check that cannot be evaluated has not
+        been satisfied, which is the same fail-closed rule RUNE applies to an
+        UNKNOWN gate. No new trigger is invented, and the failing predicate is
+        never called again — ``engage`` applies state and actions directly, so
+        this stays safe even when the predicate that raised was
+        SYSTEM_HEALTH_FAILURE itself.
+        """
+        now: Millis = self.clock.now_ms() if now_ms is None else now_ms
         fired: list[str] = []
         for name, predicate in TRIGGERS.items():
             if name in self.state.triggered_by:
@@ -355,6 +400,15 @@ class KillSwitch:
                 condition = bool(predicate(inputs, self.settings))
             except Exception:
                 log.exception("kill switch trigger %s failed", name)
+                already = "SYSTEM_HEALTH_FAILURE" in self.state.triggered_by
+                await self.engage(
+                    "SYSTEM_HEALTH_FAILURE",
+                    f"kill-switch predicate {name} raised; treating an "
+                    "unevaluable safety condition as unsatisfied",
+                    now_ms=now,
+                )
+                if not already:
+                    fired.append("SYSTEM_HEALTH_FAILURE")
                 continue
 
             if not condition:
@@ -371,13 +425,27 @@ class KillSwitch:
                     extra={"trigger": name, "streak": streak, "required": required},
                 )
                 continue
-            await self.engage(name, f"confirmed on {streak} consecutive evaluations")
+            await self.engage(
+                name,
+                f"confirmed on {streak} consecutive evaluations",
+                now_ms=now,
+            )
             fired.append(name)
         return fired
 
-    async def clear(self, reason: str = "manual reset") -> KillSwitchState:
-        """Manual reset. Never automatic."""
-        now = self.clock.now_ms()
+    async def clear(
+        self, reason: str = "manual reset", now_ms: Millis | None = None
+    ) -> KillSwitchState:
+        """Manual reset. Never automatic.
+
+        Resets THIS object's state only. Restoring the application-side
+        latches a trigger set — ``PaperExecutor.execution_disabled`` above all
+        — belongs to the orchestrator, which owns those effects;
+        ``Orchestrator.clear_kill_switch`` is the one coordinated recovery
+        path (P5-5). Giving the kill switch a reference to the executor would
+        invert that boundary.
+        """
+        now: Millis = self.clock.now_ms() if now_ms is None else now_ms
         self.state = KillSwitchState()
         self.streaks.clear()
         await self.bus.publish(

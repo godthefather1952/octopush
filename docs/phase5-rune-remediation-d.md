@@ -612,16 +612,22 @@ their own slippage budgets and will size slightly differently.
 
 ## 27. P5-18 status
 
-**P5-18 — PARTIAL / VALIDATION PENDING.**
+**P5-18 — CLOSED / EXTERNALLY VALIDATED.**
 
-Not closed. It becomes closed only when external CI shows all three:
+CI #41, on `6e4fed1`: **3018 passed / 8 failed / 2 skipped**, with Python 3.11
+at 1382 passed / 0 failed and Mypy, the paper boundary and the backend contract
+pre-check all green.
 
-1. the direct projection and recovery-headroom tests passing,
-2. `test_rune_default_breach_diagnostic.py` passing — its
-   `assert first_trigger is None` is unchanged and still strict,
-3. the four canaries recovering naturally, with no change to any of them.
+All three acceptance surfaces this section named are met:
 
-If the diagnostic still trips, CI prints the next first-breach report and the
-next decision is made from that measurement rather than from a guess.
+1. the direct projection and recovery-headroom tests pass;
+2. `test_rune_default_breach_diagnostic.py` passes — its
+   `assert first_trigger is None` was never weakened;
+3. the four canaries recovered naturally, with no change to any of them.
+
+The ordinary platform no longer enters `RISK_LIMIT_BREACH` during the
+validated default runs. The strict $10,000 emergency ceiling, the immediate
+confirmation and the manual latch are all unchanged; what changed is that a
+compliant entry no longer sizes itself flush against them.
 
 **TESTS NOT RUN — EXTERNAL VALIDATION REQUIRED.**

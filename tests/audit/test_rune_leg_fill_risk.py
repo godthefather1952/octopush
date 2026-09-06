@@ -450,7 +450,7 @@ class TestWhyTheReserveExists:
         from starting with zero headroom."""
         drift_notional = self.QUANTITY * (self.MARK_PRICE - self.ENTRY_PRICE)
         assert drift_notional == pytest.approx(41.9596, abs=0.05)
-        assert RESERVE > drift_notional
+        assert drift_notional < RESERVE
 
 
 class TestTheReserveComesFromConfiguration:

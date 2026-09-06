@@ -97,11 +97,20 @@ class TestApi:
         assert not platform.kill_switch.state.trading_allowed
 
     def test_there_is_no_endpoint_that_places_a_trade(self, client):
+        """The API is a window, not a trading terminal.
+
+        Every mutating route is a kill-switch control: one engages it, one
+        acknowledges it. Neither can open, size, route or submit anything, so
+        the property this test exists for — no HTTP request can cause a trade —
+        is unchanged. The clear endpoint was added by Remediation E1 because
+        clearing the switch's state without unlatching
+        ``PaperExecutor.execution_disabled`` left the platform permanently
+        unable to submit (P5-5).
+        """
         paths = client.get("/openapi.json").json()["paths"]
         mutating = {
             path
             for path, methods in paths.items()
             if set(methods) - {"get", "head", "options"}
         }
-        # The kill switch is the only way in, and it only halts.
-        assert mutating == {"/api/kill-switch"}
+        assert mutating == {"/api/kill-switch", "/api/kill-switch/clear"}

@@ -290,9 +290,38 @@ def create_app(platform: Platform) -> FastAPI:
 
     @app.post("/api/kill-switch")
     async def engage(trigger: str = "MANUAL", detail: str = "engaged via API") -> dict[str, Any]:
-        """Manual kill switch. The only mutating endpoint, and it only stops things."""
+        """Manual kill switch. It only ever stops things.
+
+        Unchanged: engaging is one direction, and this endpoint has no way to
+        resume anything. Recovery is the separate, explicit operator action
+        below.
+        """
         state = await platform.kill_switch.engage(trigger, detail)
         platform.state.kill_switch = state
         return {"engaged": state.engaged, "triggered_by": state.triggered_by}
+
+    @app.post("/api/kill-switch/clear")
+    async def clear(reason: str = "cleared via API") -> dict[str, Any]:
+        """Operator recovery. Deliberately explicit, and never automatic.
+
+        Routed through the ORCHESTRATOR rather than through
+        ``platform.kill_switch.clear``, because clearing the switch's own
+        state is only half of it: ``RECONCILIATION_MISMATCH`` and
+        ``UNEXPECTED_POSITION`` latch ``PaperExecutor.execution_disabled``,
+        and a reset that leaves that flag set reports a cleared platform while
+        every submission keeps being rejected (P5-5). Only the orchestrator
+        owns that effect, so only the orchestrator can undo it.
+
+        If the condition that engaged the switch still holds, the next
+        protected tick engages it again. That is the intended outcome — this
+        endpoint acknowledges an emergency, it does not resolve one.
+        """
+        state = await platform.orchestrator.clear_kill_switch(reason)
+        return {
+            "engaged": state.engaged,
+            "trading_allowed": state.trading_allowed,
+            "execution_disabled": platform.veska.executor.execution_disabled,
+            "triggered_by": state.triggered_by,
+        }
 
     return app
