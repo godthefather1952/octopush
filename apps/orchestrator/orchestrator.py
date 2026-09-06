@@ -124,7 +124,17 @@ class Orchestrator:
     #: inability to persist should.
     storage_failure_threshold: int = 3
     attributions: dict[str, AttributionBuilder] = field(default_factory=dict)
-    #: Opportunity id -> notional currently working, for strategy exposure.
+    #: Opportunity id -> GROSS quote exposure that opportunity currently has
+    #: working, summed across ALL of its legs.
+    #:
+    #: NOT the per-leg ``approved_notional``. RUNE sizes and gates in per-leg
+    #: units — a two-leg trade authorised at 25,000 puts 25,000 on each of two
+    #: venues — so one working opportunity consumes ``approved_notional *
+    #: len(legs)`` of the strategy's gross budget. Storing the per-leg figure
+    #: here made ``gate_strategy_exposure`` compare a per-leg sum against a
+    #: per-trade projection and authorise roughly ``leg count`` times
+    #: ``max_strategy_exposure`` (P5-2). Read only through
+    #: :meth:`_current_strategy_exposure`.
     working_notional: dict[str, float] = field(default_factory=dict)
     #: Symbol -> hedge orders still in flight. OKAPI measures delta from the
     #: portfolio, which only moves on fills, so without this a hedge would be
@@ -516,6 +526,20 @@ class Orchestrator:
             )
         return portfolio
 
+    def _current_strategy_exposure(self) -> float:
+        """Gross quote exposure the strategy currently has working.
+
+        The single source for both the risk gate and the dashboard. Values in
+        :attr:`working_notional` are already gross across each opportunity's
+        legs, so this is a plain sum — but it exists as a named method so the
+        gate and the published utilization cannot drift into different units
+        the way they had (P5-2 / P5-13): ``_risk_check`` fed
+        ``gate_strategy_exposure`` and ``_refresh_risk_utilization`` fed the
+        dashboard from two separate expressions that both happened to be
+        per-leg sums against a per-trade budget.
+        """
+        return sum(self.working_notional.values())
+
     def _refresh_risk_utilization(self, portfolio: PortfolioState) -> None:
         """Keep the published risk-utilization snapshot current every tick.
 
@@ -534,7 +558,7 @@ class Orchestrator:
         """
         unhedged = self.okapi.total_unhedged(portfolio)
         self.state.risk_utilization = self.rune.core.utilization(
-            portfolio, unhedged, {STRATEGY: sum(self.working_notional.values())}
+            portfolio, unhedged, {STRATEGY: self._current_strategy_exposure()}
         )
 
     def _storage_ok(self) -> bool:
@@ -808,7 +832,12 @@ class Orchestrator:
             expected_costs_bps=intent.costs.total_bps,
             decision=decision,
         )
-        self.working_notional[opportunity.opportunity_id] = decision.approved_notional
+        # Gross across every leg, not the per-leg notional RUNE authorised:
+        # this feeds MAX_STRATEGY_EXPOSURE, which is a gross budget, and the
+        # incoming intent is projected the same way (P5-2).
+        self.working_notional[opportunity.opportunity_id] = (
+            decision.approved_notional * len(intent.legs)
+        )
 
         await self.transition(record, StrategyState.EXECUTING)
         report = await self.veska.execute(plan, self.tick_time)
@@ -891,12 +920,12 @@ class Orchestrator:
             open_orders=len(self.veska.open_orders()),
             error_rate=self._error_rate(),
             unhedged_notional=self.okapi.total_unhedged(portfolio),
-            strategy_exposure=sum(self.working_notional.values()),
+            strategy_exposure=self._current_strategy_exposure(),
             max_economical_notional=curve.max_economical_notional if curve else None,
             hedge_available=self.okapi.hedge_available(intent.symbol, market),
         )
         self.state.risk_utilization = self.rune.core.utilization(
-            portfolio, ctx.unhedged_notional, {STRATEGY: sum(self.working_notional.values())}
+            portfolio, ctx.unhedged_notional, {STRATEGY: ctx.strategy_exposure}
         )
         return await self.rune.evaluate(intent, ctx, self.tick_time)
 

@@ -229,8 +229,16 @@ def strategy_exposure_as_gate_sees_it(
 
     Production computes ``ctx.strategy_exposure + intent.notional * legs``
     where ``ctx.strategy_exposure`` is
-    ``sum(orchestrator.working_notional.values())`` and each entry is one
-    opportunity's ``decision.approved_notional`` -- stored once, per-leg.
+    ``Orchestrator._current_strategy_exposure()``.
+
+    Since the P5-2 remediation each ``working_notional`` entry is one
+    opportunity's ``approved_notional * len(legs)`` -- GROSS across its legs --
+    so passing a gross-valued map here makes this agree with
+    :func:`true_strategy_exposure`. Before the fix the entries were per-leg and
+    the two diverged by a factor approaching the leg count, which is exactly
+    what this pair of comparators was built to expose. Keeping both means a
+    future regression to per-leg storage is still detectable rather than
+    silently self-consistent.
     """
     return sum(working_notional.values()) + intent_notional * leg_count
 

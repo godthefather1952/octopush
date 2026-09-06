@@ -217,9 +217,9 @@ class TestWorkingExposureLifecycle:
 
     def test_the_reservation_is_taken_at_authorisation(self):
         source = inspect.getsource(Orchestrator._decide)
-        assert (
-            "self.working_notional[opportunity.opportunity_id] = "
-            "decision.approved_notional" in source
+        assert "self.working_notional[opportunity.opportunity_id] = (" in source
+        assert "decision.approved_notional * len(intent.legs)" in source, (
+            "gross across the legs, per the P5-2 unit fix"
         )
 
     def test_the_reservation_is_released_only_on_a_terminal_transition(self):

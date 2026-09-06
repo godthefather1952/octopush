@@ -134,21 +134,62 @@ class TestTheSizeSensitiveInventory:
             "not size-sensitive and does not belong in this inventory"
         )
 
-    def test_two_of_them_are_missing_from_the_headroom_candidates(self):
-        """Structural statement of the H1 finding, independent of behaviour."""
+    def test_every_reducible_limit_has_a_headroom_candidate(self):
+        """Structural statement of the H1 property, independent of behaviour.
+
+        A limit may be read inline (``self.limits.max_gross_exposure``) or
+        through a dedicated solver in :mod:`risk.limits`; either shape counts,
+        because what matters is that ``_headroom`` bounds the size by it at
+        all. MAX_NET_EXPOSURE and MAX_LEVERAGE were bounded by neither, so a
+        trade breaching either was rejected where a smaller one would have
+        passed (P5-7).
+        """
+        from risk import limits as gates
+
         source = inspect.getsource(RuneCore._headroom)
-        absent = [
-            name
-            for name, attribute in (
-                ("MAX_NET_EXPOSURE", "max_net_exposure"),
-                ("MAX_LEVERAGE", "max_leverage"),
-            )
-            if f"self.limits.{attribute}" not in source
-        ]
+        solvers = {
+            "MAX_NET_EXPOSURE": ("max_net_exposure", "net_exposure_headroom"),
+            "MAX_LEVERAGE": ("max_leverage", "leverage_headroom"),
+            "MAX_GROSS_EXPOSURE": ("max_gross_exposure", None),
+            "MAX_STRATEGY_EXPOSURE": ("max_strategy_exposure", None),
+            "MAX_VENUE_EXPOSURE": ("max_venue_exposure", None),
+            "MAX_POSITION_NOTIONAL": ("max_position_notional", None),
+            "MAX_ORDER_NOTIONAL": ("max_order_notional", None),
+        }
+        absent = []
+        for name, (attribute, solver) in solvers.items():
+            inline = f"self.limits.{attribute}" in source
+            delegated = solver is not None and f"gates.{solver}(" in source
+            if not (inline or delegated):
+                absent.append(name)
         assert not absent, (
             "size-sensitive limits with no entry in _headroom, so a breach of "
             f"them rejects instead of reducing: {absent}"
         )
+
+        # A delegated solver must actually consult the limit it stands for,
+        # or the delegation is a name with nothing behind it.
+        assert "limits.max_net_exposure" in inspect.getsource(
+            gates.net_exposure_headroom
+        )
+        assert "limits.max_leverage" in inspect.getsource(gates.leverage_headroom)
+
+    def test_the_open_order_gate_is_deliberately_not_reducible(self):
+        """The one size-sensitive-looking gate with no headroom candidate.
+
+        An intent creates one order per leg regardless of its notional, so no
+        reduction can make MAX_OPEN_ORDERS pass and rejection is the only
+        correct answer. Pinned so its absence stays a decision.
+        """
+        source = inspect.getsource(RuneCore._headroom)
+        assert "max_open_orders" not in source
+
+    def test_headroom_and_the_gates_group_legs_the_same_way(self):
+        """P5-11's other half: a gate that aggregates duplicate legs and a
+        sizing path that does not would describe two different models."""
+        source = inspect.getsource(RuneCore._headroom)
+        assert "gates.legs_per_venue(intent)" in source
+        assert "gates.legs_per_position(intent)" in source
 
 
 class TestHeadroomNeverIncreasesSize:
@@ -357,9 +398,11 @@ class TestLeverageIsReducible:
         max_net_exposure=60_000.0,
     )
     REQUESTED = 60_000.0
-    #: Venue A already carries 40,000 of the 75,000 default venue limit, so
-    #: headroom cuts the request to 35,000 -- still enough to breach leverage.
-    EXPECTED_SIZED = 35_000.0
+    #: What leverage alone permits: ``(max_leverage * equity - gross) / legs``
+    #: = ``(1.0 * 100,000 - 40,000) / 2``. Tighter than every other candidate
+    #: -- the next-smallest is venue A's 35,000 -- so leverage is what binds
+    #: the size, which is the point of the scenario.
+    EXPECTED_SIZED = 30_000.0
 
     @staticmethod
     def _book():
@@ -374,11 +417,14 @@ class TestLeverageIsReducible:
         return {"portfolio": book, "max_economical_notional": 200_000.0}
 
     def test_the_scenario_puts_leverage_over_the_limit(self):
+        """The premise: as submitted, this trade breaches leverage."""
         book = self._book()
         assert book.equity == pytest.approx(100_000.0)
         assert book.gross_exposure == pytest.approx(40_000.0)
-        projected = (40_000.0 + self.EXPECTED_SIZED * 2) / 100_000.0
-        assert projected > 1.0, "the requested size must actually breach leverage"
+        projected = (book.gross_exposure + self.REQUESTED * 2) / book.equity
+        assert projected > self.LIMITS.max_leverage, (
+            "the requested size must actually breach leverage"
+        )
 
     def test_a_smaller_size_would_have_passed_the_leverage_gate(self):
         book = self._book()
@@ -393,13 +439,18 @@ class TestLeverageIsReducible:
             "the sizing contract"
         )
 
-    def test_leverage_is_the_only_gate_the_request_breaches(self):
-        """Establishes that a rejection here is attributable to leverage alone."""
+    def test_leverage_is_what_binds_the_size(self):
+        """Establishes that the outcome here is attributable to leverage alone:
+        it is the tightest candidate, and the sized trade lands exactly on the
+        limit rather than merely under it."""
         book = self._book()
         decision = core(self.LIMITS).evaluate(
             intent(notional=self.REQUESTED), context(**self._ctx(book)), START_MS
         )
-        assert blocking_names(decision) == ["MAX_LEVERAGE"]
+        assert blocking_names(decision) == []
+        assert decision.approved_notional == pytest.approx(self.EXPECTED_SIZED)
+        check = gate_named(decision, "MAX_LEVERAGE")
+        assert check.observed == pytest.approx(self.LIMITS.max_leverage)
 
     def test_an_oversized_leverage_request_is_reduced_not_rejected(self):
         book = self._book()

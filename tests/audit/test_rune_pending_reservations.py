@@ -57,7 +57,9 @@ def sequential_authorisations(
     """Authorise ``proposals`` back to back against an unchanging portfolio.
 
     Models the orchestrator exactly: the portfolio does not move (nothing has
-    filled), and the only carried-forward state is ``working_notional``.
+    filled), and the only carried-forward state is the strategy reservation —
+    stored gross across the opportunity's legs, as ``Orchestrator._decide``
+    does since the P5-2 fix.
     """
     engine = core(limits)
     working: dict[str, float] = {}
@@ -74,7 +76,9 @@ def sequential_authorisations(
         )
         decisions.append(decision)
         if decision.approved:
-            working[proposed.opportunity_id] = decision.approved_notional
+            working[proposed.opportunity_id] = decision.approved_notional * len(
+                proposed.legs
+            )
     return decisions
 
 
@@ -100,18 +104,20 @@ class TestTheOrchestratorAuthorisesWithoutSettlingFirst:
         assert "portfolio=portfolio," in source
 
     def test_only_strategy_exposure_carries_a_reservation(self):
-        """Nothing else in RiskContext is fed from working_notional.
+        """Nothing else in RiskContext is fed from the reservation map.
 
-        The second reference is the risk-utilization snapshot, which reports
-        the same sum to the dashboard rather than feeding another gate.
+        Since the P5-2 fix both readers go through
+        ``_current_strategy_exposure()``, so the check is on that helper rather
+        than on an inline sum.
         """
         source = inspect.getsource(Orchestrator._risk_check)
         reserved = [
-            line.strip() for line in source.splitlines() if "working_notional" in line
+            line.strip()
+            for line in source.splitlines()
+            if "_current_strategy_exposure" in line or "working_notional" in line
         ]
-        assert len(reserved) == 2, f"reservation wiring changed: {reserved}"
-        assert reserved[0] == "strategy_exposure=sum(self.working_notional.values()),"
-        assert reserved[1].startswith("portfolio, ctx.unhedged_notional,")
+        assert len(reserved) == 1, f"reservation wiring changed: {reserved}"
+        assert reserved[0] == "strategy_exposure=self._current_strategy_exposure(),"
 
     def test_no_exposure_gate_receives_a_pending_reservation(self):
         """Stated as the shape of RiskContext itself: the fields the gross,
@@ -120,7 +126,8 @@ class TestTheOrchestratorAuthorisesWithoutSettlingFirst:
         source = inspect.getsource(Orchestrator._risk_check)
         context_block = source.split("ctx = RiskContext(")[1].split(")\n")[0]
         assert "portfolio=portfolio," in context_block
-        assert context_block.count("working_notional") == 1
+        assert context_block.count("_current_strategy_exposure") == 1
+        assert "working_notional" not in context_block
 
 
 class TestGrossExposureUnderConcurrentAuthorisation:
@@ -299,9 +306,10 @@ class TestLeverageUnderConcurrentAuthorisation:
 class TestOpenOrderCapacity:
     """H4 — does the open-order gate account for the orders this intent creates?
 
-    ``gate_open_orders`` compares ``open_orders < max_open_orders``. VESKA's
-    ``build_plan`` emits one order per leg, so a two-leg intent authorised at
-    19 open orders produces 21.
+    ``build_plan`` emits one order per leg, so the question a capacity limit
+    asks is ``current + incoming <= max_open_orders``, not ``current <
+    max_open_orders``. The old form let 19 live orders admit a two-leg trade
+    and reach 21 (P5-4).
     """
 
     LIMITS = RiskLimits(max_open_orders=20)
@@ -314,13 +322,43 @@ class TestOpenOrderCapacity:
         assert "for leg in intent.legs:" in source
         assert "orders.append(" in source
 
-    def test_the_gate_reads_only_the_current_count(self):
+    def test_the_gate_reports_the_projected_count(self):
+        """§21 — a rejection must be readable. ``observed`` is what the
+        platform would hold after planning, so "21 against 20" explains itself
+        where "19 against 20" did not."""
         decision = core(self.LIMITS).evaluate(
             intent(), context(open_orders=19), START_MS
         )
         check = gate_named(decision, "MAX_OPEN_ORDERS")
-        assert check.observed == pytest.approx(19.0)
+        assert check.observed == pytest.approx(21.0)
         assert check.limit == pytest.approx(20.0)
+        assert "19 live + 2 incoming = 21" in check.detail
+
+    @pytest.mark.parametrize(
+        ("current", "expected_pass"),
+        [(0, True), (17, True), (18, True), (19, False), (20, False)],
+    )
+    def test_the_exact_capacity_boundary(self, current, expected_pass):
+        """18 + 2 == 20 passes; 19 + 2 == 21 fails."""
+        decision = core(self.LIMITS).evaluate(
+            intent(), context(open_orders=current), START_MS
+        )
+        blocked = "MAX_OPEN_ORDERS" in blocking_names(decision)
+        assert blocked is not expected_pass, (
+            f"{current} live + 2 incoming = {current + 2} against a "
+            f"{self.LIMITS.max_open_orders} limit"
+        )
+
+    def test_a_one_leg_intent_may_use_the_last_slot(self):
+        """The gate must not become blanket-conservative: at 19 live orders a
+        single-leg intent reaches exactly the limit and is allowed."""
+        proposed = intent(legs=[leg(VENUE_A, Side.BUY)])
+        decision = core(self.LIMITS).evaluate(
+            proposed, context(open_orders=19), START_MS
+        )
+        check = gate_named(decision, "MAX_OPEN_ORDERS")
+        assert check.observed == pytest.approx(20.0)
+        assert not check.blocking
 
     def test_at_the_limit_no_further_trade_is_authorised(self):
         decision = core(self.LIMITS).evaluate(
@@ -345,8 +383,11 @@ class TestOpenOrderCapacity:
             f"{resulting} against a {self.LIMITS.max_open_orders} limit"
         )
 
-    def test_a_larger_leg_count_widens_the_overshoot(self):
-        """A generic hard-risk layer must hold for any leg count."""
+    @pytest.mark.parametrize("current", [16, 17, 18, 19])
+    def test_the_limit_holds_for_a_larger_leg_count(self, current):
+        """A generic hard-risk layer must hold for any leg count, not only the
+        two the shipped strategy uses. A three-leg intent consumes three
+        slots, so 17 live orders is already too many."""
         from tests.audit.rune_fixtures import VENUE_C
 
         proposed = intent(
@@ -357,12 +398,12 @@ class TestOpenOrderCapacity:
             ],
         )
         decision = core(self.LIMITS).evaluate(
-            proposed, context(open_orders=19), START_MS
+            proposed, context(open_orders=current), START_MS
         )
-        resulting = 19 + (3 if decision.approved else 0)
+        resulting = current + (3 if decision.approved else 0)
         assert resulting <= self.LIMITS.max_open_orders, (
-            f"a 3-leg intent authorised at 19 live orders leaves {resulting} "
-            f"against a {self.LIMITS.max_open_orders} limit"
+            f"a 3-leg intent authorised at {current} live orders leaves "
+            f"{resulting} against a {self.LIMITS.max_open_orders} limit"
         )
 
 

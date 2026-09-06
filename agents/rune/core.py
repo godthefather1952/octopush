@@ -32,7 +32,16 @@ VERSION = "rune-core-0.1"
 
 @dataclass
 class RiskContext:
-    """Everything RUNE-CORE needs, gathered by the orchestrator."""
+    """Everything RUNE-CORE needs, gathered by the orchestrator.
+
+    CANONICAL NOTIONAL UNIT
+    =======================
+    ``TradeIntent.notional`` and ``RiskDecision.approved_notional`` are the
+    *per-leg* quote notional: VESKA sizes every leg as
+    ``notional / expected_price``, so an N-leg trade puts ``notional`` on each
+    of N venues. Its gross contribution — to the portfolio, to a venue, to a
+    strategy budget — is therefore ``notional * N``.
+    """
 
     portfolio: PortfolioState
     kill_switch: KillSwitchState
@@ -43,6 +52,12 @@ class RiskContext:
     open_orders: int = 0
     error_rate: float = 0.0
     unhedged_notional: float = 0.0
+    #: GROSS quote exposure this strategy already has working, summed across
+    #: every leg of every trade — NOT a sum of per-leg notionals. The incoming
+    #: intent is projected at ``notional * legs``, so a per-leg sum here would
+    #: compare two different units and authorise roughly ``leg count`` times
+    #: the configured budget (P5-2). Built by
+    #: ``Orchestrator._current_strategy_exposure``.
     strategy_exposure: float = 0.0
     max_economical_notional: float | None = None
     hedge_available: bool = True
@@ -143,7 +158,9 @@ class RuneCore:
             gates.gate_daily_loss(ctx.portfolio, self.limits),
             gates.gate_drawdown(ctx.portfolio, self.limits),
             gates.gate_unhedged(ctx.unhedged_notional, self.limits),
-            gates.gate_open_orders(ctx.open_orders, self.limits),
+            # The SIZED intent's leg count, which is also the original's:
+            # reducing a notional never changes how many orders VESKA plans.
+            gates.gate_open_orders(ctx.open_orders, len(intent.legs), self.limits),
             gates.gate_error_rate(ctx.error_rate, self.limits),
         ]
 
@@ -184,26 +201,56 @@ class RuneCore:
         )
 
     def _headroom(self, intent: TradeIntent, ctx: RiskContext) -> float:
-        """Largest notional that still satisfies every size-based limit.
+        """Largest per-leg notional that still satisfies every size-based limit.
 
         Gates have already passed at the requested size, so this only ever
         reduces; it exists so that a trade close to a limit is cut down rather
         than rejected outright.
+
+        EVERY SIZE-REDUCIBLE GATE MUST APPEAR HERE
+        ==========================================
+        :meth:`evaluate` promises that a size-based gate "can only fail if the
+        reduction could not make it pass". That is only true if this function
+        mirrors every gate whose outcome depends on ``notional``. Two were
+        missing — MAX_NET_EXPOSURE and MAX_LEVERAGE — so a trade breaching
+        either was rejected outright where a smaller one would have been
+        authorised (P5-7). Both are now solved for directly, next to the gates
+        they mirror, in :mod:`risk.limits`.
+
+        The one deliberate exclusion is MAX_OPEN_ORDERS: an intent creates one
+        order per leg regardless of its notional, so no reduction can make that
+        gate pass and rejection is the only correct answer.
+
+        Grouping matters as much as inclusion. Venue and position candidates
+        are computed per *group* rather than per leg, using the same helpers
+        the gates use, so two legs sharing a venue consume that venue's
+        headroom twice (P5-11). Appending one full remaining amount per leg
+        would have described a different model from the gate that judges the
+        result.
         """
         legs = max(1, len(intent.legs))
         candidates = [
             intent.notional,
             self.limits.max_order_notional,
             (self.limits.max_gross_exposure - ctx.portfolio.gross_exposure) / legs,
+            # ``ctx.strategy_exposure`` is gross strategy exposure across all
+            # legs of every working trade, the same unit the gate projects into.
             (self.limits.max_strategy_exposure - ctx.strategy_exposure) / legs,
+            gates.net_exposure_headroom(intent, ctx.portfolio, self.limits),
+            gates.leverage_headroom(intent, ctx.portfolio, self.limits),
         ]
+
         exposure = ctx.portfolio.exposure_by_venue()
-        for leg in intent.legs:
-            candidates.append(self.limits.max_venue_exposure - exposure.get(leg.venue, 0.0))
-            key = f"{leg.venue}:{leg.symbol}"
+        for venue, leg_count in gates.legs_per_venue(intent).items():
+            remaining = self.limits.max_venue_exposure - exposure.get(venue, 0.0)
+            candidates.append(remaining / leg_count)
+
+        for key, leg_count in gates.legs_per_position(intent).items():
             position = ctx.portfolio.positions.get(key)
             current = position.notional if position else 0.0
-            candidates.append(self.limits.max_position_notional - current)
+            remaining = self.limits.max_position_notional - current
+            candidates.append(remaining / leg_count)
+
         if ctx.max_economical_notional is not None:
             candidates.append(ctx.max_economical_notional)
         return max(0.0, min(candidates))

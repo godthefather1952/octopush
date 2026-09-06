@@ -153,9 +153,11 @@ class TestVenueExposureIsNeverUnderstated:
         assert claimed >= max(after.values()) - 1e-6
 
     def test_two_legs_on_the_same_venue_are_aggregated(self):
-        """``gate_venue_exposure`` takes ``max`` over legs rather than summing
-        per-venue additions. With two legs on one venue the venue receives
-        ``2 * notional`` while the gate observes ``current + notional``.
+        """``gate_venue_exposure`` groups legs by venue before projecting.
+
+        Taking ``max`` over ungrouped legs answered "what is the largest single
+        leg's effect", which is not the question a venue limit asks: two legs
+        routed to one venue put ``2 * notional`` on it (P5-11).
         """
         proposed = intent(
             legs=[
@@ -216,9 +218,9 @@ class TestPositionExposureIsNeverUnderstated:
             f"(held {held}, {side.value} 10,000)"
         )
 
-    def test_two_legs_on_one_position_are_not_aggregated(self):
-        """``gate_position_notional`` takes ``max`` over legs, so two legs on
-        the same venue/symbol are counted once."""
+    def test_two_legs_on_one_position_are_aggregated(self):
+        """``gate_position_notional`` groups by ``venue:symbol`` before
+        projecting, so two legs landing on one position add twice (P5-11)."""
         proposed = intent(
             legs=[leg(VENUE_A, Side.BUY), leg(VENUE_A, Side.BUY)],
             notional=10_000.0,
