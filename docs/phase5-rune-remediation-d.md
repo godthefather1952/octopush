@@ -359,3 +359,99 @@ headroom, gate result and approved notional.
 Nothing in this pass was executed under a test runner. Whether the four canary
 tests go green naturally, and whether the production probe now runs without a
 trigger, are for the external validator to establish.
+
+---
+
+## 23. External validation — CI #39
+
+Run on `d5c5edb`:
+
+| | |
+| --- | --- |
+| Full suite | 2939 passed / **43 failed** / 2 skipped |
+| Python 3.11 unit + contract | 1381 passed / 126 skipped / **0 failed** |
+| Ruff, Mypy core, paper boundary, Redis + PostgreSQL contract pre-check | PASS |
+
+**P5-18 — PARTIAL / VALIDATION PENDING.**
+
+### The sizing change is present
+
+Every P5-18 direct test passes. `test_rune_leg_fill_risk.py`,
+`test_rune_committed_exposure.py::TestPendingUnhedgedFillRisk` and the
+size-sensitivity inventory are all green, and the baseline unit/contract suite
+is unchanged at zero failures. The fill factor, the slippage multiplier, the
+projected gate, the headroom solver, the pending fill-risk accounting and the
+25,000 → 9,990.01 default sizing are all doing what Remediation D says they do.
+
+### The default run still enters emergency state
+
+`RISK_LIMIT_BREACH` engages at `1788000015200` — `START_MS + 15,200ms` —
+**exactly the same first-trigger instant observed before Remediation D**. The
+four canaries therefore still fail, for the same reason they failed in CI #38:
+they assert things about a platform that is still trading, and it is not.
+
+An unchanged first-trigger time is itself informative: whatever remains is not
+sensitive to the entry size P5-18 reduced. That rules out the simplest
+explanation and rules against reaching for a second production adjustment
+before the state at the trigger has been measured. **No further production
+change is justified until then**, which is why this pass adds no production
+diff at all.
+
+### The exposure-projection failure cluster is a stale fixture
+
+The largest new cluster is `tests/audit/test_rune_exposure_projection.py`, and
+none of it is a newly discovered projection defect:
+
+```
+gross    projection 19,980.02   vs realised 50,000
+venue    projection  9,990.01   vs realised 20,000
+position projection  9,990.01   vs realised 10,000
+net      projection  9,990.01   vs realised 10,000
+leverage projection      0.1998 vs realised     0.2
+```
+
+Every claimed projection is exactly the 9,990.01 sizing, or a multiple of it.
+The module's `OPEN` fixture declares "generous everywhere, so nothing is
+reduced" but never named `max_unhedged_notional`, because while the gate had no
+headroom candidate the shipped 10,000 default could not reduce anything and the
+claim was true without it. P5-18 made the gate size-sensitive; `OPEN` then cut
+every intent to 9,990.01 while the module's `apply_trade` reference portfolio
+was still built from the ORIGINAL request. The two sides stopped describing the
+same trade.
+
+The repair is to open the unrelated limit, and only that: the assertions,
+`apply_trade`, and the comparison against the *requested* size are all
+unchanged. The question this module asks — at a size every limit intentionally
+allows, does each gate conservatively bound the whole requested trade? — is
+still the right question and still gets a straight answer.
+
+The same omission was closed in three `test_rune_gate_invariants.py` fixtures
+and one `test_rune_loss_boundaries.py` config-coherence fixture. Those four
+passed either way, but with the unhedged budget binding first they no longer
+demonstrated the order or venue limit they name.
+
+### What is measured next
+
+`tests/audit/test_rune_default_breach_diagnostic.py` runs the real platform for
+250 ticks and reports the complete state at the first trigger: which dimensions
+`live_risk_breaches` flags, each observed value against its limit, the entry
+authorisations that preceded it with their MAX_UNHEDGED_EXPOSURE projections,
+the orders those entries became, and — for the dominant one-sided position — the
+expected price VESKA sized against, the average entry price actually filled, and
+the current mark, as three notionals plus their bps differences.
+
+That last comparison separates the candidate causes rather than assuming one:
+
+- entry away from expected → execution slippage at fill time
+- mark away from expected → mark-to-market drift after sizing
+- all three in agreement → the position is simply larger than the budget, a
+  sizing-model gap
+- unhedged breached with no large position → a residual carried in from an
+  earlier, partly-closed trade
+
+The diagnostic asserts `first_trigger is None` and is **expected to fail** while
+the default run still trips the switch. That is deliberate: the failure is what
+makes CI print the report.
+
+No buffer, tolerance, limit change, auto-clear or confirmation delay was
+implemented in this pass. The measurement decides the fix.

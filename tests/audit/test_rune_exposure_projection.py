@@ -41,6 +41,15 @@ from tests.conftest import START_MS
 
 #: Generous everywhere, so nothing is reduced and the gate reports the
 #: projection for the size actually requested.
+#:
+#: ``max_unhedged_notional`` has to be listed explicitly since Remediation D.
+#: It was omitted while MAX_UNHEDGED_EXPOSURE had no headroom candidate — the
+#: default could not reduce anything, so "generous everywhere" was true without
+#: naming it. P5-18 made the gate size-sensitive, and the shipped 10,000 default
+#: then cut every intent here to 9,990.01 while ``apply_trade`` still built its
+#: reference portfolio from the ORIGINAL request. The two sides stopped
+#: describing the same trade, and the resulting failures were an artefact of
+#: this fixture rather than an understated projection.
 OPEN = RiskLimits(
     max_position_notional=10_000_000.0,
     max_gross_exposure=100_000_000.0,
@@ -49,6 +58,7 @@ OPEN = RiskLimits(
     max_venue_exposure=10_000_000.0,
     max_strategy_exposure=100_000_000.0,
     max_order_notional=10_000_000.0,
+    max_unhedged_notional=100_000_000.0,
 )
 
 PRICE = 100.0

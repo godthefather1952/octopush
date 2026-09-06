@@ -362,7 +362,12 @@ class TestConfigCoherence:
         The same shape the existing validator already rejects for
         position/gross, left unchecked for venue.
         """
-        limits = RiskLimits(max_order_notional=25_000.0, max_venue_exposure=10_000.0)
+        limits = RiskLimits(
+            max_order_notional=25_000.0,
+            max_venue_exposure=10_000.0,
+            # So the venue limit is what reduces the trade (P5-18).
+            max_unhedged_notional=1_000_000.0,
+        )
         decision = core(limits).evaluate(intent(notional=25_000.0), context(), START_MS)
         assert decision.approved_notional <= 10_000.0
         assert limits.max_order_notional > limits.max_venue_exposure, (

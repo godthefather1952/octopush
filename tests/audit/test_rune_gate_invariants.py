@@ -252,7 +252,14 @@ class TestApprovalIsPositive:
     def test_a_reduced_decision_still_names_the_original_intent(self):
         proposed = intent(notional=24_000.0)
         decision = core(
-            RiskLimits(max_order_notional=10_000.0, max_position_notional=50_000.0)
+            RiskLimits(
+                max_order_notional=10_000.0,
+                max_position_notional=50_000.0,
+                # Named explicitly since P5-18 made MAX_UNHEDGED_EXPOSURE
+                # size-sensitive: the shipped 10,000 default would bind
+                # before the order limit this scenario is about.
+                max_unhedged_notional=1_000_000.0,
+            )
         ).evaluate(proposed, context(), START_MS)
         assert decision.verdict is RiskVerdict.APPROVED_REDUCED
         assert decision.intent_id == proposed.intent_id
@@ -265,7 +272,14 @@ class TestGateObservabilityMatchesEnforcement:
 
     def test_order_notional_reports_the_sized_notional_not_the_request(self):
         decision = core(
-            RiskLimits(max_order_notional=10_000.0, max_position_notional=50_000.0)
+            RiskLimits(
+                max_order_notional=10_000.0,
+                max_position_notional=50_000.0,
+                # Named explicitly since P5-18 made MAX_UNHEDGED_EXPOSURE
+                # size-sensitive: the shipped 10,000 default would bind
+                # before the order limit this scenario is about.
+                max_unhedged_notional=1_000_000.0,
+            )
         ).evaluate(intent(notional=24_000.0), context(), START_MS)
         check = gate_named(decision, "MAX_ORDER_NOTIONAL")
         assert check.observed == pytest.approx(decision.approved_notional)
@@ -405,7 +419,14 @@ class TestGatesArePureFunctions:
     def test_reducing_the_size_does_not_mutate_the_original_intent(self):
         proposed = intent(notional=24_000.0)
         core(
-            RiskLimits(max_order_notional=10_000.0, max_position_notional=50_000.0)
+            RiskLimits(
+                max_order_notional=10_000.0,
+                max_position_notional=50_000.0,
+                # Named explicitly since P5-18 made MAX_UNHEDGED_EXPOSURE
+                # size-sensitive: the shipped 10,000 default would bind
+                # before the order limit this scenario is about.
+                max_unhedged_notional=1_000_000.0,
+            )
         ).evaluate(proposed, context(), START_MS)
         assert proposed.notional == pytest.approx(24_000.0)
 
