@@ -1158,12 +1158,17 @@ class Orchestrator:
         return await self.rune.evaluate(intent, ctx, self.tick_time)
 
     def _error_rate(self) -> float:
-        """Rolling share of bus deliveries that raised."""
-        subs = getattr(self.bus, "subscriptions", [])
-        delivered = sum(s.delivered for s in subs)
-        errors = sum(s.errors for s in subs)
-        total = delivered + errors
-        return errors / total if total else 0.0
+        """Share of the bus's most recent delivery attempts that raised.
+
+        Read straight off the bus, which records each outcome as it dispatches
+        (``EventBus`` contract clause 9). It used to be recomputed here from
+        ``Subscription.delivered``/``errors``, which are lifetime totals — so
+        after a healthy first hour a process failing *every* current delivery
+        still reported a rate near zero, and ``MAX_ERROR_RATE`` never fired
+        (P5-8). Those counters remain, as per-handler diagnostics; they are the
+        wrong shape for a health measurement and are no longer used as one.
+        """
+        return self.bus.recent_error_rate
 
     # -- open position management -----------------------------------------
 

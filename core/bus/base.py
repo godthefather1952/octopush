@@ -70,6 +70,10 @@ A handler that raises does not prevent delivery to other subscriptions, does
 not stop the dispatcher, and does not lose the event for anyone else. The
 failure is counted on the subscription (``Subscription.errors``) and logged.
 
+Every implementation also records each delivery attempt — one outcome per
+matching handler per event, success or failure — in a bounded rolling window,
+exposed as ``recent_error_rate`` (clause 9).
+
 6. EVENT IDENTITY
 -----------------
 ``Event.id`` is unique per published event and never empty. ``Event.sequence``
@@ -123,11 +127,33 @@ their own architecture — this clause does not mandate one mechanism:
   trimming rather than this code choosing to drop anything.
 
 ``queue_depth`` is exported by both so the condition is observable either way.
+
+9. HEALTH IS MEASURED OVER A RECENT WINDOW, NOT OVER ALL TIME
+--------------------------------------------------------------
+``recent_error_rate`` is the share of the most recent N delivery attempts that
+raised, where N is fixed at construction. It is a *rolling* measurement: a
+process that has been healthy for a million deliveries and is failing every
+delivery right now reports 1.0, not a number diluted towards zero by its own
+history. RUNE's ``MAX_ERROR_RATE`` gate reads it, and that gate exists to stop
+a platform that is failing *now*, which a lifetime ratio cannot express (P5-8).
+
+Every implementation records one outcome per matching handler per event, at
+dispatch time, into a :class:`DeliveryOutcomeWindow` — bounded, deterministic
+and clock-free, so a replay measures the same health as the run it replays.
+Where a bus re-raises a handler failure to its caller, the outcome is recorded
+before the re-raise: a failure that propagates is still a failure that
+happened.
+
+``Subscription.delivered`` and ``Subscription.errors`` remain lifetime
+counters. They are diagnostics — which handler is failing, and how much — and
+must not be used to derive a health rate, because the arithmetic that does so
+cannot distinguish "healthy now" from "healthy for long enough".
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 
@@ -135,6 +161,64 @@ from core.events import Event, EventType
 
 Handler = Callable[[Event], Awaitable[None]]
 Middleware = Callable[[Event], Awaitable[None]]
+
+#: Deliveries retained by the rolling health window when no size is given.
+#: ``RiskLimits.error_rate_window_deliveries`` carries the same default and is
+#: pinned equal to this by the audit suite, so the composition root and a bus
+#: built by hand agree without one importing the other.
+DEFAULT_DELIVERY_WINDOW = 200
+
+
+class DeliveryOutcomeWindow:
+    """The outcomes of the most recent ``maxlen`` delivery attempts.
+
+    One entry per matching handler per event: ``record_success`` or
+    ``record_error``, never both for the same attempt. ``error_rate`` is the
+    share of the retained entries that failed, and an empty window reports
+    ``0.0`` — no evidence is not evidence of failure, and the gate that reads
+    this has a separate UNKNOWN path for genuinely missing inputs.
+
+    The window is bounded (a fixed-length ``deque``, so memory does not grow
+    with uptime), deterministic (the same sequence of calls always yields the
+    same rate) and takes no reading of time — eviction is by count, not by age.
+    That is what makes it usable inside replay: two runs over the same event
+    sequence measure the same health, whatever wall time either took.
+    """
+
+    __slots__ = ("_outcomes", "_errors")
+
+    def __init__(self, maxlen: int = DEFAULT_DELIVERY_WINDOW) -> None:
+        if maxlen <= 0:
+            raise ValueError(f"delivery window must retain at least one outcome, got {maxlen}")
+        self._outcomes: deque[bool] = deque(maxlen=maxlen)
+        self._errors = 0
+
+    @property
+    def maxlen(self) -> int:
+        """How many outcomes are retained before the oldest is evicted."""
+        return self._outcomes.maxlen or 0
+
+    def __len__(self) -> int:
+        return len(self._outcomes)
+
+    def record_success(self) -> None:
+        self._append(False)
+
+    def record_error(self) -> None:
+        self._append(True)
+
+    def _append(self, failed: bool) -> None:
+        if len(self._outcomes) == self._outcomes.maxlen and self._outcomes[0]:
+            self._errors -= 1
+        self._outcomes.append(failed)
+        if failed:
+            self._errors += 1
+
+    @property
+    def error_rate(self) -> float:
+        """Share of the retained attempts that raised. ``0.0`` when empty."""
+        total = len(self._outcomes)
+        return self._errors / total if total else 0.0
 
 
 @dataclass
@@ -195,6 +279,18 @@ class EventBus(ABC):
     @abstractmethod
     def subscriptions(self) -> list[Subscription]:
         """Live subscriptions, for health and metrics."""
+
+    @property
+    @abstractmethod
+    def recent_error_rate(self) -> float:
+        """Share of the most recent delivery attempts that raised (clause 9).
+
+        Declared abstract deliberately. An implementation that cannot answer
+        this cannot be used, rather than being silently substituted or quietly
+        measured by lifetime totals: a health input that degrades to a
+        different definition without saying so is worse than one that is
+        missing, because the risk gate reading it cannot tell the difference.
+        """
 
     def add_middleware(self, middleware: Middleware) -> None:
         """Register a hook invoked for every published event, before delivery.

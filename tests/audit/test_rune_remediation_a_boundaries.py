@@ -416,6 +416,12 @@ class TestOpenOrderBoundary:
 class TestDuplicateVenueBoundary:
     LIMIT = 20_000.0
 
+    #: ``max_order_notional <= max_venue_exposure`` became a coherence rule in
+    #: Remediation E2 (P5-15), so the wide-open order cap has to come down with
+    #: the venue cap. It stays non-binding: every case below is decided by
+    #: venue room strictly smaller than this.
+    NARROW = {"max_venue_exposure": LIMIT, "max_order_notional": LIMIT}
+
     @staticmethod
     def _two_on_one_venue(notional: float):
         return {
@@ -428,7 +434,7 @@ class TestDuplicateVenueBoundary:
 
     def test_two_legs_on_one_venue_project_twice(self):
         decision = decide(
-            {"max_venue_exposure": self.LIMIT}, self._two_on_one_venue(10_000.0)
+            self.NARROW, self._two_on_one_venue(10_000.0)
         )
         check = gate_named(decision, "MAX_VENUE_EXPOSURE")
         assert check.observed == pytest.approx(20_000.0)
@@ -437,12 +443,12 @@ class TestDuplicateVenueBoundary:
     def test_the_boundary_is_exact(self):
         assert (
             decide(
-                {"max_venue_exposure": self.LIMIT}, self._two_on_one_venue(10_000.0)
+                self.NARROW, self._two_on_one_venue(10_000.0)
             ).verdict
             is RiskVerdict.APPROVED
         )
         above = decide(
-            {"max_venue_exposure": self.LIMIT}, self._two_on_one_venue(10_001.0)
+            self.NARROW, self._two_on_one_venue(10_001.0)
         )
         assert above.verdict is RiskVerdict.APPROVED_REDUCED
         assert above.approved_notional == pytest.approx(10_000.0)
@@ -451,7 +457,7 @@ class TestDuplicateVenueBoundary:
         """The sizing path and the gate must describe one model: half the
         remaining venue room per leg, not the whole of it twice."""
         decision = decide(
-            {"max_venue_exposure": self.LIMIT}, self._two_on_one_venue(500_000.0)
+            self.NARROW, self._two_on_one_venue(500_000.0)
         )
         assert decision.approved_notional == pytest.approx(10_000.0)
         assert gate_named(
@@ -462,7 +468,7 @@ class TestDuplicateVenueBoundary:
         book = portfolio_with(position(VENUE_A, "SOL-USD", quantity=100.0))
         assert book.exposure_by_venue()[VENUE_A] == pytest.approx(10_000.0)
         decision = decide(
-            {"max_venue_exposure": self.LIMIT},
+            self.NARROW,
             self._two_on_one_venue(500_000.0),
             portfolio=book,
         )
@@ -472,7 +478,7 @@ class TestDuplicateVenueBoundary:
     def test_distinct_venues_are_unaffected(self):
         """A control: the shipped two-leg strategy uses distinct venues, and
         its sizing must not change."""
-        decision = decide({"max_venue_exposure": self.LIMIT}, {"notional": 20_000.0})
+        decision = decide(self.NARROW, {"notional": 20_000.0})
         assert decision.verdict is RiskVerdict.APPROVED
         assert decision.approved_notional == pytest.approx(20_000.0)
 

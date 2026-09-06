@@ -182,7 +182,14 @@ import logging
 from collections import deque
 from collections.abc import Iterable
 
-from core.bus.base import EventBus, Handler, Middleware, Subscription
+from core.bus.base import (
+    DEFAULT_DELIVERY_WINDOW,
+    DeliveryOutcomeWindow,
+    EventBus,
+    Handler,
+    Middleware,
+    Subscription,
+)
 from core.events import Event, EventType
 
 log = logging.getLogger(__name__)
@@ -233,6 +240,7 @@ class InMemoryEventBus(EventBus):
         raise_on_handler_error: bool = False,
         max_pending: int | None = None,
         cascade_reserve: int | None = None,
+        error_rate_window: int = DEFAULT_DELIVERY_WINDOW,
     ) -> None:
         self._queue: deque[Event] = deque()
         self._max_pending = self.DEFAULT_MAX_PENDING if max_pending is None else max_pending
@@ -275,6 +283,10 @@ class InMemoryEventBus(EventBus):
         self._raise = raise_on_handler_error
         self.published_count = 0
         self.delivered_count = 0
+        #: Clause 9. One entry per handler invocation, written at dispatch
+        #: time. ``delivered_count`` and the per-subscription counters below
+        #: stay lifetime totals for diagnostics; this is the health input.
+        self._outcomes = DeliveryOutcomeWindow(error_rate_window)
         #: Publishes abandoned by stop() while blocked awaiting capacity —
         #: never enqueued at all, but the same category of loss as clause 7's
         #: existing discard-at-stop, so counted alongside it.
@@ -540,8 +552,15 @@ class InMemoryEventBus(EventBus):
                     await sub.handler(event)
                     sub.delivered += 1
                     self.delivered_count += 1
+                    self._outcomes.record_success()
                 except Exception:
                     sub.errors += 1
+                    # Recorded BEFORE the optional re-raise: with
+                    # ``raise_on_handler_error`` set, a failure that propagates
+                    # is still a failure that happened, and a window that
+                    # forgot it would report the healthier of the two possible
+                    # answers exactly when the bus is configured to be strict.
+                    self._outcomes.record_error()
                     log.exception("handler %s failed on %s", sub.name, event.type)
                     if self._raise:
                         raise
@@ -642,3 +661,13 @@ class InMemoryEventBus(EventBus):
     @property
     def subscriptions(self) -> list[Subscription]:
         return list(self._subs)
+
+    @property
+    def recent_error_rate(self) -> float:
+        """Clause 9: failures among the most recent delivery attempts."""
+        return self._outcomes.error_rate
+
+    @property
+    def error_rate_window(self) -> int:
+        """How many delivery attempts ``recent_error_rate`` measures over."""
+        return self._outcomes.maxlen

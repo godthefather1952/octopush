@@ -500,6 +500,40 @@ Severities follow §46. Ranked most severe first.
 | **P5-17** | LOW | Kill switch | An action mapping names a response some trigger can deliver | `AGENT_FAILURE` has actions defined, no predicate in `TRIGGERS`, and no caller. Its action set is `(HALT_NEW_TRADES,)` — byte-identical to `SYSTEM_HEALTH_FAILURE`'s, whose predicate already covers a required agent going unhealthy | `test_rune_kill_switch.py::TestTriggerInventory::test_agent_failure_is_not_a_vestigial_mapping` | **Not an exposure gap and explicitly not part of P5-3.** Nothing is unprotected: a failing required agent is caught by `SYSTEM_HEALTH_FAILURE`, and a required agent that answers with nothing is caught by consensus completeness. The mapping is vestigial, and a dead entry in a safety table invites someone to assume a response exists that no code path delivers | Either give it a predicate that means something `SYSTEM_HEALTH_FAILURE` does not, or delete the mapping. Do not add a trigger without deciding what it should mean |
 | **P5-18** | HIGH | Pre-trade leg risk | An authorised multi-leg intent must not have a known execution sequence that necessarily crosses `max_unhedged_notional` | `gate_unhedged` compares only `ctx.unhedged_notional` — the residual already present in the FILLED book — and `_headroom` has no candidate for it at all, so the gate was classified as a pure current-state check. An intent's worst INTERMEDIATE residual scales with its notional: the ordinary two-leg delta-neutral trade holds one whole leg of one-sided exposure between its first fill and its second | `test_rune_leg_fill_risk.py`, `test_rune_committed_exposure.py::TestPendingUnhedgedFillRisk`, `test_rune_headroom.py::TestTheSizeSensitiveInventory` | With the shipped defaults (`max_order_notional` 25,000, `max_unhedged_notional` 10,000) RUNE authorises 2.5× the hard unhedged budget on every ordinary trade. CI #38 shows `RISK_LIMIT_BREACH` engaging during normal operation at ≈ START_MS + 15,200ms and latching, as designed; four unrelated long-run tests then halted because the emergency latch had correctly engaged, and the P5-3 breach-to-response probe PASSED — proving the backstop was reacting to a real state rather than to a test artifact. The backstop is correct; the pre-trade projection is the incomplete half | Project worst-case asynchronous fill risk — actual residual + pending entry fill risk + this intent at `notional × per-symbol worst side × slippage multiplier` — in both the gate and a matching `_headroom` candidate, so the entry is SIZED to fit the configured budget rather than authorised and caught afterwards. TWO PARTS: (A) asynchronous fill-sequence risk, closed by Remediation D; (B) recovery headroom, closed by Remediation D2 — sizing that temporary leg *to* the emergency ceiling left nothing for mark movement while the exit and hedge were still working, and CI #40 measured exactly that (entry notional 9,980.9741 inside the limit, marked to 10,022.9337, +42.0395 bps, exit CANCEL_PENDING and hedge SUBMITTING). An entry now reserves `Settings.hedge_tolerance_notional` of the budget it may not consume. **Status: CLOSED / EXTERNALLY VALIDATED** (CI #41: 3018 passed / 8 failed / 2 skipped) — the direct projection and recovery-headroom tests, the strict first-breach diagnostic, and all four normal-platform canaries are green, so the ordinary platform no longer enters RISK_LIMIT_BREACH during the validated default runs. |
 
+### Remediation status
+
+Every Phase 5 finding, after Remediations A through E2. "CLOSED" means
+remediated and confirmed by external CI; "REMEDIATED" means the fix is in the
+tree and external validation has not yet been reported for it.
+
+| Status | Findings | Pass |
+| --- | --- | --- |
+| **CLOSED / EXTERNALLY VALIDATED** | P5-1, P5-2, P5-3, P5-4, P5-6, P5-7, P5-11, P5-13, P5-18 | A, B, C, D, D2 |
+| **CLOSED / EXTERNALLY VALIDATED** | P5-5, P5-10, P5-12, P5-16, P5-17 | E1 (CI #42) |
+| **REMEDIATED / EXTERNAL VALIDATION PENDING** | P5-8, P5-9, P5-14, P5-15 | E2 |
+
+Remediation E2 detail is in `docs/phase5-rune-remediation-e2.md`:
+
+- **P5-8** — the bus records each delivery outcome at dispatch time in a
+  bounded, clock-free window (`DeliveryOutcomeWindow`, sized by
+  `RiskLimits.error_rate_window_deliveries`, default 200) and exposes
+  `recent_error_rate`; `Orchestrator._error_rate` reads it instead of deriving
+  a lifetime ratio from `Subscription.delivered`/`errors`, which remain as
+  per-handler diagnostics.
+- **P5-9** — `gate_data_age` now requires
+  `-max_clock_skew_ms <= age <= max_data_age_ms`. TIDAL's upstream skew
+  defence is unchanged; this is the boundary's own check.
+- **P5-14** — `RiskLimits` sets `allow_inf_nan=False`, so every one of its
+  thirteen float fields rejects `+inf`, `-inf` and NaN. No default moved.
+- **P5-15** — `max_order_notional <= max_venue_exposure` on `RiskLimits`;
+  `max_strategy_exposure >= 2 x min_trade_notional` and
+  `max_unhedged_notional - hedge_tolerance_notional >= min_trade_notional` on
+  the root `Settings`, where the shipped strategy's leg count and the hedge
+  tolerance are both known.
+
+Phase 5 as a whole is validated only when external CI reports 0 failed with
+every gate PASS. **TESTS NOT RUN — EXTERNAL VALIDATION REQUIRED.**
+
 ### Expected conservative behaviour (not defects)
 
 - Gross, net, position and leverage projections treat an exposure-*reducing*
@@ -550,8 +584,8 @@ Severities follow §46. Ranked most severe first.
 | **H3** | Authorised-but-unfilled trades reserve enough headroom to prevent concurrent over-allocation | **FALSE** — only strategy exposure reserves anything (P5-1) |
 | **H4** | Open-order risk accounts for the orders the new intent will create | **FALSE** — current count only (P5-4) |
 | **H5** | Gross / venue / position / net / leverage projections never understate | **PARTIALLY FALSE** — gross, net and leverage hold; venue and position understate when legs share a venue (P5-11) |
-| **H6** | RUNE rejects implausibly future timestamps, or upstream makes it impossible | **UPSTREAM ONLY** — TIDAL blocks it; RUNE has no bound of its own (P5-9) |
-| **H7** | `MAX_ERROR_RATE` measures the intended horizon | **FALSE** — lifetime, documented as rolling (P5-8) |
+| **H6** | RUNE rejects implausibly future timestamps, or upstream makes it impossible | **UPSTREAM ONLY** at audit time — TIDAL blocked it; RUNE had no bound of its own (P5-9). Remediation E2 gave RUNE the two-sided interval, so both defences now hold |
+| **H7** | `MAX_ERROR_RATE` measures the intended horizon | **FALSE** at audit time — lifetime, documented as rolling (P5-8). Remediation E2 made the measurement a bounded rolling window, so the implementation and the documented contract now agree |
 | **H8** | All hard-limit breaches have an automatic post-trade detection path | **FALSE** — six exposure limits unwatched; `RISK_LIMIT_BREACH` unreachable (P5-3) |
 | **H9** | `EXCESSIVE_LATENCY` consumes latency | **FALSE** — consumes data age (P5-10) |
 | **H10** | Manual clear has a complete recovery path after `DISABLE_EXECUTION` | **FALSE** — executor latch never cleared (P5-5) |

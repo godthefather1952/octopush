@@ -235,11 +235,28 @@ def build_platform(
     """
     settings = settings or load_settings()
     clock = clock or SystemClock()
-    bus = bus or (
-        InMemoryEventBus(raise_on_handler_error=raise_on_handler_error)
-        if settings.bus == "memory"
-        else build_bus(settings.bus, settings.redis_url)
-    )
+    if bus is None:
+        window = settings.risk.error_rate_window_deliveries
+        bus = (
+            InMemoryEventBus(
+                raise_on_handler_error=raise_on_handler_error,
+                error_rate_window=window,
+            )
+            if settings.bus == "memory"
+            else build_bus(settings.bus, settings.redis_url, error_rate_window=window)
+        )
+    elif not hasattr(bus, "recent_error_rate"):
+        # A caller-supplied bus is never swapped out for one this function
+        # would rather have -- the whole point of the argument is that the
+        # caller controls the transport. But RUNE's MAX_ERROR_RATE gate reads
+        # this measurement, so a bus that cannot answer must fail here, at
+        # construction, rather than have the orchestrator quietly fall back to
+        # lifetime totals and feed the gate a number that means something else
+        # (P5-8).
+        raise TypeError(
+            f"{type(bus).__name__} does not implement EventBus.recent_error_rate; "
+            "the risk error-rate gate has no health input it can trust"
+        )
     store = store or build_store(
         settings.storage.backend,
         sqlite_path=settings.storage.sqlite_path,

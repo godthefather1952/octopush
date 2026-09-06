@@ -123,15 +123,51 @@ def gate_order_notional(intent: TradeIntent, limits: RiskLimits) -> GateCheck:
 
 
 def gate_data_age(intent: TradeIntent, limits: RiskLimits, now_ms: Millis) -> GateCheck:
+    """Freshness of the market data an intent was built from.
+
+    The permitted interval is two-sided:
+    ``-max_clock_skew_ms <= age <= max_data_age_ms``, where
+    ``age = now_ms - intent.source_data_timestamp``.
+
+    The upper bound is the obvious one — data too old to act on. The lower
+    bound is the one this gate used to be missing (P5-9): a timestamp in the
+    *future* produces a negative age, and ``age <= max_data_age_ms`` is
+    satisfied by every negative number, however large. Data stamped a day
+    ahead therefore read as maximally fresh, and the further wrong the
+    timestamp was, the more freshness the gate credited it with. That is
+    exactly backwards, and it is reachable without an adversary: a venue whose
+    clock has jumped, or a unit mix-up that multiplies a timestamp.
+
+    A small negative age is normal and stays permitted. Two independently
+    synced machines disagree by a few milliseconds, so requiring
+    ``age >= 0`` would reject honest data. ``max_clock_skew_ms`` is the
+    tolerance already configured for precisely that question — how far an
+    exchange timestamp may lead local time before it is a clock problem
+    rather than drift — so it is reused rather than duplicated by a second
+    number that could drift away from it.
+
+    This gate reads no clock: ``now_ms`` is supplied by the caller, which is
+    what lets a replay evaluate the same intent at the same logical instant
+    and reach the same verdict. TIDAL's own upstream skew handling is
+    unchanged and still runs first; this is the risk boundary's independent
+    check, not a replacement for it.
+
+    Not size-reducible: a smaller trade is not built on fresher data, so this
+    gate has no headroom candidate.
+    """
     if intent.source_data_timestamp is None:
         return _unknown("MARKET_DATA_FRESH", "intent carries no source data timestamp")
     age = now_ms - intent.source_data_timestamp
+    lower = -limits.max_clock_skew_ms
     return _check(
         "MARKET_DATA_FRESH",
-        age <= limits.max_data_age_ms,
+        lower <= age <= limits.max_data_age_ms,
         observed=float(age),
         limit=float(limits.max_data_age_ms),
-        detail=f"market data age {age}ms",
+        detail=(
+            f"market data age {age}ms; "
+            f"permitted [{lower}, {limits.max_data_age_ms}]ms"
+        ),
     )
 
 

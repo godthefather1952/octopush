@@ -256,7 +256,12 @@ DIMENSIONED_TOKENS = frozenset(
 
 #: Units the codebase actually uses.  A field carrying a dimensioned token
 #: must end in one of these.
-UNIT_TOKENS = frozenset({"ms", "s", "seconds", "bps", "levels", "notional", "updates", "events"})
+#: "deliveries" joined the set with ``error_rate_window_deliveries`` (P5-8):
+#: that window is counted in bus delivery attempts, not milliseconds, and the
+#: suffix is exactly what stops a reader assuming a duration.
+UNIT_TOKENS = frozenset(
+    {"ms", "s", "seconds", "bps", "levels", "notional", "updates", "events", "deliveries"}
+)
 
 
 def config_models():

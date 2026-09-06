@@ -1,14 +1,17 @@
-"""Phase 5 — H6: data age, future timestamps, deadlines, and health decay.
+"""Phase 5 — P5-9: data age, future timestamps, deadlines, and health decay.
 
-``gate_data_age`` computes ``age = now_ms - source_data_timestamp`` and passes
-when ``age <= max_data_age_ms``. A timestamp in the FUTURE produces a negative
-age, and every negative number satisfies that comparison.
+``gate_data_age`` computes ``age = now_ms - source_data_timestamp``. It used to
+pass whenever ``age <= max_data_age_ms``, and every negative number satisfies
+that — so a timestamp in the FUTURE read as maximally fresh, and the further
+wrong it was, the fresher the gate called it.
 
 TIDAL already refuses to publish a venue whose exchange timestamp leads local
-receipt by more than ``max_clock_skew_ms`` (TIDAL-H3), so upstream is meant to
-make this unreachable. The question this file answers is whether RUNE — the
-final hard boundary — enforces a plausible lower bound of its own, and what
-the platform's defence-in-depth posture actually is.
+receipt by more than ``max_clock_skew_ms`` (TIDAL-H3), so upstream was meant to
+make this unreachable. Remediation E2 gave RUNE — the final hard boundary — its
+own lower bound rather than relying on that: the permitted interval is now
+``-max_clock_skew_ms <= age <= max_data_age_ms``, reusing the tolerance the
+platform already configures for exactly this question instead of inventing a
+second number. Both defences are asserted below.
 """
 
 from __future__ import annotations
@@ -122,13 +125,42 @@ class TestFutureTimestamps:
             f"blocking={blocking_names(decision)}"
         )
 
-    def test_the_gate_has_no_lower_bound_at_all(self):
+    def test_the_gate_now_has_a_lower_bound(self):
         """Structural: records exactly what the comparison is, so a future
-        change is visible."""
+        change is visible.
+
+        The bound is ``max_clock_skew_ms``, not a hardcoded zero: honest data
+        from a machine whose clock differs by a few milliseconds must still
+        trade, and the tolerance for that is already configured.
+        """
         source = inspect.getsource(gates.gate_data_age)
-        assert "age <= limits.max_data_age_ms" in source
-        assert "max_clock_skew_ms" not in source
-        assert ">= 0" not in source
+        assert "lower <= age <= limits.max_data_age_ms" in source
+        assert "lower = -limits.max_clock_skew_ms" in source
+
+    def test_the_gate_still_reads_no_clock(self):
+        """``now_ms`` is supplied, never sampled — otherwise the same intent
+        would reach different verdicts on replay."""
+        source = inspect.getsource(gates.gate_data_age)
+        body = source.split('"""')[-1]
+        for sampled in ("time.time", "datetime", "monotonic", "clock.now", ".now()"):
+            assert sampled not in body
+
+    def test_the_detail_names_the_permitted_interval(self):
+        """A rejection must say what would have been accepted; "age -500ms"
+        against "limit 2000ms" reads like a pass."""
+        _decision, check = age_check(-(MAX_SKEW + 1))
+        assert f"[-{MAX_SKEW}, {MAX_AGE}]" in (check.detail or "")
+
+    def test_the_lower_boundary_is_inclusive(self):
+        """``-max_clock_skew_ms <= age``: exactly at the tolerance is drift."""
+        assert age_check(-MAX_SKEW)[1].result is GateResult.PASS
+        assert age_check(-(MAX_SKEW + 1))[1].result is GateResult.FAIL
+
+    def test_the_observed_value_is_still_the_signed_age(self):
+        """The lower bound changed the verdict, not the reported quantity."""
+        _decision, check = age_check(-(MAX_SKEW + 1))
+        assert check.observed == pytest.approx(-float(MAX_SKEW + 1))
+        assert check.limit == pytest.approx(float(MAX_AGE))
 
     def test_upstream_is_where_skew_is_currently_caught(self):
         """Records the defence that does exist, so the finding is scoped.

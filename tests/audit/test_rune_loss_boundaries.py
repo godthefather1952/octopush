@@ -262,6 +262,73 @@ class TestNumericSafety:
             f"{offenders} — each one disables the gate that reads it"
         )
 
+    #: Every float field on ``RiskLimits``, enumerated from the model rather
+    #: than by hand so a field added later cannot quietly escape the rule.
+    FLOAT_LIMITS = sorted(
+        name
+        for name, info in RiskLimits.model_fields.items()
+        if info.annotation is float
+    )
+
+    def test_the_enumeration_covers_the_known_float_limits(self):
+        """A guard on the guard: if the annotation scan ever returns nothing,
+        every parametrised case below would vacuously pass."""
+        assert set(self.FLOAT_LIMITS) == {
+            "max_position_notional",
+            "max_gross_exposure",
+            "max_net_exposure",
+            "max_leverage",
+            "max_daily_loss",
+            "max_drawdown",
+            "max_venue_exposure",
+            "max_strategy_exposure",
+            "max_order_notional",
+            "min_trade_notional",
+            "max_unhedged_notional",
+            "min_expected_edge_bps",
+            "max_error_rate",
+        }
+
+    @pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+    def test_no_float_limit_may_be_non_finite(self, bad):
+        """P5-14. ``x <= inf`` is true for every finite x, so an infinite
+        ceiling is a gate that can never fire while still reporting itself as
+        checked; every comparison against NaN is false, so a NaN ceiling is a
+        gate that can never be satisfied. Neither is a limit."""
+        import pydantic
+
+        offenders = []
+        for field in self.FLOAT_LIMITS:
+            try:
+                RiskLimits(**{field: bad})
+            except pydantic.ValidationError:
+                continue
+            offenders.append(field)
+        assert not offenders, (
+            f"RiskLimits accepts {bad} for: {offenders} — each one breaks the "
+            "gate that reads it"
+        )
+
+    def test_the_defaults_are_unchanged_by_the_finiteness_rule(self):
+        """Rejecting infinities must not have moved any number."""
+        defaults = RiskLimits()
+        assert defaults.max_position_notional == pytest.approx(50_000.0)
+        assert defaults.max_gross_exposure == pytest.approx(150_000.0)
+        assert defaults.max_net_exposure == pytest.approx(25_000.0)
+        assert defaults.max_leverage == pytest.approx(2.0)
+        assert defaults.max_daily_loss == pytest.approx(2_500.0)
+        assert defaults.max_drawdown == pytest.approx(5_000.0)
+        assert defaults.max_venue_exposure == pytest.approx(75_000.0)
+        assert defaults.max_strategy_exposure == pytest.approx(100_000.0)
+        assert defaults.max_order_notional == pytest.approx(25_000.0)
+        assert defaults.min_trade_notional == pytest.approx(250.0)
+        assert defaults.max_unhedged_notional == pytest.approx(10_000.0)
+        assert defaults.min_expected_edge_bps == pytest.approx(2.0)
+        assert defaults.max_error_rate == pytest.approx(0.25)
+        assert defaults.max_data_age_ms == 2_000
+        assert defaults.max_clock_skew_ms == 2_000
+        assert defaults.max_open_orders == 20
+
     def test_a_nan_expected_edge_cannot_pass_the_edge_gate(self):
         """``nan >= floor`` is False, so NaN blocks. Pinned because the
         opposite convention would silently authorise an unpriceable trade."""
@@ -355,26 +422,33 @@ class TestConfigCoherence:
         with pytest.raises(pydantic.ValidationError):
             RiskLimits(max_position_notional=200_000.0, max_gross_exposure=150_000.0)
 
-    def test_an_order_larger_than_the_venue_limit_is_not_refused(self):
-        """A single permitted order cannot fit on any one venue, so every trade
-        is silently reduced or rejected. Nothing warns.
+    def test_an_order_larger_than_the_venue_limit_is_refused(self):
+        """A single permitted order that cannot fit on any one venue means
+        every trade is silently reduced or rejected, and nothing warned.
 
-        The same shape the existing validator already rejects for
-        position/gross, left unchecked for venue.
+        The same shape the validator already rejected for position/gross, left
+        unchecked for venue until P5-15. Every order executes on exactly one
+        venue, so the two caps are directly comparable.
         """
-        limits = RiskLimits(
-            max_order_notional=25_000.0,
-            max_venue_exposure=10_000.0,
-            # So the venue limit is what reduces the trade (P5-18).
-            max_unhedged_notional=1_000_000.0,
-        )
-        decision = core(limits).evaluate(intent(notional=25_000.0), context(), START_MS)
-        assert decision.approved_notional <= 10_000.0
-        assert limits.max_order_notional > limits.max_venue_exposure, (
-            "RiskLimits accepts a per-order cap larger than any single venue "
-            "may hold; the configuration is coherent only by accident of the "
-            "sizing path reducing every trade"
-        )
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError, match="max_venue_exposure"):
+            RiskLimits(
+                max_order_notional=25_000.0,
+                max_venue_exposure=10_000.0,
+                max_unhedged_notional=1_000_000.0,
+            )
+
+    def test_an_order_exactly_at_the_venue_limit_is_allowed(self):
+        """Equality is coherent: one order may fill the venue's whole budget."""
+        limits = RiskLimits(max_order_notional=25_000.0, max_venue_exposure=25_000.0)
+        assert limits.max_order_notional == pytest.approx(limits.max_venue_exposure)
+
+    def test_one_unit_above_the_venue_limit_is_refused(self):
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError):
+            RiskLimits(max_order_notional=25_001.0, max_venue_exposure=25_000.0)
 
     def test_a_two_leg_strategy_cannot_use_its_whole_strategy_budget(self):
         """``max_strategy_exposure`` is consumed at ``notional * legs``, so the
@@ -391,12 +465,66 @@ class TestConfigCoherence:
         decision = core(limits).evaluate(intent(notional=25_000.0), context(), START_MS)
         assert decision.approved_notional == pytest.approx(10_000.0)
 
-    def test_a_strategy_budget_below_the_minimum_trade_makes_trading_impossible(self):
-        """Nothing refuses this configuration; every trade rejects at
-        MIN_TRADE_NOTIONAL and the platform looks merely quiet."""
-        limits = RiskLimits(max_strategy_exposure=300.0, min_trade_notional=250.0)
-        decision = core(limits).evaluate(intent(notional=5_000.0), context(), START_MS)
-        assert decision.reason_codes == ["MIN_TRADE_NOTIONAL"]
+    def test_a_strategy_budget_below_two_minimum_trades_is_refused_at_the_root(self):
+        """Every trade would reject at MIN_TRADE_NOTIONAL and the platform
+        would look merely quiet.
+
+        The rule lives on ``Settings``, not ``RiskLimits``: it depends on the
+        shipped strategy opening ``SHIPPED_ENTRY_LEGS`` legs at once, which is
+        a fact about the strategy rather than about risk limits in general. A
+        one-leg strategy would find a two-leg floor arbitrary, so ``RiskLimits``
+        still accepts the same numbers on its own.
+        """
+        import pydantic
+
+        from core.config.settings import SHIPPED_ENTRY_LEGS
+
+        assert RiskLimits(max_strategy_exposure=300.0, min_trade_notional=250.0)
+        with pytest.raises(pydantic.ValidationError, match="max_strategy_exposure"):
+            load_settings(risk={"max_strategy_exposure": 300.0, "min_trade_notional": 250.0})
+        assert SHIPPED_ENTRY_LEGS == 2
+
+    def test_a_strategy_budget_of_exactly_two_minimum_trades_is_allowed(self):
+        settings = load_settings(
+            risk={"max_strategy_exposure": 500.0, "min_trade_notional": 250.0}
+        )
+        assert settings.risk.max_strategy_exposure == pytest.approx(500.0)
+
+    def test_one_unit_below_two_minimum_trades_is_refused(self):
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError):
+            load_settings(risk={"max_strategy_exposure": 499.0, "min_trade_notional": 250.0})
+
+    def test_a_recovery_reserve_that_consumes_the_unhedged_budget_is_refused(self):
+        """``max_unhedged_notional - hedge_tolerance_notional`` is the budget an
+        entry may actually use (P5-18). Below ``min_trade_notional`` no entry
+        could ever be sized, and nothing said so."""
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError, match="hedge_tolerance_notional"):
+            load_settings(
+                risk={"max_unhedged_notional": 700.0, "min_trade_notional": 250.0},
+                hedge_tolerance_notional=500.0,
+            )
+
+    def test_a_recovery_reserve_leaving_exactly_the_minimum_is_allowed(self):
+        settings = load_settings(
+            risk={"max_unhedged_notional": 750.0, "min_trade_notional": 250.0},
+            hedge_tolerance_notional=500.0,
+        )
+        assert (
+            settings.risk.max_unhedged_notional - settings.hedge_tolerance_notional
+        ) == pytest.approx(settings.risk.min_trade_notional)
+
+    def test_one_unit_below_the_minimum_recovery_budget_is_refused(self):
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError):
+            load_settings(
+                risk={"max_unhedged_notional": 749.0, "min_trade_notional": 250.0},
+                hedge_tolerance_notional=500.0,
+            )
 
     @pytest.mark.parametrize("rate", [-0.01, 1.01])
     def test_error_rate_outside_zero_to_one_is_refused(self, rate):

@@ -31,6 +31,19 @@ ENV_PREFIX = "TF_"
 #: generator; "live" is the read-only public market-data adapters.
 _FEEDS = frozenset({"simulated", "live"})
 
+#: Legs the shipped strategy opens per entry. ``CrossVenueDetector`` builds a
+#: cross-venue trade as exactly one buy and one sell, and every size-sensitive
+#: gate charges ``notional * len(intent.legs)``, so the smallest entry the
+#: platform can construct consumes two units of ``min_trade_notional``.
+#:
+#: This is a fact about the strategy that is currently shipped, not a property
+#: of risk limits in general — which is why the coherence rule that uses it
+#: lives on :class:`Settings`, where the strategy is known, and deliberately
+#: NOT on :class:`RiskLimits`, which must stay usable by a one-leg strategy
+#: that would find a two-leg floor arbitrary. A future strategy with a
+#: different leg count changes this constant and the rule follows.
+SHIPPED_ENTRY_LEGS = 2
+
 
 class ConfigError(ValueError):
     """A configuration value could not be used.
@@ -159,9 +172,22 @@ class VenueConfig(BaseModel):
 
 
 class RiskLimits(BaseModel):
-    """RUNE-CORE's deterministic limits. Every one is a hard gate."""
+    """RUNE-CORE's deterministic limits. Every one is a hard gate.
 
-    model_config = ConfigDict(extra="forbid")
+    ``allow_inf_nan=False`` is load-bearing, not tidiness. Every float here is
+    a ceiling something is compared against, and ``x <= inf`` is True for every
+    finite ``x`` — so a single ``+Infinity`` in a config file turns its gate
+    into a permanent PASS while the gate still reports itself as checked and
+    the dashboard still renders a limit. NaN is worse in the other direction:
+    every comparison against it is False, so a gate reads as failing with no
+    size that could ever satisfy it. Neither is a limit; both are now rejected
+    at load, where an operator sees the error, rather than at the first trade
+    that should have been blocked. The ``gt``/``ge`` bounds below do not cover
+    this on their own — ``+inf`` satisfies ``gt=0`` — so the model-level rule
+    is what makes the property total across every float field.
+    """
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     max_position_notional: float = Field(default=50_000.0, gt=0)
     max_gross_exposure: float = Field(default=150_000.0, gt=0)
@@ -195,6 +221,15 @@ class RiskLimits(BaseModel):
     min_expected_edge_bps: float = Field(default=2.0, ge=0.0)
     #: Rolling API/feed error rate above which trading halts.
     max_error_rate: float = Field(default=0.25, ge=0.0, le=1.0)
+    #: How many of the most recent bus delivery attempts ``max_error_rate`` is
+    #: measured over. The rate must be *rolling*: measured over all deliveries
+    #: since startup, a process failing every delivery right now still reports
+    #: a healthy number for as long as its past success count dominates, and
+    #: the gate never fires (P5-8). Kept equal to
+    #: ``core.bus.base.DEFAULT_DELIVERY_WINDOW`` — pinned by the audit suite
+    #: rather than by an import, so configuration does not depend on the
+    #: transport package.
+    error_rate_window_deliveries: int = Field(default=200, gt=0, le=100_000)
     #: Maximum simultaneous open orders.
     max_open_orders: int = Field(default=20, gt=0)
 
@@ -216,6 +251,13 @@ class RiskLimits(BaseModel):
             raise ValueError(
                 f"max_position_notional ({self.max_position_notional}) exceeds "
                 f"max_gross_exposure ({self.max_gross_exposure})"
+            )
+        if self.max_order_notional > self.max_venue_exposure:
+            raise ValueError(
+                f"max_order_notional ({self.max_order_notional}) exceeds "
+                f"max_venue_exposure ({self.max_venue_exposure}): every order "
+                "executes on exactly one venue, so a single permitted order "
+                "would breach the venue limit it is checked against"
             )
         return self
 
@@ -622,6 +664,28 @@ class Settings(BaseModel):
             self.storage.postgres_dsn and self.storage.postgres_dsn.get_secret_value()
         ):
             raise ValueError("storage.backend='postgres' requires postgres_dsn")
+        strategy_floor = SHIPPED_ENTRY_LEGS * self.risk.min_trade_notional
+        if self.risk.max_strategy_exposure < strategy_floor:
+            raise ValueError(
+                f"max_strategy_exposure ({self.risk.max_strategy_exposure}) is "
+                f"below {SHIPPED_ENTRY_LEGS} x min_trade_notional "
+                f"({strategy_floor}): the shipped cross-venue strategy opens "
+                f"{SHIPPED_ENTRY_LEGS} legs at once and each consumes the "
+                "strategy budget, so the smallest permitted entry could never "
+                "be authorised"
+            )
+        recovery_budget = (
+            self.risk.max_unhedged_notional - self.hedge_tolerance_notional
+        )
+        if recovery_budget < self.risk.min_trade_notional:
+            raise ValueError(
+                f"max_unhedged_notional ({self.risk.max_unhedged_notional}) minus "
+                f"hedge_tolerance_notional ({self.hedge_tolerance_notional}) leaves "
+                f"{recovery_budget}, below min_trade_notional "
+                f"({self.risk.min_trade_notional}): the reserve held back for the "
+                "exit and hedge would consume the whole unhedged budget, so no "
+                "entry could ever be sized"
+            )
         return self
 
     @property

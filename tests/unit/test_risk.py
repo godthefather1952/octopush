@@ -244,7 +244,10 @@ class TestHardGates:
                 max_venue_exposure=41_000.0,
                 max_position_notional=100_000.0,
                 max_gross_exposure=1_000_000.0,
-                max_order_notional=100_000.0,
+                # Coherence (P5-15): an order cap above the venue cap is not a
+                # configuration. Held equal to the venue limit, which leaves it
+                # non-binding here — 1,000 of venue room is what decides this.
+                max_order_notional=41_000.0,
                 max_net_exposure=100_000.0,
             ),
             clock,

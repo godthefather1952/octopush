@@ -1,7 +1,16 @@
-from core.bus.base import EventBus, Handler, Middleware, Subscription
+from core.bus.base import (
+    DEFAULT_DELIVERY_WINDOW,
+    DeliveryOutcomeWindow,
+    EventBus,
+    Handler,
+    Middleware,
+    Subscription,
+)
 from core.bus.memory import InMemoryEventBus
 
 __all__ = [
+    "DEFAULT_DELIVERY_WINDOW",
+    "DeliveryOutcomeWindow",
     "EventBus",
     "Handler",
     "InMemoryEventBus",

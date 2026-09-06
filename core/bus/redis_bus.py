@@ -60,7 +60,14 @@ import json
 import logging
 from collections.abc import Iterable
 
-from core.bus.base import EventBus, Handler, Middleware, Subscription
+from core.bus.base import (
+    DEFAULT_DELIVERY_WINDOW,
+    DeliveryOutcomeWindow,
+    EventBus,
+    Handler,
+    Middleware,
+    Subscription,
+)
 from core.events import Event, EventType
 
 log = logging.getLogger(__name__)
@@ -81,6 +88,7 @@ class RedisStreamBus(EventBus):
         batch: int = 256,
         stream: str = STREAM,
         maxlen: int = MAXLEN,
+        error_rate_window: int = DEFAULT_DELIVERY_WINDOW,
     ) -> None:
         self._url = url
         self._group = group
@@ -104,6 +112,11 @@ class RedisStreamBus(EventBus):
         self._progress = asyncio.Event()
         self.published_count = 0
         self.delivered_count = 0
+        #: Clause 9. Same semantics as the in-memory bus: one entry per
+        #: handler invocation, written at dispatch time, bounded and
+        #: clock-free. Health must not be measured differently just because
+        #: the transport underneath changed.
+        self._outcomes = DeliveryOutcomeWindow(error_rate_window)
         #: Internal admission-order counter -- see "ORDERED COMMIT" above.
         #: Deliberately distinct from ``_seq``/``Event.sequence``.
         self._admission_seq = itertools.count(1)
@@ -261,6 +274,16 @@ class RedisStreamBus(EventBus):
     def subscriptions(self) -> list[Subscription]:
         return list(self._subs)
 
+    @property
+    def recent_error_rate(self) -> float:
+        """Clause 9: failures among the most recent delivery attempts."""
+        return self._outcomes.error_rate
+
+    @property
+    def error_rate_window(self) -> int:
+        """How many delivery attempts ``recent_error_rate`` measures over."""
+        return self._outcomes.maxlen
+
     # -- consumption -------------------------------------------------------
 
     async def _consume(self) -> None:
@@ -313,8 +336,10 @@ class RedisStreamBus(EventBus):
                     await sub.handler(event)
                     sub.delivered += 1
                     self.delivered_count += 1
+                    self._outcomes.record_success()
                 except Exception:
                     sub.errors += 1
+                    self._outcomes.record_error()
                     log.exception("handler %s failed on %s", sub.name, event.type)
         finally:
             self._inflight -= 1
