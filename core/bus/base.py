@@ -185,7 +185,7 @@ class DeliveryOutcomeWindow:
     sequence measure the same health, whatever wall time either took.
     """
 
-    __slots__ = ("_outcomes", "_errors")
+    __slots__ = ("_errors", "_outcomes")
 
     def __init__(self, maxlen: int = DEFAULT_DELIVERY_WINDOW) -> None:
         if maxlen <= 0:

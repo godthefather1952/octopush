@@ -14,7 +14,8 @@ risk boundary to report itself as enforced while enforcing nothing.
 - **Production files changed:** `core/bus/base.py`, `core/bus/memory.py`,
   `core/bus/redis_bus.py`, `core/bus/__init__.py`, `core/config/settings.py`,
   `risk/limits/__init__.py`, `apps/orchestrator/wiring.py`,
-  `apps/orchestrator/orchestrator.py`. Paper trading only.
+  `apps/orchestrator/orchestrator.py`, plus a `__slots__` reordering in
+  `core/bus/base.py` for Ruff. Paper trading only.
 - **Testing status:** **TESTS NOT RUN — EXTERNAL VALIDATION REQUIRED.**
 
 ---
@@ -25,14 +26,49 @@ risk boundary to report itself as enforced while enforcing nothing.
 to remote. `phase5-rune-remediation-e2` was created directly from that commit —
 no merge, no rebase, no tag, no force-push.
 
-## 2. Scope
+## 2. External validation — CI #43
+
+| | |
+| --- | --- |
+| Full suite | 3082 passed / **1 failed** / 2 skipped |
+| Python 3.11 unit + contract | 1382 passed / 126 skipped / **0 failed** |
+| Backend contract pre-check | 747 passed / 1 tooling-only skip |
+| Mypy core, paper boundary | PASS |
+
+**All six pre-E2 finding failures are gone.** P5-8's rolling-error-rate
+behaviour, P5-9's future-timestamp behaviour, P5-14's finite-number validation
+and P5-15's strict coherence validation are all green, as is every earlier
+Phase 5 remediation.
+
+**No risk-semantic defect was exposed by CI #43.** Two validation-surface
+items remained, both fixed in the follow-up commit on this branch:
+
+1. **The sole pytest failure** —
+   `test_rune_replay.py::TestNothingNondeterministicIsReachable::test_no_gate_reads_a_clock_randomness_or_the_network`
+   scanned `risk.limits` for the bare substring `"clock"`. P5-9 introduced
+   `limits.max_clock_skew_ms` into `gate_data_age`, plus the prose explaining
+   it, so the scan fired. `max_clock_skew_ms` is an integer loaded from
+   configuration — identical on every evaluation and in every replay of the
+   same recorded config. Reading it is no more a clock access than reading
+   `max_data_age_ms`; the gate still receives `now_ms` explicitly and imports
+   nothing that can tell the time. The audit's premise was stale, not the
+   gate. See §11.
+2. **The sole Ruff failure** — RUF023: `DeliveryOutcomeWindow.__slots__` was
+   `("_outcomes", "_errors")` and wants alphabetical order. Reordered to
+   `("_errors", "_outcomes")`. `__slots__` order carries no meaning; nothing
+   else in the class changed.
+
+Phase 5 is **not** externally validated until a CI run is fully green. This
+document does not claim it is.
+
+## 3. Scope
 
 Exactly P5-8, P5-9, P5-14 and P5-15. Everything else in Phase 5 is frozen:
 `risk/kill_switch/**` is not in the diff, and neither are NORO, TIDAL, ZEPHR,
 consensus, the simulation, execution, the OMS, `PaperExecutor`, OKAPI, market
-generation or the replay engine. No limit value was tuned (§9).
+generation or the replay engine. No limit value was tuned (§10).
 
-## 3. P5-9 — data from the future is no longer the freshest data
+## 4. P5-9 — data from the future is no longer the freshest data
 
 `gate_data_age` computed `age = now_ms - source_data_timestamp` and passed when
 `age <= max_data_age_ms`. Every negative number satisfies that. A timestamp
@@ -71,7 +107,7 @@ Boundaries pinned: source == now PASS, 1ms lead PASS, `max_clock_skew_ms` lead
 PASS, `max_clock_skew_ms + 1` FAIL, `max_data_age_ms` PASS,
 `max_data_age_ms + 1` FAIL, missing timestamp UNKNOWN and blocking.
 
-## 4. P5-8 — the error rate is now actually rolling
+## 5. P5-8 — the error rate is now actually rolling
 
 `Orchestrator._error_rate` documented itself as "Rolling share of bus
 deliveries that raised" and computed `errors / (delivered + errors)` over
@@ -166,7 +202,7 @@ The last two matter as much as the others. A platform that has recovered must
 be allowed to trade again; a rolling window is indifferent in both directions.
 After 100,000 healthy deliveries the gate now fires on the 51st recent error.
 
-## 5. P5-14 — an infinite limit is not a limit
+## 6. P5-14 — an infinite limit is not a limit
 
 `RiskLimits` constrains its floats with `gt=0`, which admits `+inf`. Every
 comparison against an infinite ceiling passes, so one value in one config file
@@ -190,7 +226,7 @@ the known set, so the parametrised cases cannot pass vacuously.
 
 Integer fields need no infinity rule. **No default moved.**
 
-## 6. P5-15 — two incoherent configurations now refuse to load
+## 7. P5-15 — two incoherent configurations now refuse to load
 
 ### `max_order_notional <= max_venue_exposure` (on `RiskLimits`)
 
@@ -239,7 +275,7 @@ all of them) and changes no expected number:
 1,000, and `TestDuplicateVenueBoundary` still approves 10,000, 5,000 and 20,000
 at its three boundaries. No assertion was weakened.
 
-## 7. Replay and the config digest
+## 8. Replay and the config digest
 
 `error_rate_window_deliveries` is a new field on `RiskLimits`, so it appears in
 `Settings.model_dump()` and therefore changes `config_digest`. **This is
@@ -253,7 +289,7 @@ mismatch. That is the mechanism working as designed. **No replay code was
 changed**, and no test pins a literal digest value — every digest assertion in
 the suite is relative.
 
-## 8. What must not have regressed
+## 9. What must not have regressed
 
 Preserved and re-verified statically: P5-1 committed exposure, P5-2 strategy
 units, P5-3 live hard-limit backstop, P5-4 open-order projection, P5-6
@@ -267,7 +303,7 @@ every agent module are not in the diff. `MAX_ERROR_RATE`'s own comparison
 (`error_rate <= limits.max_error_rate`) is unchanged — only the number reaching
 it is now the one the limit was written for.
 
-## 9. No threshold tuning
+## 10. No threshold tuning
 
 Unchanged: `max_error_rate` 0.25, `max_data_age_ms` 2,000, `max_clock_skew_ms`
 2,000, `max_unhedged_notional` 10,000, `hedge_tolerance_notional` 500, every
@@ -276,19 +312,61 @@ and ZEPHR's economics.
 
 One new default in the entire pass: `error_rate_window_deliveries = 200`.
 
-## 10. Test changes
+## 11. Test changes
 
 | File | Change |
 | --- | --- |
 | `tests/audit/test_rune_error_rate.py` | Rewritten. The lifetime-horizon premise is inverted into an assertion that the horizon is rolling; the window arithmetic, the dispatch-time recording (including the strict-bus re-raise case) and the one-outcome-per-handler rule are asserted directly against a real `InMemoryEventBus`. The concentrated-burst safety property and the huge-lifetime-counter control are kept. |
 | `tests/audit/test_rune_data_time.py` | `test_the_gate_has_no_lower_bound_at_all` inverted; lower-boundary inclusivity, the interval in `detail`, the signed `observed`, and the no-clock-read property added. The TIDAL upstream-defence test is untouched. |
 | `tests/audit/test_rune_loss_boundaries.py` | The two descriptive P5-15 tests became `pytest.raises(ValidationError)`; the strategy-budget one moved to root `Settings`; the hedge-tolerance rule and both new boundary controls added. The P5-14 sweep now covers every float field against `+inf`, `-inf` and NaN, plus a defaults-unchanged pin. |
-| `tests/audit/test_rune_remediation_a_boundaries.py`, `tests/unit/test_risk.py` | Venue-isolation fixtures made coherent under the new rule (§6). |
+| `tests/audit/test_rune_remediation_a_boundaries.py`, `tests/unit/test_risk.py` | Venue-isolation fixtures made coherent under the new rule (§7). |
 | `tests/contract/test_config_validation.py` | `deliveries` added to the unit vocabulary. |
+| `tests/audit/test_rune_replay.py` | The determinism audit's bare `"clock"` substring ban replaced by a real live-clock check (below). |
 
 No test is skipped, xfailed, or weakened.
 
-## 11. Deliberate omissions
+### The determinism audit's stale premise
+
+`TestNothingNondeterministicIsReachable` rejected the substring `"clock"`
+anywhere in `risk.limits`. That is not the determinism property; it is a proxy
+for it, and P5-9 broke the proxy without touching the property.
+
+`limits.max_clock_skew_ms` is an integer loaded from configuration. It has the
+same value on every evaluation, and the same value in a replay of any run whose
+config it was recorded with — `config_digest` covers it. Reading it is no more
+a clock access than reading `max_data_age_ms`, and the docstring explaining why
+the bound exists necessarily contains the words "clock skew".
+
+The invariant is now asserted as what it actually is, in three parts:
+
+- **Imports, from the AST.** `risk.limits` must not import `random`, `time`,
+  `datetime`, `uuid`, `secrets`, `requests`, `httpx`, `socket`, `urllib` or
+  `core.clock`. An import is what creates the dependency, and `import time as
+  t` would slip past any substring scan. Every prefix of a dotted module name
+  is checked, so `core.clock.anything` is caught while `core.models.common`
+  is not.
+- **Source constructs a bare import scan cannot see.** The existing bans on
+  `random`, `time.time`, `datetime.now`, `uuid`, `requests` and `httpx` are
+  unchanged, and `"clock"` is replaced by the ways a module *reads* a clock:
+  `from core.clock`, `import core.clock`, `self.clock`, `clock.now`,
+  `SystemClock`, `ManualClock`, `now_ms()`.
+- **`gate_data_age` pinned on its own**, since it is the one gate that reasons
+  about time: its signature is exactly `(intent, limits, now_ms)`, none of the
+  clock-read constructs appears in its body, ten repeated calls at each of the
+  five interval boundaries produce byte-identical `GateCheck`s, and the verdict
+  moves with the supplied instant (PASS at `now_ms`, FAIL at
+  `now_ms + max_data_age_ms + 1`) rather than with anything ambient. This is a
+  behavioural test, not a documentation one.
+
+A fourth test records the premise explicitly — `max_clock_skew_ms` is present,
+the letters `clock` are present, and no clock-read construct is — so the
+distinction between clock *configuration* and clock *access* cannot quietly
+drift back into a substring ban. Nothing was weakened: the protections against
+randomness, wall-clock functions, network clients and direct UUID generation
+are all intact, and the import check is strictly stronger than what it
+supplements.
+
+## 12. Deliberate omissions
 
 - **`EXCESSIVE_LATENCY` still compares against `max_data_age_ms * 5`.** Giving
   latency its own configured threshold is a calibration question, recorded in
@@ -298,23 +376,34 @@ No test is skipped, xfailed, or weakened.
 - **No new trigger, no new limit, no new buffer.** Every rule added here is
   expressed with numbers the platform already configures.
 
-## 12. Ruff
+## 13. Ruff
+
+One violation, RUF023: `DeliveryOutcomeWindow.__slots__` was declared
+`("_outcomes", "_errors")` — the order the attributes are assigned in
+`__init__` — and the rule wants alphabetical. Now `("_errors", "_outcomes")`.
+
+`__slots__` order carries no meaning: it declares which attribute names the
+class reserves descriptors for, not a layout anything depends on. The window's
+arithmetic, the `deque` and its `maxlen`, the error accounting and
+`recent_error_rate` are all untouched.
 
 No SIM300-shaped inversions were introduced; the assertions added compare
 computed values against constants in the conventional order.
 
-## 13. Phase 5 status after this pass
+## 14. Phase 5 status after this pass
 
 | | |
 | --- | --- |
 | CLOSED / externally validated | P5-1, P5-2, P5-3, P5-4, P5-5, P5-6, P5-7, P5-10, P5-11, P5-12, P5-13, P5-16, P5-17, P5-18 |
-| Remediated here, external validation pending | P5-8, P5-9, P5-14, P5-15 |
+| Remediated, behavioural tests pass (CI #43), final suite validation pending | P5-8, P5-9, P5-14, P5-15 |
 
-Phase 5 becomes validated only if external CI reports 0 failed and every gate
-PASS. Nothing in this document claims that has happened. **No tag was created
-in this build.**
+Phase 5 becomes validated only if external CI reports 0 failed with every gate
+PASS. CI #43 came within one stale audit assertion and one `__slots__` ordering
+of that; neither is a risk-semantic defect, and both are fixed on this branch.
+Nothing in this document claims Phase 5 is validated. **No tag was created in
+this build.**
 
-## 14. Testing status
+## 15. Testing status
 
 **TESTS NOT RUN — EXTERNAL VALIDATION REQUIRED.**
 

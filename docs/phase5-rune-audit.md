@@ -510,7 +510,17 @@ tree and external validation has not yet been reported for it.
 | --- | --- | --- |
 | **CLOSED / EXTERNALLY VALIDATED** | P5-1, P5-2, P5-3, P5-4, P5-6, P5-7, P5-11, P5-13, P5-18 | A, B, C, D, D2 |
 | **CLOSED / EXTERNALLY VALIDATED** | P5-5, P5-10, P5-12, P5-16, P5-17 | E1 (CI #42) |
-| **REMEDIATED / EXTERNAL VALIDATION PENDING** | P5-8, P5-9, P5-14, P5-15 | E2 |
+| **REMEDIATED / BEHAVIOURAL TESTS PASS / FINAL SUITE VALIDATION PENDING** | P5-8, P5-9, P5-14, P5-15 | E2 (CI #43) |
+
+CI #43 ran the E2 build: 3082 passed / 1 failed / 2 skipped, with every P5-8,
+P5-9, P5-14 and P5-15 behavioural test green and Mypy core and the paper
+boundary passing. The single failure was `test_rune_replay.py`'s determinism
+audit rejecting the bare substring `"clock"` in `risk.limits` — a stale premise
+rather than a defect, since `max_clock_skew_ms` is configuration and
+`gate_data_age` still takes `now_ms` as an argument and imports nothing that
+can tell the time. That audit now checks live-clock access instead, and one
+Ruff `__slots__` ordering violation was corrected. Phase 5 is not validated
+until a run is fully green.
 
 Remediation E2 detail is in `docs/phase5-rune-remediation-e2.md`:
 

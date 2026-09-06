@@ -19,7 +19,7 @@ import pytest
 from agents.rune.core import RuneCore
 from core.config import RiskLimits
 from core.models.ops import KillSwitchState
-from core.models.risk import RiskVerdict
+from core.models.risk import GateResult, RiskVerdict
 from tests.audit.rune_fixtures import (
     VENUE_A,
     context,
@@ -125,22 +125,169 @@ class TestNothingNondeterministicIsReachable:
             "the clock is the fallback, never the primary source"
         )
 
+    #: Constructs that would make a gate nondeterministic. Bare substrings are
+    #: safe here because none of them also names a configuration value.
+    NONDETERMINISTIC = (
+        "random",
+        "time.time",
+        "datetime.now",
+        "uuid",
+        "requests",
+        "httpx",
+    )
+
+    #: How a module *reads* a clock, as opposed to merely naming one. The bare
+    #: word "clock" is deliberately absent — see
+    #: ``test_configured_clock_tolerance_is_not_a_clock_read``.
+    CLOCK_READS = (
+        "from core.clock",
+        "import core.clock",
+        "self.clock",
+        "clock.now",
+        "SystemClock",
+        "ManualClock",
+        "now_ms()",
+    )
+
+    #: Modules whose import would put a live clock, randomness or the network
+    #: inside the gates, checked as import statements rather than as text.
+    FORBIDDEN_IMPORTS = frozenset(
+        {
+            "random",
+            "time",
+            "datetime",
+            "uuid",
+            "secrets",
+            "requests",
+            "httpx",
+            "socket",
+            "urllib",
+            "core.clock",
+        }
+    )
+
+    def _forbidden_module(self, module: str) -> bool:
+        parts = module.split(".")
+        return any(
+            ".".join(parts[: index + 1]) in self.FORBIDDEN_IMPORTS
+            for index in range(len(parts))
+        )
+
+    def test_no_gate_imports_a_clock_randomness_or_the_network(self):
+        """Imports, read from the AST rather than from the text.
+
+        An import is what actually creates the dependency, and ``import time as
+        t`` would slip past any substring scan. This is the load-bearing half
+        of the invariant; the source scan below catches the rest.
+        """
+        import ast
+
+        import risk.limits as gates
+
+        imported: set[str] = set()
+        for node in ast.walk(ast.parse(inspect.getsource(gates))):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+        offenders = sorted(m for m in imported if self._forbidden_module(m))
+        assert not offenders, (
+            f"the deterministic gate module imports {offenders}; a gate's "
+            "verdict must depend on its arguments alone"
+        )
+
     def test_no_gate_reads_a_clock_randomness_or_the_network(self):
+        """The same invariant stated over the source, for constructs an import
+        scan cannot see (an attribute access on something passed in)."""
         import risk.limits as gates
 
         source = inspect.getsource(gates)
-        for forbidden in (
-            "random",
-            "time.time",
-            "datetime.now",
-            "uuid",
-            "requests",
-            "httpx",
-            "clock",
-        ):
+        for forbidden in self.NONDETERMINISTIC + self.CLOCK_READS:
             assert forbidden not in source, (
                 f"{forbidden!r} appears in the deterministic gate module"
             )
+
+    def test_configured_clock_tolerance_is_not_a_clock_read(self):
+        """The premise of the narrowed ban above, stated so it cannot drift.
+
+        This audit used to reject the bare substring ``"clock"`` anywhere in
+        ``risk.limits``. P5-9 gave ``gate_data_age`` a lower bound of
+        ``-limits.max_clock_skew_ms``, and the substring scan called that a
+        nondeterminism finding. It is not one: ``max_clock_skew_ms`` is an
+        integer loaded from configuration, identical on every evaluation and in
+        every replay of the same recorded config. Reading it is no more a clock
+        access than reading ``max_data_age_ms``, and the prose explaining why
+        the bound exists necessarily says "clock skew".
+
+        The property that matters is that the module takes no reading of the
+        current time — which the two tests above assert directly.
+        """
+        import risk.limits as gates
+
+        source = inspect.getsource(gates)
+        assert "max_clock_skew_ms" in source, (
+            "P5-9's lower bound is gone; the gate would again treat a "
+            "timestamp from the future as maximally fresh"
+        )
+        assert "clock" in source, (
+            "premise: the letters are present, which is exactly why a bare "
+            "substring ban was the wrong test"
+        )
+        for read in self.CLOCK_READS:
+            assert read not in source
+
+    def test_gate_data_age_takes_its_instant_as_an_argument(self):
+        """P5-9 touched the one gate that reasons about time at all, so it is
+        pinned on its own rather than only through the module-wide scan."""
+        from risk.limits import gate_data_age
+
+        assert list(inspect.signature(gate_data_age).parameters) == [
+            "intent",
+            "limits",
+            "now_ms",
+        ]
+        source = inspect.getsource(gate_data_age)
+        for read in self.CLOCK_READS:
+            assert read not in source, (
+                f"{read!r} appears in gate_data_age; its instant must be "
+                "supplied, never sampled"
+            )
+
+    def test_gate_data_age_is_a_pure_function_of_its_arguments(self):
+        """Behavioural, not documentary.
+
+        Same intent, same limits, same ``now_ms`` — same ``GateCheck``, at
+        every boundary of the interval P5-9 established. And the verdict moves
+        with the supplied instant rather than with anything ambient.
+        """
+        from risk.limits import gate_data_age
+
+        limits = RiskLimits()
+        boundaries = (
+            0,
+            limits.max_data_age_ms,
+            limits.max_data_age_ms + 1,
+            -limits.max_clock_skew_ms,
+            -(limits.max_clock_skew_ms + 1),
+        )
+        for offset in boundaries:
+            proposed = intent(source_data_timestamp=START_MS - offset)
+            checks = [
+                gate_data_age(proposed, limits, START_MS).model_dump()
+                for _ in range(10)
+            ]
+            assert all(check == checks[0] for check in checks), (
+                f"gate_data_age varied across repeated calls at age {offset}ms"
+            )
+
+        stable = intent(source_data_timestamp=START_MS)
+        assert gate_data_age(stable, limits, START_MS).result is GateResult.PASS
+        assert (
+            gate_data_age(
+                stable, limits, START_MS + limits.max_data_age_ms + 1
+            ).result
+            is GateResult.FAIL
+        )
 
     def test_the_core_module_imports_nothing_nondeterministic(self):
         import agents.rune.core as rune_core
