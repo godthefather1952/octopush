@@ -52,7 +52,7 @@ from core.models.opportunity import (
 )
 from core.models.ops import HealthStatus, Severity, SystemEvent
 from core.models.portfolio import PortfolioState
-from core.models.risk import RiskDecision, RiskVerdict
+from core.models.risk import CommittedExposure, RiskDecision, RiskVerdict
 from core.state import OpportunityRecord, SystemState
 from execution.veska import Veska
 from monitoring import metrics as M
@@ -540,6 +540,116 @@ class Orchestrator:
         """
         return sum(self.working_notional.values())
 
+    def _current_committed_exposure(self) -> CommittedExposure:
+        """Exposure already committed by working, unfilled ENTRY orders.
+
+        DERIVED, NEVER STORED
+        =====================
+        Computed from :attr:`SystemState.orders`, the platform's authoritative
+        order state, every time it is asked for. The alternative — a mutable
+        reservation ledger incremented on submit and decremented on partial
+        fill, cancel, reject and expiry — is a second copy of the order
+        lifecycle that has to be kept in step with the first by hand, and that
+        drifts the moment one path forgets to release. A snapshot recomputed
+        from the orders themselves cannot drift, because there is nothing to
+        drift from.
+
+        WHAT COUNTS: EVERYTHING NOT YET TERMINAL
+        ========================================
+        The liveness helper on :class:`PaperOrder` excludes UNKNOWN, which is a
+        real state meaning "the venue-side truth is not known", not a failure.
+        An UNKNOWN order may well be resting on the venue and may fill at any
+        moment, so releasing its reservation would free budget against risk the
+        platform still carries. Terminality is therefore the test used here,
+        and only the four genuinely terminal statuses — FILLED, CANCELLED,
+        REJECTED, EXPIRED — release.
+
+        HOW MUCH: REMAINING QUANTITY AT THE EXPECTED PRICE
+        ==================================================
+        ``remaining_quantity * expected_price``. For an untouched entry order
+        this reconstructs exactly the per-leg ``approved_notional`` RUNE
+        authorised, because ``Veska.build_plan`` sizes an entry leg as
+        ``approved_notional / expected_price``. As the order fills, the
+        remaining quantity shrinks and the reservation hands over to the
+        position it has become, so the two never double-count.
+
+        It is deliberately NOT built from executed fill prices and quantities:
+        those measure what already filled — which the portfolio has by then
+        recorded anyway — rather than what is still exposed, and they say
+        nothing at all about an order that has not filled once, which is
+        precisely the case this exists for. A fully filled order releases here
+        and appears as a position instead.
+
+        WHICH ORDERS: ENTRIES ONLY
+        ==========================
+        Exits and hedges REDUCE exposure. Counting them as new commitments
+        would make the platform's own risk-reduction look like risk-taking and
+        could block the trade that closes a breach. An order is an entry when
+        its ``intent_id`` is the entry intent of a known opportunity record;
+        ``Orchestrator._decide`` is the only place that sets ``record.intent``,
+        and ``_submit_exit`` and ``_hedge`` build their own intents which are
+        never stored there.
+
+        FAIL-CLOSED ON ANYTHING ELSE
+        ============================
+        An order that is neither a known entry nor accounted for as a known
+        exit/hedge order is RESERVED as though it were an entry. That is the
+        conservative direction: it over-reserves and blocks, where skipping it
+        would under-reserve and authorise. It is reachable — an opportunity
+        whose record has aged out of ``SystemState``'s bounded history, or a
+        superseded UNKNOWN hedge — and it is state-dependent, never
+        time-dependent: nothing here consults a clock or an order's age, so the
+        same set of orders always produces the same snapshot.
+
+        The one thing this cannot see is an order that is no longer in
+        ``SystemState.orders`` at all. ``SystemState._trim_orders`` keeps every
+        live order and every order a retained opportunity record names, so a
+        working entry is never evicted while it is being tracked; an order that
+        has gone UNKNOWN *and* whose record has aged out of the bounded history
+        is the one gap, and it belongs to that retention policy rather than to
+        this calculation.
+        """
+        entry_intents = {
+            record.intent.intent_id
+            for record in self.state.opportunities.values()
+            if record.intent is not None
+        }
+        # Order ids the platform is still tracking somewhere. Used only to tell
+        # a KNOWN exit/hedge order from an unclassifiable one; an entry order
+        # appears here too and is caught by the entry test first.
+        accounted: set[str] = set()
+        for order_ids in self.working_hedges.values():
+            accounted.update(order_ids)
+        for record in self.state.opportunities.values():
+            accounted.update(record.order_ids)
+
+        gross = 0.0
+        net = 0.0
+        by_venue: dict[str, float] = {}
+        by_position: dict[str, float] = {}
+        for order in self.state.orders.values():
+            if order.is_terminal:
+                continue
+            is_entry = order.intent_id is not None and order.intent_id in entry_intents
+            if not is_entry and order.client_order_id in accounted:
+                # Positively identified as an exit or a hedge: exposure-reducing.
+                continue
+            reserved = order.remaining_quantity * order.expected_price
+            if reserved <= 0:
+                continue
+            gross += reserved
+            net += reserved * order.side.sign
+            by_venue[order.venue] = by_venue.get(order.venue, 0.0) + reserved
+            key = f"{order.venue}:{order.symbol}"
+            by_position[key] = by_position.get(key, 0.0) + reserved
+
+        return CommittedExposure(
+            gross_exposure=gross,
+            net_exposure=net,
+            venue_exposure=by_venue,
+            position_exposure=by_position,
+        )
+
     def _refresh_risk_utilization(self, portfolio: PortfolioState) -> None:
         """Keep the published risk-utilization snapshot current every tick.
 
@@ -554,11 +664,17 @@ class Orchestrator:
         This runs unconditionally, right after ``_measure()`` has marked the
         portfolio, using the exact same canonical calculation
         (``RuneCore.utilization``) ``_risk_check`` uses -- one source of
-        truth, called from two places rather than two calculations.
+        truth, called from two places rather than two calculations. That now
+        includes committed exposure: both callers pass it, so the dashboard and
+        the gates describe the same exposure rather than the dashboard showing
+        only what has settled.
         """
         unhedged = self.okapi.total_unhedged(portfolio)
         self.state.risk_utilization = self.rune.core.utilization(
-            portfolio, unhedged, {STRATEGY: self._current_strategy_exposure()}
+            portfolio,
+            unhedged,
+            {STRATEGY: self._current_strategy_exposure()},
+            self._current_committed_exposure(),
         )
 
     def _storage_ok(self) -> bool:
@@ -921,11 +1037,19 @@ class Orchestrator:
             error_rate=self._error_rate(),
             unhedged_notional=self.okapi.total_unhedged(portfolio),
             strategy_exposure=self._current_strategy_exposure(),
+            # What earlier authorisations in THIS tick have already committed.
+            # The portfolio below has not moved for them -- nothing has filled
+            # -- so without this every trade in a ``_seek`` pass would be
+            # measured against the same empty book (P5-1).
+            committed_exposure=self._current_committed_exposure(),
             max_economical_notional=curve.max_economical_notional if curve else None,
             hedge_available=self.okapi.hedge_available(intent.symbol, market),
         )
         self.state.risk_utilization = self.rune.core.utilization(
-            portfolio, ctx.unhedged_notional, {STRATEGY: ctx.strategy_exposure}
+            portfolio,
+            ctx.unhedged_notional,
+            {STRATEGY: ctx.strategy_exposure},
+            ctx.committed_exposure,
         )
         return await self.rune.evaluate(intent, ctx, self.tick_time)
 

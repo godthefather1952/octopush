@@ -68,6 +68,7 @@ from core.models.ops import (
 )
 from core.models.portfolio import PortfolioState, PositionState
 from core.models.risk import (
+    CommittedExposure,
     GateCheck,
     GateResult,
     RiskDecision,
@@ -89,6 +90,7 @@ __all__ = [
     "AgentScore",
     "Base",
     "BookMetrics",
+    "CommittedExposure",
     "ConsensusResult",
     "ConsolidatedView",
     "CostBreakdown",

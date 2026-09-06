@@ -14,7 +14,28 @@ from core.models.common import Millis
 from core.models.opportunity import TradeIntent
 from core.models.ops import HealthStatus, KillSwitchState, SystemHealth
 from core.models.portfolio import PortfolioState
-from core.models.risk import GateCheck, GateResult
+from core.models.risk import CommittedExposure, GateCheck, GateResult
+
+
+def _resolved(committed: CommittedExposure | None) -> CommittedExposure:
+    """A zero snapshot when the caller supplies none.
+
+    Every committed-exposure argument below is keyword-only and defaults to
+    ``None``, so a caller written before committed exposure existed gets
+    exactly its old behaviour: an all-zero snapshot adds nothing to any base.
+    """
+    return CommittedExposure() if committed is None else committed
+
+
+def _basis(filled: float, committed: float) -> str:
+    """A gate ``detail`` explaining a base that is not just the filled book.
+
+    Empty when nothing is committed, so gates read the same as before in the
+    ordinary case and explain themselves in the case that used to be invisible.
+    """
+    if committed == 0.0:
+        return ""
+    return f"{filled:,.2f} filled + {committed:,.2f} committed"
 
 
 def _check(
@@ -124,7 +145,11 @@ def gate_deadline(intent: TradeIntent, now_ms: Millis) -> GateCheck:
 
 
 def gate_position_notional(
-    intent: TradeIntent, portfolio: PortfolioState, limits: RiskLimits
+    intent: TradeIntent,
+    portfolio: PortfolioState,
+    limits: RiskLimits,
+    *,
+    committed: CommittedExposure | None = None,
 ) -> GateCheck:
     """Largest post-trade single-position notional across the intent's legs.
 
@@ -132,35 +157,62 @@ def gate_position_notional(
     position add twice (P5-11). Taking ``max`` over ungrouped legs counted such
     a pair once and understated the position the trade would actually build.
 
+    The base is the position already held PLUS whatever is already working on
+    that same ``venue:symbol`` but has not filled yet (P5-1). Two trades
+    authorised into one position inside a single tick both read an empty
+    position without it.
+
     Deliberately conservative with opposing legs: a BUY and a SELL on the same
     position are added rather than netted. RUNE has no guaranteed fill sequence
     or per-leg quantity for a generic multi-leg intent, so it cannot know the
     two would offset — and overstating a position blocks a safe trade, while
-    understating one authorises an unsafe one.
+    understating one authorises an unsafe one. Committed notional is unsigned
+    for the same reason.
     """
+    reserved = _resolved(committed).position_exposure
     per_position = legs_per_position(intent)
     worst = 0.0
+    detail = ""
     for key, leg_count in per_position.items():
         position = portfolio.positions.get(key)
-        current = position.notional if position else 0.0
-        worst = max(worst, current + intent.notional * leg_count)
+        held = position.notional if position else 0.0
+        pending = reserved.get(key, 0.0)
+        projected = held + pending + intent.notional * leg_count
+        if projected > worst:
+            worst = projected
+            detail = _basis(held, pending)
     return _check(
         "MAX_POSITION_NOTIONAL",
         worst <= limits.max_position_notional,
         observed=worst,
         limit=limits.max_position_notional,
+        detail=detail,
     )
 
 
 def gate_gross_exposure(
-    intent: TradeIntent, portfolio: PortfolioState, limits: RiskLimits
+    intent: TradeIntent,
+    portfolio: PortfolioState,
+    limits: RiskLimits,
+    *,
+    committed: CommittedExposure | None = None,
 ) -> GateCheck:
-    projected = portfolio.gross_exposure + intent.notional * len(intent.legs)
+    """Gross exposure after this intent, counting what is already working.
+
+    The base is filled gross PLUS committed gross. Without the second term the
+    orchestrator's ``_seek`` pass could authorise several trades in one tick,
+    each reading the same portfolio, because no fill had landed to make the
+    earlier ones visible (P5-1).
+    """
+    pending = _resolved(committed).gross_exposure
+    base = portfolio.gross_exposure + pending
+    projected = base + intent.notional * len(intent.legs)
     return _check(
         "MAX_GROSS_EXPOSURE",
         projected <= limits.max_gross_exposure,
         observed=projected,
         limit=limits.max_gross_exposure,
+        detail=_basis(portfolio.gross_exposure, pending),
     )
 
 
@@ -175,21 +227,38 @@ def net_exposure_coefficient(intent: TradeIntent) -> float:
 
 
 def gate_net_exposure(
-    intent: TradeIntent, portfolio: PortfolioState, limits: RiskLimits
+    intent: TradeIntent,
+    portfolio: PortfolioState,
+    limits: RiskLimits,
+    *,
+    committed: CommittedExposure | None = None,
 ) -> GateCheck:
-    """Net exposure after the intent, assuming its legs offset as designed."""
+    """Net exposure after the intent, assuming its legs offset as designed.
+
+    ``committed.net_exposure`` is SIGNED, so a working BUY and a working SELL
+    of the same size cancel here exactly as two filled positions would. That is
+    the whole point of tracking net separately from gross: a balanced pair
+    in flight adds no net delta and must not be made to look as though it does.
+    """
+    pending = _resolved(committed).net_exposure
+    base = portfolio.net_exposure + pending
     delta = net_exposure_coefficient(intent) * intent.notional
-    projected = abs(portfolio.net_exposure + delta)
+    projected = abs(base + delta)
     return _check(
         "MAX_NET_EXPOSURE",
         projected <= limits.max_net_exposure,
         observed=projected,
         limit=limits.max_net_exposure,
+        detail=_basis(portfolio.net_exposure, pending),
     )
 
 
 def net_exposure_headroom(
-    intent: TradeIntent, portfolio: PortfolioState, limits: RiskLimits
+    intent: TradeIntent,
+    portfolio: PortfolioState,
+    limits: RiskLimits,
+    *,
+    committed: CommittedExposure | None = None,
 ) -> float:
     """Largest per-leg notional keeping projected net exposure inside its limit.
 
@@ -216,8 +285,13 @@ def net_exposure_headroom(
     portfolio is already outside the permitted band and only a LARGER
     risk-reducing trade would re-enter it, this still returns a bound at or
     below the request — RUNE reduces, never enlarges — and the gate rejects.
+
+    ``current`` is filled net PLUS committed net, matching ``gate_net_exposure``
+    term for term. If the two disagreed, a trade could be sized against a base
+    the gate does not use and then be rejected by that gate at its own reduced
+    size, which is exactly the promise :meth:`RuneCore.evaluate` makes.
     """
-    current = portfolio.net_exposure
+    current = portfolio.net_exposure + _resolved(committed).net_exposure
     limit = limits.max_net_exposure
     coefficient = net_exposure_coefficient(intent)
 
@@ -234,13 +308,22 @@ def net_exposure_headroom(
 
 
 def leverage_headroom(
-    intent: TradeIntent, portfolio: PortfolioState, limits: RiskLimits
+    intent: TradeIntent,
+    portfolio: PortfolioState,
+    limits: RiskLimits,
+    *,
+    committed: CommittedExposure | None = None,
 ) -> float:
     """Largest per-leg notional keeping projected leverage inside its limit.
 
     ``gate_leverage`` computes ``(gross + n * legs) / equity <= max_leverage``.
     Every term but ``n`` is fixed at decision time, so this rearranges to
     ``n <= (max_leverage * equity - gross) / legs``.
+
+    ``gross`` here is filled gross PLUS committed gross, matching the gate.
+    Equity deliberately does NOT move: an unfilled order has not paid a fee or
+    taken a mark, so committed exposure belongs in the numerator only. Leaving
+    it out of the numerator would let leverage be re-levered inside one tick.
 
     Non-positive equity yields zero: there is no size at which the gate can
     pass, and the gate itself remains the fail-closed authority.
@@ -249,43 +332,67 @@ def leverage_headroom(
     if equity <= 0:
         return 0.0
     legs = max(1, len(intent.legs))
-    allowed_gross = limits.max_leverage * equity - portfolio.gross_exposure
+    gross = portfolio.gross_exposure + _resolved(committed).gross_exposure
+    allowed_gross = limits.max_leverage * equity - gross
     return max(0.0, allowed_gross / legs)
 
 
 def gate_leverage(
-    intent: TradeIntent, portfolio: PortfolioState, limits: RiskLimits
+    intent: TradeIntent,
+    portfolio: PortfolioState,
+    limits: RiskLimits,
+    *,
+    committed: CommittedExposure | None = None,
 ) -> GateCheck:
     equity = portfolio.equity
     if equity <= 0:
         return _check("MAX_LEVERAGE", False, observed=0.0, limit=limits.max_leverage,
                       detail="non-positive equity")
-    projected = (portfolio.gross_exposure + intent.notional * len(intent.legs)) / equity
+    pending = _resolved(committed).gross_exposure
+    gross = portfolio.gross_exposure + pending
+    projected = (gross + intent.notional * len(intent.legs)) / equity
     return _check(
         "MAX_LEVERAGE",
         projected <= limits.max_leverage,
         observed=projected,
         limit=limits.max_leverage,
+        detail=_basis(portfolio.gross_exposure, pending),
     )
 
 
 def gate_venue_exposure(
-    intent: TradeIntent, portfolio: PortfolioState, limits: RiskLimits
+    intent: TradeIntent,
+    portfolio: PortfolioState,
+    limits: RiskLimits,
+    *,
+    committed: CommittedExposure | None = None,
 ) -> GateCheck:
     """Largest post-trade exposure on any one venue.
 
     Legs are grouped by venue first, so an intent routing two legs to one venue
-    projects ``2 * notional`` onto it rather than ``notional`` (P5-11).
+    projects ``2 * notional`` onto it rather than ``notional`` (P5-11). Each
+    venue's base is what is held there PLUS what is already working there and
+    unfilled (P5-1) — venue concentration is where concurrent authorisation
+    bites hardest, because every leg of every cross-venue trade lands on one of
+    a small number of venues.
     """
+    reserved = _resolved(committed).venue_exposure
     exposure = portfolio.exposure_by_venue()
     worst = 0.0
+    detail = ""
     for venue, leg_count in legs_per_venue(intent).items():
-        worst = max(worst, exposure.get(venue, 0.0) + intent.notional * leg_count)
+        held = exposure.get(venue, 0.0)
+        pending = reserved.get(venue, 0.0)
+        projected = held + pending + intent.notional * leg_count
+        if projected > worst:
+            worst = projected
+            detail = _basis(held, pending)
     return _check(
         "MAX_VENUE_EXPOSURE",
         worst <= limits.max_venue_exposure,
         observed=worst,
         limit=limits.max_venue_exposure,
+        detail=detail,
     )
 
 
@@ -302,6 +409,16 @@ def gate_strategy_exposure(
     and would authorise roughly ``leg count`` times the configured budget
     (P5-2). ``Orchestrator._current_strategy_exposure`` is the one place that
     computes it.
+
+    DELIBERATELY TAKES NO COMMITTED-EXPOSURE ARGUMENT
+    ================================================
+    ``strategy_exposure`` is already reserved at authorisation time, from
+    ``Orchestrator.working_notional``, and is held until the opportunity
+    reaches CLOSED or REJECTED. It therefore ALREADY covers the
+    authorised-but-unfilled window that :class:`CommittedExposure` exists to
+    close for the other gates. Adding committed exposure here would count the
+    same trade twice and roughly halve the effective strategy budget, which
+    would silently undo the P5-2 fix rather than extend it.
     """
     projected = strategy_exposure + intent.notional * len(intent.legs)
     return _check(
@@ -332,6 +449,17 @@ def gate_drawdown(portfolio: PortfolioState, limits: RiskLimits) -> GateCheck:
 
 
 def gate_unhedged(unhedged_notional: float, limits: RiskLimits) -> GateCheck:
+    """Residual delta OKAPI has measured, against its limit.
+
+    DELIBERATELY TAKES NO COMMITTED-EXPOSURE ARGUMENT
+    ================================================
+    ``unhedged_notional`` is a *measurement* of delta OKAPI has observed in the
+    filled book, not a projection of what a trade might leave behind. Committed
+    exposure describes orders that have not filled, and an order that has not
+    filled has left no residual to hedge. Feeding one into the other would
+    manufacture a pre-trade unhedged number out of orders that may yet cancel —
+    a different finding with a different fix, not this one.
+    """
     return _check(
         "MAX_UNHEDGED_EXPOSURE",
         abs(unhedged_notional) <= limits.max_unhedged_notional,
@@ -457,6 +585,7 @@ def gate_hedge_available(hedge_available: bool) -> GateCheck:
 Gate = Callable[..., GateCheck]
 
 __all__ = [
+    "CommittedExposure",
     "Gate",
     "GateCheck",
     "GateResult",

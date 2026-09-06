@@ -19,6 +19,7 @@ from core.models.opportunity import TradeIntent
 from core.models.ops import KillSwitchState, SystemHealth
 from core.models.portfolio import PortfolioState
 from core.models.risk import (
+    CommittedExposure,
     GateCheck,
     GateResult,
     RiskDecision,
@@ -41,6 +42,14 @@ class RiskContext:
     ``notional / expected_price``, so an N-leg trade puts ``notional`` on each
     of N venues. Its gross contribution — to the portfolio, to a venue, to a
     strategy budget — is therefore ``notional * N``.
+
+    WHAT "CURRENT EXPOSURE" MEANS
+    =============================
+    :attr:`portfolio` is what has FILLED; :attr:`committed_exposure` is what
+    has been submitted and has not filled yet. Both are real risk, and every
+    exposure gate judges against their sum. Reading the portfolio alone left a
+    window in which several trades could each be authorised against the same
+    unmoved book (P5-1).
     """
 
     portfolio: PortfolioState
@@ -59,6 +68,12 @@ class RiskContext:
     #: the configured budget (P5-2). Built by
     #: ``Orchestrator._current_strategy_exposure``.
     strategy_exposure: float = 0.0
+    #: Exposure already committed by working, unfilled ENTRY orders, derived
+    #: from authoritative order state by
+    #: ``Orchestrator._current_committed_exposure``. Defaults to an empty
+    #: snapshot so a caller that does not supply one gets exactly the
+    #: pre-P5-1 behaviour rather than a silently wrong one.
+    committed_exposure: CommittedExposure = field(default_factory=CommittedExposure)
     max_economical_notional: float | None = None
     hedge_available: bool = True
 
@@ -149,11 +164,25 @@ class RuneCore:
             gates.gate_liquidity(ctx.max_economical_notional, intent),
             gates.gate_hedge_available(ctx.hedge_available),
             gates.gate_order_notional(intent, self.limits),
-            gates.gate_position_notional(intent, ctx.portfolio, self.limits),
-            gates.gate_gross_exposure(intent, ctx.portfolio, self.limits),
-            gates.gate_net_exposure(intent, ctx.portfolio, self.limits),
-            gates.gate_leverage(intent, ctx.portfolio, self.limits),
-            gates.gate_venue_exposure(intent, ctx.portfolio, self.limits),
+            # Every exposure gate judges filled + committed. The committed term
+            # is what closes the authorise-before-fill window (P5-1); the
+            # matching candidate in ``_headroom`` uses the same base, so a
+            # trade is sized against exactly what it is then gated against.
+            gates.gate_position_notional(
+                intent, ctx.portfolio, self.limits, committed=ctx.committed_exposure
+            ),
+            gates.gate_gross_exposure(
+                intent, ctx.portfolio, self.limits, committed=ctx.committed_exposure
+            ),
+            gates.gate_net_exposure(
+                intent, ctx.portfolio, self.limits, committed=ctx.committed_exposure
+            ),
+            gates.gate_leverage(
+                intent, ctx.portfolio, self.limits, committed=ctx.committed_exposure
+            ),
+            gates.gate_venue_exposure(
+                intent, ctx.portfolio, self.limits, committed=ctx.committed_exposure
+            ),
             gates.gate_strategy_exposure(intent, ctx.strategy_exposure, self.limits),
             gates.gate_daily_loss(ctx.portfolio, self.limits),
             gates.gate_drawdown(ctx.portfolio, self.limits),
@@ -227,27 +256,47 @@ class RuneCore:
         headroom twice (P5-11). Appending one full remaining amount per leg
         would have described a different model from the gate that judges the
         result.
+
+        THE BASE MUST BE THE GATE'S BASE
+        ================================
+        Every candidate below starts from filled exposure PLUS committed
+        exposure, exactly as the gate it mirrors now does (P5-1). If sizing
+        used the filled book alone while the gate used filled + committed, a
+        trade would be cut to fit a limit it was never measured against and
+        then rejected at its own reduced size — breaking the same promise the
+        omissions above broke, from the other direction.
         """
         legs = max(1, len(intent.legs))
+        committed = ctx.committed_exposure
+        gross = ctx.portfolio.gross_exposure + committed.gross_exposure
         candidates = [
             intent.notional,
             self.limits.max_order_notional,
-            (self.limits.max_gross_exposure - ctx.portfolio.gross_exposure) / legs,
+            (self.limits.max_gross_exposure - gross) / legs,
             # ``ctx.strategy_exposure`` is gross strategy exposure across all
             # legs of every working trade, the same unit the gate projects into.
+            # It is already reserved at authorisation, so it ALREADY covers the
+            # unfilled window: committed exposure is deliberately not added to
+            # it here, exactly as it is not added in ``gate_strategy_exposure``.
             (self.limits.max_strategy_exposure - ctx.strategy_exposure) / legs,
-            gates.net_exposure_headroom(intent, ctx.portfolio, self.limits),
-            gates.leverage_headroom(intent, ctx.portfolio, self.limits),
+            gates.net_exposure_headroom(
+                intent, ctx.portfolio, self.limits, committed=committed
+            ),
+            gates.leverage_headroom(
+                intent, ctx.portfolio, self.limits, committed=committed
+            ),
         ]
 
         exposure = ctx.portfolio.exposure_by_venue()
         for venue, leg_count in gates.legs_per_venue(intent).items():
-            remaining = self.limits.max_venue_exposure - exposure.get(venue, 0.0)
+            held = exposure.get(venue, 0.0) + committed.venue_exposure.get(venue, 0.0)
+            remaining = self.limits.max_venue_exposure - held
             candidates.append(remaining / leg_count)
 
         for key, leg_count in gates.legs_per_position(intent).items():
             position = ctx.portfolio.positions.get(key)
             current = position.notional if position else 0.0
+            current += committed.position_exposure.get(key, 0.0)
             remaining = self.limits.max_position_notional - current
             candidates.append(remaining / leg_count)
 
@@ -260,6 +309,7 @@ class RuneCore:
         portfolio: PortfolioState,
         unhedged_notional: float,
         strategy_exposure: dict[str, float],
+        committed: CommittedExposure | None = None,
     ) -> RiskUtilization:
         """The one canonical risk-utilization snapshot.
 
@@ -273,11 +323,24 @@ class RuneCore:
         own call (via ``ctx.unhedged_notional``) both go through this same
         method, so there is exactly one risk-utilization formula regardless
         of which caller asks for it.
+
+        ``committed`` is optional and defaults to nothing reserved, so an
+        existing caller is unaffected. When supplied, the gross, net and
+        per-venue figures are reported as FILLED + COMMITTED — the same base
+        the gates judge against — because a dashboard that showed only settled
+        exposure would read comfortably under its limit at the exact moment
+        the platform was fully committed against it. The committed share is
+        also reported on its own, so a number that moved because an order was
+        submitted is distinguishable from one that moved because a fill landed.
         """
+        reserved = CommittedExposure() if committed is None else committed
+        venue_exposure = portfolio.exposure_by_venue()
+        for venue, amount in reserved.venue_exposure.items():
+            venue_exposure[venue] = venue_exposure.get(venue, 0.0) + amount
         return RiskUtilization(
-            gross_exposure=portfolio.gross_exposure,
+            gross_exposure=portfolio.gross_exposure + reserved.gross_exposure,
             max_gross_exposure=self.limits.max_gross_exposure,
-            net_exposure=portfolio.net_exposure,
+            net_exposure=portfolio.net_exposure + reserved.net_exposure,
             max_net_exposure=self.limits.max_net_exposure,
             day_loss=max(0.0, -portfolio.day_realized_pnl),
             max_day_loss=self.limits.max_daily_loss,
@@ -285,8 +348,10 @@ class RuneCore:
             max_drawdown=self.limits.max_drawdown,
             unhedged_notional=abs(unhedged_notional),
             max_unhedged_notional=self.limits.max_unhedged_notional,
-            venue_exposure=portfolio.exposure_by_venue(),
+            venue_exposure=venue_exposure,
             max_venue_exposure=self.limits.max_venue_exposure,
             strategy_exposure=strategy_exposure,
             max_strategy_exposure=self.limits.max_strategy_exposure,
+            committed_gross_exposure=reserved.gross_exposure,
+            committed_net_exposure=reserved.net_exposure,
         )

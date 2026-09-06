@@ -22,6 +22,8 @@ import pytest
 from core.config import RiskLimits
 from core.models.common import Side
 from core.models.portfolio import PortfolioState, PositionState
+from core.models.risk import RiskVerdict
+from risk import limits as gates
 from tests.audit.rune_fixtures import (
     VENUE_A,
     VENUE_B,
@@ -322,7 +324,32 @@ class TestLeverageIsNeverUnderstated:
         assert claimed == pytest.approx(20_000.0 / book.equity)
 
     @pytest.mark.parametrize("equity_cash", [0.0, -1.0, -50_000.0])
+    def test_the_leverage_gate_itself_fails_on_non_positive_equity(self, equity_cash):
+        """The gate's own behaviour, asked of the gate directly.
+
+        Split out of what used to be a single ``evaluate`` test. Since the
+        P5-7 remediation gave MAX_LEVERAGE a headroom solver, non-positive
+        equity yields zero headroom, and ``evaluate`` short-circuits on
+        MIN_TRADE_NOTIONAL before the twenty-one-gate list ever runs — so
+        ``gate_named(decision, "MAX_LEVERAGE")`` no longer finds a gate to
+        inspect. The gate is unchanged and still fail-closed; only the path
+        that reaches it changed, so the assertion moves to the gate.
+        """
+        book = portfolio(cash=equity_cash)
+        assert book.equity <= 0
+        check = gates.gate_leverage(intent(notional=1_000.0), book, OPEN)
+        assert check.blocking, "non-positive equity must never authorise a trade"
+        assert "non-positive equity" in check.detail
+
+    @pytest.mark.parametrize("equity_cash", [0.0, -1.0, -50_000.0])
     def test_non_positive_equity_always_blocks(self, equity_cash):
+        """The safety property, unchanged: no trade is authorised.
+
+        Which gate does the blocking is an implementation detail; that nothing
+        is authorised is not. Rejection now arrives earlier and more cheaply,
+        via zero headroom, and the decision must say so rather than approving
+        anything at all.
+        """
         book = portfolio(cash=equity_cash)
         assert book.equity <= 0
         decision = core(OPEN).evaluate(
@@ -330,9 +357,9 @@ class TestLeverageIsNeverUnderstated:
             context(portfolio=book, max_economical_notional=10_000_000.0),
             START_MS,
         )
-        check = gate_named(decision, "MAX_LEVERAGE")
-        assert check.blocking, "non-positive equity must never authorise a trade"
-        assert "non-positive equity" in check.detail
+        assert decision.verdict is RiskVerdict.REJECTED
+        assert decision.approved_notional == pytest.approx(0.0)
+        assert decision.reason_codes == ["MIN_TRADE_NOTIONAL"]
 
     def test_tiny_positive_equity_produces_an_enormous_projection(self):
         book = portfolio(cash=0.01)

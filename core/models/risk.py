@@ -65,9 +65,69 @@ class RiskDecision(Envelope):
         return [g for g in self.gates if g.blocking]
 
 
+class CommittedExposure(Base):
+    """Exposure the platform has committed to but that has not yet filled.
+
+    THE WINDOW THIS CLOSES
+    ======================
+    Every exposure gate reads :class:`~core.models.portfolio.PortfolioState`,
+    and a portfolio only moves when a fill lands. Between authorisation and
+    fill a trade is real risk — its orders are live and can execute at any
+    moment — yet it was invisible to MAX_GROSS_EXPOSURE, MAX_NET_EXPOSURE,
+    MAX_LEVERAGE, MAX_VENUE_EXPOSURE and MAX_POSITION_NOTIONAL. The
+    orchestrator authorises opportunities back to back inside one ``_seek``
+    pass with no settlement between them, so two trades could each be
+    authorised against the same empty book and together breach a limit
+    neither of them individually approached (P5-1).
+
+    A DERIVED SNAPSHOT, NOT A LEDGER
+    ================================
+    This is a *value* computed from authoritative order state on demand, never
+    a second mutable ledger that has to be incremented on submit, decremented
+    on partial fill, and released on cancel/reject/expiry. A ledger like that
+    can drift from the order lifecycle it is supposed to mirror; a snapshot
+    recomputed from :attr:`core.state.SystemState.orders` cannot.
+    ``Orchestrator._current_committed_exposure`` is the one place that builds
+    it.
+
+    UNITS
+    =====
+    Quote notional, in the same unit as ``PortfolioState.gross_exposure`` —
+    i.e. already summed across legs, NOT a per-leg figure. Each contributing
+    order reserves ``remaining_quantity * expected_price``, which reconstructs
+    the per-leg ``approved_notional`` for an untouched order and shrinks as it
+    fills, so the reservation hands over to the position it becomes rather
+    than double-counting alongside it.
+    """
+
+    #: Unsigned quote notional still working, summed over every reserved order.
+    gross_exposure: float = 0.0
+    #: The same amount signed by side (+BUY / -SELL), so it can be added
+    #: directly to ``PortfolioState.net_exposure``.
+    net_exposure: float = 0.0
+    #: Venue -> unsigned committed notional on that venue.
+    venue_exposure: dict[str, float] = Field(default_factory=dict)
+    #: ``"venue:symbol"`` -> unsigned committed notional on that position, keyed
+    #: exactly as ``PortfolioState.positions`` is.
+    position_exposure: dict[str, float] = Field(default_factory=dict)
+
+    @property
+    def is_zero(self) -> bool:
+        """Whether anything at all is reserved. Used only to keep gate
+        ``detail`` strings quiet when there is nothing to explain."""
+        return (
+            self.gross_exposure == 0.0
+            and self.net_exposure == 0.0
+            and not self.venue_exposure
+            and not self.position_exposure
+        )
+
+
 class RiskUtilization(Base):
     """Current consumption of each deterministic limit, for the dashboard."""
 
+    #: Filled PLUS committed, so the dashboard shows the same exposure the
+    #: gates judge against rather than only what has settled.
     gross_exposure: float = 0.0
     max_gross_exposure: float = 0.0
     net_exposure: float = 0.0
@@ -82,6 +142,12 @@ class RiskUtilization(Base):
     max_venue_exposure: float = 0.0
     strategy_exposure: dict[str, float] = Field(default_factory=dict)
     max_strategy_exposure: float = 0.0
+    #: The committed-but-unfilled share of the three figures above, so a
+    #: reader can tell a number that moved because a fill landed from one that
+    #: moved because an order was submitted. Reported, never subtracted: the
+    #: totals already include it.
+    committed_gross_exposure: float = 0.0
+    committed_net_exposure: float = 0.0
 
     @staticmethod
     def _pct(used: float, limit: float) -> float:
