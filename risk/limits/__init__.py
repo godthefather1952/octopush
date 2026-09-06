@@ -500,6 +500,7 @@ def gate_unhedged(
     limits: RiskLimits,
     *,
     committed: CommittedExposure | None = None,
+    recovery_reserve: float = 0.0,
 ) -> GateCheck:
     """Worst-case unhedged residual once this intent is working.
 
@@ -514,13 +515,41 @@ def gate_unhedged(
     one-sided exposure. The post-fill backstop caught it afterwards, correctly
     and every time; the pre-trade projection was the incomplete half (P5-18).
 
-    Three terms, all in quote notional:
+    Four terms, all in quote notional:
 
     * ``actual``   — the residual OKAPI measures right now;
     * ``pending``  — :attr:`CommittedExposure.unhedged_fill_risk`, the worst
       case from entry orders already working and not yet filled;
     * ``incoming`` — this intent, at ``notional * fill factor * execution
-      multiplier``.
+      multiplier``;
+    * ``recovery reserve`` — see below.
+
+    THE RECOVERY RESERVE
+    ====================
+    Sizing the temporary leg exactly TO the hard ceiling is not the same as
+    sizing it safely. External validation measured the difference: an entry
+    authorised at 9,980.97 of notional was MARKED at 10,022.93 while it was
+    still one-sided, 42 bps of ordinary movement, and the emergency backstop
+    engaged — with the exit already CANCEL_PENDING and OKAPI's hedge already
+    SUBMITTING. Nothing had gone wrong; recovery was underway and simply had
+    no room between it and the ceiling.
+
+    So an entry reserves a slice of the budget it may not consume, leaving the
+    recovery path somewhere to move. The reserve is not a new invented
+    percentage: the caller passes ``Settings.hedge_tolerance_notional``, the
+    operator-configured delta OKAPI already tolerates before it hedges — which
+    ties entry sizing to the mechanism that has to unwind the exposure.
+
+    This is a PRE-TRADE budget only. The hard limit is unchanged, and the kill
+    switch still fires at ``max_unhedged_notional`` on the residual that
+    actually exists. If the market moves further than the reserve and crosses
+    the real ceiling, the backstop is supposed to engage; the reserve only
+    stops normal recovery from starting with zero headroom to it.
+
+    ``observed`` is the STRESSED projection — all four terms — so the gate's
+    ``observed <= limit`` contract still reads against the true hard limit
+    rather than against a second, quieter one. ``detail`` names every term,
+    including a zero reserve, so nothing is hidden.
 
     WHY ADDING THEM IS DELIBERATELY CONSERVATIVE
     ============================================
@@ -537,7 +566,8 @@ def gate_unhedged(
     incoming = (
         intent.notional * unhedged_fill_factor(intent) * execution_multiplier(intent)
     )
-    projected = actual + pending + incoming
+    reserve = max(0.0, recovery_reserve)
+    projected = actual + pending + incoming + reserve
     return _check(
         "MAX_UNHEDGED_EXPOSURE",
         projected <= limits.max_unhedged_notional,
@@ -545,7 +575,8 @@ def gate_unhedged(
         limit=limits.max_unhedged_notional,
         detail=(
             f"{actual:,.2f} actual + {pending:,.2f} pending + "
-            f"{incoming:,.2f} incoming"
+            f"{incoming:,.2f} incoming + {reserve:,.2f} recovery reserve "
+            f"= {projected:,.2f} stressed"
         ),
     )
 
@@ -556,14 +587,19 @@ def unhedged_headroom(
     limits: RiskLimits,
     *,
     committed: CommittedExposure | None = None,
+    recovery_reserve: float = 0.0,
 ) -> float:
     """Largest per-leg notional keeping worst-case unhedged inside its limit.
 
     Mirrors :func:`gate_unhedged` term for term, so a trade is sized against
     exactly what it is then judged against. ``gate_unhedged`` computes
-    ``actual + pending + n * factor * multiplier <= limit``, which is linear in
-    ``n`` and rearranges to ``n <= (limit - actual - pending) / (factor *
-    multiplier)``.
+    ``actual + pending + n * factor * multiplier + reserve <= limit``, which is
+    linear in ``n`` and rearranges to
+    ``n <= (limit - reserve - actual - pending) / (factor * multiplier)``.
+
+    The reserve comes off the top, in addition to the residual that already
+    exists — with a 10,000 limit, a 500 reserve and 2,000 of actual residual,
+    7,500 remains for pending plus incoming, not 8,000.
 
     Zero when the base alone already breaches: no reduction can help, and the
     gate remains the fail-closed authority. A non-finite ``unhedged_notional``
@@ -573,6 +609,7 @@ def unhedged_headroom(
     reserved = _resolved(committed)
     remaining = (
         limits.max_unhedged_notional
+        - max(0.0, recovery_reserve)
         - abs(unhedged_notional)
         - reserved.unhedged_fill_risk
     )

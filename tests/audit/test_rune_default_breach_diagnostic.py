@@ -26,7 +26,7 @@ the orders those entries became, and a mark-versus-expected comparison for the
 dominant one-sided position.
 
 That last part is the point of the whole exercise. If the breach is unhedged
-exposure, the residual is `quantity × price`, and the question is which price
+exposure, the residual is `quantity x price`, and the question is which price
 moved: the fill landing away from what VESKA sized against (execution
 slippage), the mark moving after the trade was sized (mark-to-market drift), or
 a residual carried in from earlier. Those three have different fixes, and the

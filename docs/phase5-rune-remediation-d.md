@@ -455,3 +455,173 @@ makes CI print the report.
 
 No buffer, tolerance, limit change, auto-clear or confirmation delay was
 implemented in this pass. The measurement decides the fix.
+
+---
+
+## 24. External validation — CI #40, and the completion of P5-18
+
+Run on `d7f98d3`:
+
+| | |
+| --- | --- |
+| Full suite | 2970 passed / **13 failed** / 2 skipped |
+| Python 3.11 unit + contract | 1382 passed / 126 skipped / **0 failed** |
+| Mypy core, paper boundary, backend contract pre-check | PASS |
+| Ruff | one audit-only RUF002 (ambiguous `×` in a docstring) |
+
+The ~30 exposure-projection failures disappeared once the `OPEN` fixture was
+corrected, confirming that diagnosis. Remediation D's projection arithmetic is
+present and correct. The RUF002 is fixed here.
+
+### The first breach, measured
+
+The diagnostic did its job. At **tick 151**, `time = 1788000015200`:
+
+```
+breaches = ['MAX_UNHEDGED_EXPOSURE']        <- and nothing else
+
+gross     10,022.9337 / 150,000
+net       10,022.9337 /  25,000
+leverage       0.1002 /       2.0
+venue     10,022.9337 /  75,000   (VENUE_A)
+position  10,022.9337 /  50,000   (VENUE_A:ETH-USD)
+strategy  19,962.9808 / 100,000
+actual_unhedged  10,022.9337 / 10,000      <- the only one over
+
+pending_unhedged_fill_risk = 0.0
+```
+
+Every other dimension is an order of magnitude inside its limit. The
+classification is unambiguous.
+
+### The position did not fill above the limit
+
+```
+venue:symbol          VENUE_A:ETH-USD
+quantity              -2.4292661940053453
+average entry price    4,108.63747827
+current mark           4,125.91
+
+entry notional         9,980.9741      <- INSIDE the 10,000 limit
+marked notional       10,022.9337      <- outside it
+mark vs entry            +42.0395 bps
+```
+
+The entry was authorised and filled inside the budget. It was **marked**
+across the ceiling, by 42 bps of ordinary movement, while it was still
+one-sided.
+
+### Recovery was already in flight
+
+At the trigger the platform held an original-opportunity BUY at
+`CANCEL_PENDING` and an OKAPI hedge at `SUBMITTING`. Nothing had failed. The
+exit and the hedge were both working; they simply had 19.03 of room between the
+position and the emergency ceiling, and 42 bps of drift consumed it.
+
+So the correct reading is not *"RUNE authorised 10,023 of exposure"*. It is
+*"RUNE authorised nearly the entire hard budget, and ordinary mark-to-market
+movement during recovery pushed the existing one-sided position 22.93 past the
+ceiling"*.
+
+### P5-18 has two parts, and only one was closed
+
+| | |
+| --- | --- |
+| **A. asynchronous fill-sequence risk** | closed by Remediation D — RUNE understands a balanced pair can transiently hold one whole leg |
+| **B. recovery headroom** | closed here — RUNE was sizing that leg *to* the emergency limit, leaving nothing for mark movement, residuals, or hedge and exit submission latency |
+
+Part B is what turned a normal recovery path into a manually-latched
+emergency.
+
+## 25. The recovery reserve
+
+**No new percentage buffer was invented.** The reserve is
+`Settings.hedge_tolerance_notional` (default 500.0) — the per-symbol delta
+OKAPI already tolerates before it requests a hedge. Using it ties entry sizing
+to the mechanism that has to unwind the resulting exposure, and keeps one
+operator-configured number instead of two that could drift apart.
+
+`RiskContext` gained `hedge_tolerance_notional: float = 0.0`, passed by
+`Orchestrator._risk_check` from settings. A caller that omits it reserves
+nothing and behaves exactly as before, so the change is additive.
+
+### Effective entry budget
+
+```
+hard_limit        = limits.max_unhedged_notional          10,000   (unchanged)
+recovery_reserve  = max(0, ctx.hedge_tolerance_notional)     500
+effective budget  = hard_limit - recovery_reserve          9,500
+```
+
+`RiskLimits` is untouched and OKAPI's tolerance is untouched. The only new
+concept is how much of the hard ceiling an ENTRY may deliberately consume.
+
+### Gate
+
+```
+stressed = actual + pending + incoming + recovery_reserve
+PASS when stressed <= max_unhedged_notional
+```
+
+`observed` is the stressed projection, so the gate's `observed <= limit`
+contract still reads against the real hard limit rather than a second, quieter
+one. `detail` names all four terms, including a zero reserve:
+
+```
+0.00 actual + 0.00 pending + 9,500.00 incoming + 500.00 recovery reserve
+= 10,000.00 stressed
+```
+
+### Headroom
+
+Mirrors the gate exactly:
+
+```
+remaining = max_unhedged_notional - recovery_reserve
+                                  - abs(actual_unhedged)
+                                  - committed.unhedged_fill_risk
+candidate = remaining / (unhedged_fill_factor(intent) * execution_multiplier(intent))
+```
+
+clamped at zero. The reserve comes off in addition to what is already there:
+with 2,000 of actual residual, 7,500 remains for pending plus incoming, not
+8,000. When `actual + pending >= hard - reserve` the candidate is zero and
+`evaluate` rejects early at `MIN_TRADE_NOTIONAL`, the same shape leverage and
+the other size-sensitive limits already take.
+
+### Illustrative default
+
+For a balanced one-symbol pair at a 10 bps slippage budget, factor 1:
+`9,500 / 1.001 ≈ 9,490.51`. Production hard-codes nothing — real intents carry
+their own slippage budgets and will size slightly differently.
+
+## 26. What the reserve is NOT
+
+- **Not a kill-switch change.** `live_risk_breaches` still fires at
+  `actual_unhedged > 10,000`. Moving it to 9,500 would turn a safety margin
+  into a second hidden ceiling and defeat the point of having a margin. No
+  file under `risk/kill_switch/` was touched.
+- **Not a utilization change.** `RiskUtilization.unhedged_notional` still
+  means the actual filled-book residual and `max_unhedged_notional` still
+  reports the real limit; `pending_unhedged_fill_risk` still means potential
+  unresolved-entry leg risk. The reserve appears only in the gate's `detail`.
+- **Not a guarantee.** Markets can move more than 500. If they do and the real
+  ceiling is crossed, `RISK_LIMIT_BREACH` must still engage — that is what the
+  backstop is for. The reserve only stops normal recovery from *beginning*
+  with zero headroom to it.
+
+## 27. P5-18 status
+
+**P5-18 — PARTIAL / VALIDATION PENDING.**
+
+Not closed. It becomes closed only when external CI shows all three:
+
+1. the direct projection and recovery-headroom tests passing,
+2. `test_rune_default_breach_diagnostic.py` passing — its
+   `assert first_trigger is None` is unchanged and still strict,
+3. the four canaries recovering naturally, with no change to any of them.
+
+If the diagnostic still trips, CI prints the next first-breach report and the
+next decision is made from that measurement rather than from a guess.
+
+**TESTS NOT RUN — EXTERNAL VALIDATION REQUIRED.**

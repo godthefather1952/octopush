@@ -74,6 +74,14 @@ class RiskContext:
     #: snapshot so a caller that does not supply one gets exactly the
     #: pre-P5-1 behaviour rather than a silently wrong one.
     committed_exposure: CommittedExposure = field(default_factory=CommittedExposure)
+    #: Quote notional of unhedged budget an ENTRY may not consume, leaving the
+    #: recovery path room to move before it reaches the emergency ceiling
+    #: (P5-18). Sourced from ``Settings.hedge_tolerance_notional`` — the delta
+    #: OKAPI already tolerates before hedging — rather than from a new invented
+    #: buffer, so entry sizing is tied to the mechanism that unwinds the
+    #: exposure. Defaults to zero, so a caller that omits it reserves nothing
+    #: and behaves exactly as before.
+    hedge_tolerance_notional: float = 0.0
     max_economical_notional: float | None = None
     hedge_available: bool = True
 
@@ -194,6 +202,7 @@ class RuneCore:
                 ctx.unhedged_notional,
                 self.limits,
                 committed=ctx.committed_exposure,
+                recovery_reserve=ctx.hedge_tolerance_notional,
             ),
             # The SIZED intent's leg count, which is also the original's:
             # reducing a notional never changes how many orders VESKA plans.
@@ -261,7 +270,10 @@ class RuneCore:
         one whole leg of one-sided exposure between its first fill and its
         second — so the gate is size-sensitive after all, and the default
         configuration let RUNE authorise 25,000 per leg against a 10,000 hard
-        unhedged ceiling (P5-18). It is now sized for here like the rest.
+        unhedged ceiling (P5-18). It is now sized for here like the rest, and
+        its candidate also holds back ``ctx.hedge_tolerance_notional`` so an
+        entry does not size itself flush against the emergency ceiling and
+        leave ordinary mark movement no room while recovery is under way.
 
         The one deliberate exclusion is MAX_OPEN_ORDERS: an intent creates one
         order per leg regardless of its notional, so no reduction can make that
@@ -303,7 +315,11 @@ class RuneCore:
                 intent, ctx.portfolio, self.limits, committed=committed
             ),
             gates.unhedged_headroom(
-                intent, ctx.unhedged_notional, self.limits, committed=committed
+                intent,
+                ctx.unhedged_notional,
+                self.limits,
+                committed=committed,
+                recovery_reserve=ctx.hedge_tolerance_notional,
             ),
         ]
 

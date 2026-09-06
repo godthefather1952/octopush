@@ -1083,6 +1083,13 @@ class Orchestrator:
             # -- so without this every trade in a ``_seek`` pass would be
             # measured against the same empty book (P5-1).
             committed_exposure=self._current_committed_exposure(),
+            # The unhedged budget an entry must leave unspent, so the exit and
+            # hedge that unwind its temporary leg have room to work before the
+            # emergency ceiling. OKAPI's own tolerance is the honest source:
+            # it is the delta the operator already accepts before hedging, so
+            # entry sizing and recovery are configured by one number rather
+            # than by two that could drift apart (P5-18).
+            hedge_tolerance_notional=self.settings.hedge_tolerance_notional,
             max_economical_notional=curve.max_economical_notional if curve else None,
             hedge_available=self.okapi.hedge_available(intent.symbol, market),
         )

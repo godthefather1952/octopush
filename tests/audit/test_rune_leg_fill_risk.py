@@ -214,9 +214,13 @@ class TestTheProjectedBoundary:
         assert check.observed > UNHEDGED
         assert check.blocking
 
-    def test_the_detail_separates_the_three_terms(self):
+    def test_the_detail_separates_every_term(self):
         """An operator reading a rejection must be able to tell which term
-        consumed the budget; the gate is conservative and says so."""
+        consumed the budget; the gate is conservative and says so.
+
+        Four terms since Remediation D2 — the recovery reserve is named even
+        when it is zero, so the format is stable and nothing is hidden.
+        """
         check = gates.gate_unhedged(
             intent(notional=1_000.0),
             2_000.0,
@@ -226,6 +230,8 @@ class TestTheProjectedBoundary:
         assert "2,000.00 actual" in check.detail
         assert "3,000.00 pending" in check.detail
         assert "1,001.00 incoming" in check.detail
+        assert "0.00 recovery reserve" in check.detail
+        assert "6,001.00 stressed" in check.detail
         assert check.observed == pytest.approx(6_001.0)
 
 
@@ -386,3 +392,355 @@ class TestNothingElseMoved:
         )
         assert util.unhedged_notional == pytest.approx(2_000.0)
         assert util.pending_unhedged_fill_risk == pytest.approx(7_000.0)
+
+
+# ======================================================================
+# P5-18 part B — recovery headroom (Remediation D2)
+# ======================================================================
+
+#: ``Settings.hedge_tolerance_notional``'s shipped value. Pinned against the
+#: real configuration by ``TestTheReserveComesFromConfiguration`` below rather
+#: than assumed here.
+RESERVE = 500.0
+
+#: What an entry may actually consume once the reserve is held back.
+EFFECTIVE = UNHEDGED - RESERVE          # 9,500
+
+
+class TestWhyTheReserveExists:
+    """The measurement that produced this change, restated as a test.
+
+    External validation ran the shipped platform and captured the first
+    emergency trigger: MAX_UNHEDGED_EXPOSURE alone, actual 10,022.9337 against
+    a 10,000 limit, with pending fill risk 0.0 and every other dimension
+    comfortably inside. The dominant residual was ETH-USD on VENUE_A, quantity
+    -2.4292661940053453, entry price 4,108.63747827, mark 4,125.91.
+
+    So the position did NOT fill above the limit — its entry notional was
+    9,980.9741, inside it. It was MARKED to 10,022.9337 while still one-sided,
+    42.04 bps of ordinary movement, with the exit already CANCEL_PENDING and
+    OKAPI's hedge already SUBMITTING. Recovery was working; it simply had no
+    room between itself and the emergency ceiling.
+
+    The asynchronous fill-sequence projection was right. Sizing that temporary
+    leg flush against the hard limit was the remaining half.
+    """
+
+    QUANTITY = 2.4292661940053453
+    ENTRY_PRICE = 4_108.63747827
+    MARK_PRICE = 4_125.91
+
+    def test_the_observed_entry_notional_was_inside_the_limit(self):
+        entry_notional = self.QUANTITY * self.ENTRY_PRICE
+        assert entry_notional == pytest.approx(9_980.9741, abs=0.05)
+        assert entry_notional < UNHEDGED
+
+    def test_the_observed_mark_notional_was_outside_it(self):
+        mark_notional = self.QUANTITY * self.MARK_PRICE
+        assert mark_notional == pytest.approx(10_022.9337, abs=0.05)
+        assert mark_notional > UNHEDGED
+
+    def test_the_drift_that_crossed_the_limit_was_ordinary(self):
+        drift_bps = (self.MARK_PRICE / self.ENTRY_PRICE - 1.0) * 10_000.0
+        assert drift_bps == pytest.approx(42.0395, abs=0.1)
+
+    def test_the_reserve_is_far_larger_than_that_drift(self):
+        """Not a guarantee that markets cannot move more — they can, and the
+        backstop is what catches it. The reserve only stops normal recovery
+        from starting with zero headroom."""
+        drift_notional = self.QUANTITY * (self.MARK_PRICE - self.ENTRY_PRICE)
+        assert drift_notional == pytest.approx(41.9596, abs=0.05)
+        assert RESERVE > drift_notional
+
+
+class TestTheReserveComesFromConfiguration:
+    """§6 / §21 — no new invented buffer, and exactly one source."""
+
+    def test_it_is_okapis_own_hedge_tolerance(self):
+        from core.config import load_settings
+
+        settings = load_settings()
+        assert settings.hedge_tolerance_notional == pytest.approx(RESERVE)
+
+    def test_okapi_measures_against_the_same_number(self):
+        """The reserve ties entry sizing to the mechanism that unwinds the
+        exposure: it is the delta OKAPI already tolerates before hedging."""
+        import inspect
+
+        from agents.okapi.agent import Okapi
+
+        source = inspect.getsource(Okapi.delta_reports)
+        assert "self.settings.hedge_tolerance_notional" in source
+
+    def test_the_orchestrator_passes_it_straight_through(self):
+        """§21. One value, read from settings, not copied or recomputed."""
+        import inspect
+
+        import apps.orchestrator.orchestrator as orch
+        from apps.orchestrator.orchestrator import Orchestrator
+
+        risk_check = inspect.getsource(Orchestrator._risk_check)
+        assert (
+            "hedge_tolerance_notional=self.settings.hedge_tolerance_notional,"
+            in risk_check
+        )
+        mentions = [
+            line.strip()
+            for line in inspect.getsource(orch).splitlines()
+            if "hedge_tolerance_notional" in line
+        ]
+        assert mentions == [
+            "hedge_tolerance_notional=self.settings.hedge_tolerance_notional,"
+        ], (
+            "the reserve must be read from settings in exactly one place; "
+            f"a second copy is how two safety layers come to disagree: {mentions}"
+        )
+
+    def test_the_hard_limit_itself_is_unchanged(self):
+        """§7. The reserve changes what an ENTRY may consume, never the
+        ceiling the emergency layer watches."""
+        assert SHIPPED.max_unhedged_notional == pytest.approx(10_000.0)
+
+
+class TestTheEffectiveEntryBudget:
+    """§20-A/B — the reserve comes off the top of the entry budget."""
+
+    def test_a_25k_request_is_sized_to_the_effective_budget(self):
+        """§20-A. Approved size uses 9,500, not 10,000."""
+        decision = decide(intent(notional=ORDER), hedge_tolerance_notional=RESERVE)
+        assert decision.verdict is RiskVerdict.APPROVED_REDUCED
+        assert decision.approved_notional == pytest.approx(
+            EFFECTIVE / gates.execution_multiplier(intent())
+        )
+        assert decision.approved_notional == pytest.approx(9_490.51, abs=0.01)
+
+    def test_the_stressed_projection_lands_on_the_hard_limit(self):
+        """§11. ``observed`` is the stressed total including the reserve, so
+        the gate's ``observed <= limit`` contract still reads against the real
+        ceiling rather than a second, quieter one."""
+        decision = decide(intent(notional=ORDER), hedge_tolerance_notional=RESERVE)
+        check = gate_named(decision, "MAX_UNHEDGED_EXPOSURE")
+        assert check.observed == pytest.approx(UNHEDGED)
+        assert check.limit == pytest.approx(UNHEDGED)
+        assert not check.blocking
+
+    def test_the_detail_names_the_reserve(self):
+        """§11 — do not hide it."""
+        decision = decide(intent(notional=ORDER), hedge_tolerance_notional=RESERVE)
+        detail = gate_named(decision, "MAX_UNHEDGED_EXPOSURE").detail
+        assert "0.00 actual" in detail
+        assert "0.00 pending" in detail
+        assert "9,500.00 incoming" in detail
+        assert "500.00 recovery reserve" in detail
+        assert "10,000.00 stressed" in detail
+
+    def test_zero_reserve_reproduces_the_previous_behaviour(self):
+        """§20-B. A caller that reserves nothing gets exactly what Remediation
+        D gave it, so the change is additive rather than a re-tuning."""
+        decision = decide(intent(notional=ORDER), hedge_tolerance_notional=0.0)
+        assert decision.approved_notional == pytest.approx(
+            UNHEDGED / gates.execution_multiplier(intent())
+        )
+        assert decision.approved_notional == pytest.approx(9_990.01, abs=0.01)
+
+    def test_the_default_context_reserves_nothing(self):
+        """The field defaults to zero, so every existing direct caller and
+        audit fixture is unaffected."""
+        assert context().hedge_tolerance_notional == pytest.approx(0.0)
+
+    def test_a_negative_reserve_cannot_enlarge_the_budget(self):
+        """Clamped at zero: a reserve is something held back, never handed
+        out."""
+        decision = decide(intent(notional=ORDER), hedge_tolerance_notional=-5_000.0)
+        assert decision.approved_notional == pytest.approx(
+            UNHEDGED / gates.execution_multiplier(intent())
+        )
+
+
+class TestTheReserveComposesWithWhatIsAlreadyThere:
+    """§17, §18, §19 — it is in addition to actual and pending, not instead."""
+
+    def test_actual_residual_and_the_reserve_both_come_off(self):
+        """§17 / §20-C. 10,000 hard, 500 reserved, 2,000 already held leaves
+        7,500 for pending plus incoming — not 8,000."""
+        decision = decide(
+            intent(notional=ORDER),
+            unhedged_notional=2_000.0,
+            hedge_tolerance_notional=RESERVE,
+        )
+        assert decision.approved_notional == pytest.approx(
+            7_500.0 / gates.execution_multiplier(intent())
+        )
+
+    def test_the_four_thousand_case(self):
+        """§20-C as stated: 4,000 actual and a 500 reserve leave roughly 5,500
+        of incoming budget before the slippage multiplier."""
+        decision = decide(
+            intent(notional=ORDER),
+            unhedged_notional=4_000.0,
+            hedge_tolerance_notional=RESERVE,
+        )
+        assert decision.approved_notional == pytest.approx(
+            5_500.0 / gates.execution_multiplier(intent())
+        )
+        assert gate_named(
+            decision, "MAX_UNHEDGED_EXPOSURE"
+        ).observed == pytest.approx(UNHEDGED)
+
+    def test_pending_entry_risk_and_the_reserve_both_come_off(self):
+        """§18 / §20-D. 7,000 already working plus a 500 reserve leave 2,500."""
+        decision = decide(
+            intent(notional=ORDER),
+            committed_exposure=CommittedExposure(unhedged_fill_risk=7_000.0),
+            hedge_tolerance_notional=RESERVE,
+        )
+        assert decision.approved_notional == pytest.approx(
+            2_500.0 / gates.execution_multiplier(intent())
+        )
+
+    def test_all_three_compose(self):
+        decision = decide(
+            intent(notional=ORDER),
+            unhedged_notional=1_000.0,
+            committed_exposure=CommittedExposure(unhedged_fill_risk=2_000.0),
+            hedge_tolerance_notional=RESERVE,
+        )
+        assert decision.approved_notional == pytest.approx(
+            6_500.0 / gates.execution_multiplier(intent())
+        )
+
+    @pytest.mark.parametrize(
+        ("actual", "pending"),
+        [(9_500.0, 0.0), (0.0, 9_500.0), (5_000.0, 4_500.0), (9_600.0, 0.0)],
+    )
+    def test_a_consumed_effective_budget_leaves_no_headroom(self, actual, pending):
+        """§19. ``actual + pending >= hard - reserve`` authorises nothing, and
+        rejects early at MIN_TRADE_NOTIONAL — the same shape leverage and the
+        rest of the size-sensitive limits already take. The gate is not forced
+        to appear merely for diagnostics."""
+        decision = decide(
+            intent(notional=ORDER),
+            unhedged_notional=actual,
+            committed_exposure=CommittedExposure(unhedged_fill_risk=pending),
+            hedge_tolerance_notional=RESERVE,
+        )
+        assert decision.verdict is RiskVerdict.REJECTED
+        assert decision.approved_notional == pytest.approx(0.0)
+        assert decision.reason_codes == ["MIN_TRADE_NOTIONAL"]
+
+    def test_just_inside_the_effective_budget_still_trades(self):
+        """The boundary is not blanket-conservative: at 9,000 of actual there
+        is still 500 of room, which is above ``min_trade_notional``."""
+        decision = decide(
+            intent(notional=ORDER),
+            unhedged_notional=9_000.0,
+            hedge_tolerance_notional=RESERVE,
+        )
+        assert decision.approved
+        assert decision.approved_notional == pytest.approx(
+            500.0 / gates.execution_multiplier(intent())
+        )
+
+
+class TestGateAndHeadroomStillMirrorEachOther:
+    """The sizing contract has to survive the fourth term."""
+
+    @pytest.mark.parametrize("reserve", [0.0, 250.0, RESERVE, 2_000.0])
+    @pytest.mark.parametrize("actual", [0.0, 1_500.0, 6_000.0])
+    def test_a_sized_intent_always_clears_the_gate(self, reserve, actual):
+        decision = decide(
+            intent(notional=ORDER),
+            unhedged_notional=actual,
+            hedge_tolerance_notional=reserve,
+        )
+        if decision.approved:
+            check = gate_named(decision, "MAX_UNHEDGED_EXPOSURE")
+            assert not check.blocking, (
+                f"sized to {decision.approved_notional} with actual={actual} "
+                f"reserve={reserve}, and the gate still failed at "
+                f"{check.observed}"
+            )
+
+    @pytest.mark.parametrize("reserve", [0.0, RESERVE, 2_000.0])
+    def test_the_solver_reproduces_the_gates_boundary(self, reserve):
+        proposed = intent(notional=ORDER)
+        allowed = gates.unhedged_headroom(
+            proposed, 1_500.0, ONLY_UNHEDGED, recovery_reserve=reserve
+        )
+        at_bound = proposed.model_copy(update={"notional": allowed})
+        check = gates.gate_unhedged(
+            at_bound, 1_500.0, ONLY_UNHEDGED, recovery_reserve=reserve
+        )
+        assert check.observed == pytest.approx(UNHEDGED)
+        assert not check.blocking
+
+    def test_a_reserve_larger_than_the_limit_yields_zero(self):
+        assert gates.unhedged_headroom(
+            intent(), 0.0, ONLY_UNHEDGED, recovery_reserve=UNHEDGED * 2
+        ) == 0.0
+
+    def test_headroom_never_enlarges_a_request(self):
+        for requested in (250.0, 1_000.0, 5_000.0, ORDER):
+            decision = decide(
+                intent(notional=requested), hedge_tolerance_notional=RESERVE
+            )
+            assert decision.approved_notional <= requested + 1e-9
+
+
+class TestTheReserveIsPreTradeOnly:
+    """§15, §16 — it must not leak into the emergency layer or the dashboard."""
+
+    def test_the_kill_switch_knows_nothing_about_it(self):
+        """§15 / §20-F. The backstop watches the actual hard limit at 10,000.
+        Moving it to 9,500 would turn a safety margin into a second, hidden
+        ceiling and defeat the point of having a margin at all."""
+        import inspect
+
+        from risk.kill_switch import KillSwitchInputs, live_risk_breaches
+
+        source = inspect.getsource(live_risk_breaches)
+        assert "hedge_tolerance" not in source
+        assert "recovery_reserve" not in source
+        assert "inputs.unhedged_notional" in source
+        assert not hasattr(
+            KillSwitchInputs(portfolio=context().portfolio, health=None),
+            "hedge_tolerance_notional",
+        )
+
+    def test_the_backstop_still_fires_only_at_the_hard_limit(self):
+        """A residual inside the hard limit but past the effective entry
+        budget is not an emergency — it is exactly the room the reserve was
+        set aside to provide."""
+        from core.config import load_settings, simulated_venues
+        from risk.kill_switch import KillSwitchInputs, live_risk_breaches
+
+        settings = load_settings().model_copy(
+            update={"venues": simulated_venues()}
+        )
+        inside = KillSwitchInputs(
+            portfolio=context().portfolio,
+            health=None,
+            unhedged_notional=EFFECTIVE + 100.0,
+        )
+        assert live_risk_breaches(inside, settings) == []
+
+        outside = KillSwitchInputs(
+            portfolio=context().portfolio,
+            health=None,
+            unhedged_notional=UNHEDGED + 0.01,
+        )
+        assert live_risk_breaches(outside, settings) == ["MAX_UNHEDGED_EXPOSURE"]
+
+    def test_utilization_reports_neither_the_reserve_nor_a_reduced_limit(self):
+        """§16 / §20-G. ``unhedged_notional`` stays the actual filled-book
+        residual and ``max_unhedged_notional`` stays the real ceiling."""
+        engine = core(ONLY_UNHEDGED)
+        util = engine.utilization(
+            context().portfolio,
+            2_000.0,
+            {SYMBOL: 0.0},
+            CommittedExposure(unhedged_fill_risk=7_000.0),
+        )
+        assert util.unhedged_notional == pytest.approx(2_000.0)
+        assert util.pending_unhedged_fill_risk == pytest.approx(7_000.0)
+        assert util.max_unhedged_notional == pytest.approx(UNHEDGED)
