@@ -127,9 +127,12 @@ class TestFlattenOnlyCloses:
             "exit path so the quantity-from-position rule applies"
         )
 
-    def test_flatten_visits_only_states_that_hold_a_position(self):
+    def test_flatten_visits_every_state_that_can_hold_exposure(self):
+        """EXECUTING joined the list in Remediation C (P5-6): a partly-filled
+        entry holds a position too, and its remaining orders are exactly the
+        ones a flatten needs to have cancelled out from under it."""
         source = inspect.getsource(Orchestrator._flatten)
-        for state in ("MONITORING", "RECONCILING", "HEDGING"):
+        for state in ("EXECUTING", "MONITORING", "RECONCILING", "HEDGING"):
             assert f"StrategyState.{state}" in source
 
     def test_the_kill_switch_acknowledges_flatten_so_it_runs_once(self):

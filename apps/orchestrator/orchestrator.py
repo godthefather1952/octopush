@@ -717,7 +717,14 @@ class Orchestrator:
             default=0,
         )
         await self.okapi.publish_deltas(portfolio)
+        # Derived once, here, and passed in. The kill switch's live-breach
+        # predicate has to be looking at the same exposure this tick's
+        # risk-utilization snapshot and RUNE's own gates are looking at; three
+        # branches each re-deriving it is how two safety layers come to
+        # disagree about what the platform currently holds.
         unhedged = self.okapi.total_unhedged(portfolio)
+        committed = self._current_committed_exposure()
+        strategy_exposure = self._current_strategy_exposure()
 
         fired = await self.kill_switch.evaluate(
             KillSwitchInputs(
@@ -730,9 +737,15 @@ class Orchestrator:
                 ),
                 max_latency_ms=float(max_age),
                 storage_ok=self._storage_ok(),
+                # The catastrophic-anomaly level. A breach of
+                # ``max_unhedged_notional`` itself is caught one layer earlier,
+                # by RISK_LIMIT_BREACH reading ``unhedged_notional`` below.
                 unexpected_position=abs(unhedged)
                 > self.settings.risk.max_unhedged_notional * 3,
                 required_components=REQUIRED_COMPONENTS,
+                committed_exposure=committed,
+                strategy_exposure=strategy_exposure,
+                unhedged_notional=unhedged,
             )
         )
         self.state.kill_switch = self.kill_switch.state
@@ -1499,9 +1512,32 @@ class Orchestrator:
         await self._finish_attribution(record)
 
     async def _flatten(self, market: MarketState) -> None:
-        """Kill-switch flatten: unwind every open opportunity immediately."""
+        """Kill-switch flatten: unwind every open opportunity immediately.
+
+        EXECUTING IS IN THE LIST DELIBERATELY
+        ====================================
+        It used to be the omission (P5-6). EXECUTING is precisely the state
+        whose entry orders may still be live or partly filled, so skipping it
+        left the trade the flatten most needed to reach untouched — neither
+        cancelled by the old action sets nor unwound here.
+        ``EXECUTING -> EXITING`` was already a legal transition; nothing about
+        the state machine changed to allow this.
+
+        CANCEL_ALL has already run by the time this is reached — every action
+        set that flattens also cancels, and ``_protect`` applies cancel before
+        flatten — so an EXECUTING record's resting entry orders are
+        cancel-pending before its position is unwound.
+
+        ``_submit_exit`` sizes from the position that ACTUALLY exists, never
+        from the notional RUNE authorised: whatever portion of an entry has
+        filled is in the account, and whatever has not is being cancelled. An
+        order that wins the race and fills after the cancel leaves a residual,
+        which the ordinary EXITING logic then notices and works down through
+        its retries and OKAPI's standing hedge loop.
+        """
         for record in self.state.open_opportunities():
             if record.state in (
+                StrategyState.EXECUTING,
                 StrategyState.MONITORING,
                 StrategyState.RECONCILING,
                 StrategyState.HEDGING,

@@ -89,6 +89,10 @@ class TestTriggerInventory:
         External validation reported TWO such mappings, and they are different
         findings, so each has its own test below rather than being lumped into
         one list. This test records the inventory that produced them.
+
+        ``RISK_LIMIT_BREACH`` left the list in Remediation C, which gave it a
+        predicate in :data:`TRIGGERS`. ``AGENT_FAILURE`` (P5-17) is
+        deliberately untouched and is the only dead mapping that remains.
         """
         callers = _explicit_engage_calls()
         unreachable = sorted(
@@ -97,8 +101,8 @@ class TestTriggerInventory:
             # MANUAL is operator-invoked by design; see the test below.
             if name != "MANUAL" and name not in TRIGGERS and name not in callers
         )
-        assert unreachable == ["AGENT_FAILURE", "RISK_LIMIT_BREACH"], (
-            "the set of unreachable action mappings changed; the two findings "
+        assert unreachable == ["AGENT_FAILURE"], (
+            "the set of unreachable action mappings changed; the findings "
             f"below are scoped to the old set. Now: {unreachable}"
         )
 
@@ -169,8 +173,13 @@ class TestTriggerInventory:
             "MARKET_DATA_OUTAGE",
         }
         for immediate in ("MAX_DRAWDOWN_BREACHED", "MAX_DAILY_LOSS_BREACHED",
-                          "BOOK_CORRUPTION", "RECONCILIATION_MISMATCH"):
-            assert CONFIRMATIONS.get(immediate, 1) == 1
+                          "BOOK_CORRUPTION", "RECONCILIATION_MISMATCH",
+                          "RISK_LIMIT_BREACH"):
+            assert CONFIRMATIONS.get(immediate, 1) == 1, (
+                f"{immediate} is a breached hard boundary, true the first tick "
+                "it is observed; a confirmation delay would leave the platform "
+                "trading through it"
+            )
 
 
 def _explicit_engage_calls() -> set[str]:
@@ -191,16 +200,22 @@ def _explicit_engage_calls() -> set[str]:
     return names
 
 
-class TestNoAutomaticExposureBreachDetection:
+class TestAutomaticExposureBreachDetection:
     """H8, stated as the invariant rather than as an inventory question.
 
     Every configured hard exposure limit should have SOME automatic path that
     notices a live breach. Pre-trade gates cannot provide it: they run before a
     trade, and the states this is about arise after one.
+
+    Remediation C supplies that path — ``RISK_LIMIT_BREACH``, evaluated every
+    protected tick against filled plus committed exposure.
     """
 
     #: Limits whose breach is a live-portfolio condition rather than a
-    #: pre-trade projection.
+    #: pre-trade projection. ``max_unhedged_notional`` is in the list because
+    #: it too is a configured hard maximum on a live measurement, and the
+    #: production probe breached it at 25,103 against 10,000 while the only
+    #: emergency path watching it waited for three times that.
     LIVE_EXPOSURE_LIMITS = [
         "max_gross_exposure",
         "max_net_exposure",
@@ -208,6 +223,7 @@ class TestNoAutomaticExposureBreachDetection:
         "max_strategy_exposure",
         "max_position_notional",
         "max_leverage",
+        "max_unhedged_notional",
     ]
 
     def test_drawdown_and_daily_loss_do_have_detection(self):
@@ -215,12 +231,23 @@ class TestNoAutomaticExposureBreachDetection:
         assert "MAX_DRAWDOWN_BREACHED" in TRIGGERS
         assert "MAX_DAILY_LOSS_BREACHED" in TRIGGERS
 
-    def test_unhedged_exposure_has_a_detection_path(self):
-        """``UNEXPECTED_POSITION`` is fed from the orchestrator's unhedged
-        measurement, so this dimension is watched."""
+    def test_unhedged_exposure_is_watched_at_two_levels(self):
+        """Its own limit and the catastrophic multiple, not one or the other.
+
+        ``UNEXPECTED_POSITION`` remains the 3x anomaly trigger — it is not
+        weakened or removed — but a breach of ``max_unhedged_notional`` itself
+        is now caught by ``RISK_LIMIT_BREACH`` one layer earlier. Between the
+        two there used to be a band where the configured hard limit said
+        unsafe and the emergency layer said nothing.
+        """
         assert "UNEXPECTED_POSITION" in TRIGGERS
+        assert "RISK_LIMIT_BREACH" in TRIGGERS
         source = inspect.getsource(Orchestrator._protect)
         assert "unexpected_position=abs(unhedged)" in source
+        assert "max_unhedged_notional * 3" in source, "the 3x layer must remain"
+        assert "unhedged_notional=unhedged," in source, (
+            "the measurement must also reach the own-limit predicate"
+        )
 
     @pytest.mark.parametrize("limit_name", LIVE_EXPOSURE_LIMITS)
     def test_every_live_exposure_limit_has_an_automatic_breach_trigger(self, limit_name):
@@ -232,8 +259,14 @@ class TestNoAutomaticExposureBreachDetection:
             f"is defined but unreachable. Triggers read: {sorted(watched)}"
         )
 
-    async def test_a_portfolio_past_gross_exposure_fires_nothing(self):
-        """Diagnostic: the concrete state, run through the real evaluator."""
+    async def test_a_portfolio_past_gross_exposure_now_engages_the_switch(self):
+        """The invariant this class exists for, run through the real evaluator.
+
+        This assertion used to record the defect — a portfolio at double the
+        gross limit fired nothing and trading carried on. It is inverted
+        rather than deleted so the same concrete state still proves the
+        opposite claim.
+        """
         engine = switch()
         limit = engine.settings.risk.max_gross_exposure
         book = portfolio_with(
@@ -241,26 +274,46 @@ class TestNoAutomaticExposureBreachDetection:
         )
         assert book.gross_exposure > limit
         fired = await engine.evaluate(inputs(portfolio=book))
-        assert fired == [], (
-            "recorded for the report: a portfolio at "
-            f"{book.gross_exposure} against a {limit} gross limit fires "
-            f"{fired}"
+        assert "RISK_LIMIT_BREACH" in fired, (
+            f"a portfolio at {book.gross_exposure} against a {limit} gross "
+            f"limit fired {fired}"
         )
-        assert engine.state.trading_allowed, (
-            "and trading is still permitted afterwards"
-        )
+        assert not engine.state.trading_allowed
+        assert engine.state.cancel_all_requested
+        assert engine.state.flatten_requested
 
 
 def _limits_read_by_triggers() -> set[str]:
-    """Which ``settings.risk`` fields the trigger predicates actually consult."""
+    """Which ``settings.risk`` fields the trigger predicates actually consult.
+
+    Follows one level of delegation into :mod:`risk.kill_switch`'s own
+    helpers. ``_risk_limit_breach`` is a thin wrapper over
+    ``live_risk_breaches``, which is where the limits are read — a scan of the
+    predicate body alone would report detection absent when it is real. The
+    resolution is generic (any module-level function the predicate calls),
+    not a special case for one name, so a future predicate that delegates
+    differently is still seen.
+    """
+    import risk.kill_switch as ks
     from core.config import RiskLimits
+
+    def sources(predicate) -> list[str]:
+        body = inspect.getsource(predicate)
+        out = [body]
+        for name, value in vars(ks).items():
+            if callable(value) and f"{name}(" in body and value is not predicate:
+                try:
+                    out.append(inspect.getsource(value))
+                except (OSError, TypeError):
+                    continue
+        return out
 
     watched: set[str] = set()
     for predicate in TRIGGERS.values():
-        source = inspect.getsource(predicate)
-        for field in RiskLimits.model_fields:
-            if f"settings.risk.{field}" in source:
-                watched.add(field)
+        for source in sources(predicate):
+            for field in RiskLimits.model_fields:
+                if f"settings.risk.{field}" in source or f"limits.{field}" in source:
+                    watched.add(field)
     return watched
 
 
@@ -432,10 +485,22 @@ class TestDisableExecutionRecovery:
 class TestFlattenAndLiveOrders:
     """H11 — can a previously-live opening order undo a flatten?"""
 
-    LOSS_TRIGGERS = ("MAX_DRAWDOWN_BREACHED", "MAX_DAILY_LOSS_BREACHED")
+    #: Every trigger that flattens, derived rather than listed, so a trigger
+    #: added later cannot slip past the invariant below.
+    FLATTEN_TRIGGERS = sorted(
+        name
+        for name, actions in TRIGGER_ACTIONS.items()
+        if KillAction.FLATTEN in actions
+    )
 
-    @pytest.mark.parametrize("trigger", LOSS_TRIGGERS)
-    def test_a_flatten_trigger_also_cancels_resting_orders(self, trigger):
+    def test_something_actually_flattens(self):
+        """Premise for the parametrisation: the list is not empty."""
+        assert self.FLATTEN_TRIGGERS
+
+    @pytest.mark.parametrize("trigger", FLATTEN_TRIGGERS)
+    def test_every_flatten_trigger_also_cancels_resting_orders(self, trigger):
+        """The P5-6 invariant, over EVERY flatten trigger rather than the two
+        that originally failed it."""
         actions = TRIGGER_ACTIONS[trigger]
         assert KillAction.FLATTEN in actions, "premise: this trigger flattens"
         assert KillAction.CANCEL_ALL in actions, (
@@ -445,9 +510,20 @@ class TestFlattenAndLiveOrders:
             f"action just closed. Actions: {[a.value for a in actions]}"
         )
 
-    def test_flatten_only_visits_states_with_no_opening_orders(self):
-        """The other half: even with CANCEL_ALL absent, a flatten that also
-        handled EXECUTING records would close the window."""
+    @pytest.mark.parametrize("trigger", FLATTEN_TRIGGERS)
+    def test_no_flatten_trigger_disables_execution(self, trigger):
+        """Closing a position is itself a submission. A trigger that must
+        reduce exposure and also refuses to submit cannot carry out its own
+        response."""
+        actions = TRIGGER_ACTIONS[trigger]
+        assert KillAction.DISABLE_EXECUTION not in actions, (
+            f"{trigger} flattens but also disables execution, so the exit "
+            "orders its own flatten needs can never be submitted"
+        )
+
+    def test_flatten_visits_the_state_whose_orders_are_still_live(self):
+        """EXECUTING is where entry orders may still be resting or partly
+        filled — exactly the record a flatten most needs to reach (P5-6)."""
         source = inspect.getsource(Orchestrator._flatten)
         assert "StrategyState.MONITORING" in source
         assert "StrategyState.EXECUTING" in source, (
@@ -456,12 +532,29 @@ class TestFlattenAndLiveOrders:
             "cancelled by the action set nor unwound by the flatten"
         )
 
+    def test_executing_to_exiting_is_a_legal_transition(self):
+        """Flattening an EXECUTING record needs no state-machine change."""
+        from core.models.opportunity import STRATEGY_TRANSITIONS, StrategyState
+
+        assert (
+            StrategyState.EXITING in STRATEGY_TRANSITIONS[StrategyState.EXECUTING]
+        )
+
+    def test_the_exit_is_sized_from_the_position_not_the_authorisation(self):
+        """A flattened EXECUTING record may be only partly filled. Sizing its
+        exit from the notional RUNE authorised would try to close more than
+        exists; the quantity actually held is the only correct amount."""
+        source = inspect.getsource(Orchestrator._submit_exit)
+        assert "quantity = abs(position.quantity)" in source
+        assert "approved_notional" not in source.split("legs.append(")[0]
+
     def test_cancel_all_is_applied_before_flatten_in_the_tick(self):
         """Ordering matters: cancelling after flattening would leave the same
-        window. Recorded as a control for whichever remediation is chosen."""
+        window — the flatten closes the position, then a still-resting entry
+        order fills and re-opens it."""
         source = inspect.getsource(Orchestrator._protect)
-        cancel_at = source.index("cancel_all_requested")
-        flatten_at = source.index("flatten_requested")
+        cancel_at = source.index("if self.kill_switch.state.cancel_all_requested:")
+        flatten_at = source.index("if self.kill_switch.state.flatten_requested:")
         assert cancel_at < flatten_at
 
     async def test_market_data_outage_holds_positions_deliberately(self):
