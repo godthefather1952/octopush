@@ -40,7 +40,7 @@ from core.events import Event, EventType
 from core.health import HealthRegistry
 from core.models.agent import AgentOpinion, ConsensusResult
 from core.models.common import AgentId, Millis, Side
-from core.models.execution import FillEvent, OrderStatus
+from core.models.execution import ExecutionRole, FillEvent, OrderStatus
 from core.models.market import MarketState, safe_bps
 from core.models.opportunity import (
     STRATEGY_TRANSITIONS,
@@ -1102,6 +1102,9 @@ class Orchestrator:
             max_slippage_bps=max(1.0, opportunity.gross_edge_bps * 0.5),
             deadline_ms=now + self.settings.risk.max_data_age_ms,
             urgency=min(1.0, 0.5 + result.agreement / 2),
+            # Risk-increasing activity. Metadata only in Phase 6: nothing sizes
+            # or routes from it yet (docs/phase6-veska-framework.md).
+            execution_role=ExecutionRole.ENTRY,
         )
 
     async def _risk_check(
@@ -1431,6 +1434,13 @@ class Orchestrator:
             deadline_ms=now + self.settings.risk.max_data_age_ms,
             urgency=1.0,
             is_exit=True,
+            # Risk-reducing: this closes a position the platform already holds.
+            # ``_flatten`` reaches this same path under an engaged kill switch,
+            # where FLATTEN would be the more precise word; distinguishing the
+            # two would mean threading a flag through _submit_exit, which is a
+            # behavioural change this construction pass does not make. Recorded
+            # as a deferred extension in the framework doc.
+            execution_role=ExecutionRole.EXIT,
         )
         # Exits are not gated on edge or consensus: refusing to close a
         # position because the trade is no longer attractive is how a platform
@@ -1507,6 +1517,11 @@ class Orchestrator:
                 deadline_ms=now + self.settings.risk.max_data_age_ms,
                 urgency=hedge.urgency,
                 is_exit=True,
+                # Risk-reducing, but not an exit: a hedge neutralises a
+                # residual delta rather than closing a trade. ``is_exit`` stays
+                # True because every existing reader uses it to mean "not an
+                # entry", which is still correct.
+                execution_role=ExecutionRole.HEDGE,
             )
             decision = RiskDecision(
                 created_at=now,

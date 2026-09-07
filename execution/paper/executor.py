@@ -37,7 +37,16 @@ from core.clock import Clock
 from core.config import Settings
 from core.events import Event, EventType
 from core.models.common import QTY_EPSILON, Millis
-from core.models.execution import ExecutionReport, FillEvent, OrderStatus, PaperOrder
+from core.models.execution import (
+    ExecutionCommandResult,
+    ExecutionReport,
+    ExecutionSnapshot,
+    ExecutorCapabilities,
+    FillEvent,
+    OrderStatus,
+    OrderSummary,
+    PaperOrder,
+)
 from core.models.market import MarketState, PriceLevel
 from core.models.opportunity import ExecutionPlan
 from execution.oms import OrderManager
@@ -48,6 +57,36 @@ from execution.veska.executor import Executor
 log = logging.getLogger(__name__)
 
 SERVICE = "PAPER_EXECUTOR"
+
+NAME = "paper"
+VERSION = "paper-executor-0.2"
+
+#: What this executor claims to implement.
+#:
+#: Written to describe the CURRENT implementation rather than an aspiration.
+#: ``supports_market`` is False because the router never emits a MARKET order
+#: and the fill path has never been exercised for one; ``supports_fok`` is
+#: False because nothing here distinguishes fill-or-kill from any other
+#: marketable instruction. Declaring either True would be a claim this build
+#: has not earned.
+#:
+#: A capability being True is a statement of intent, not a proof. Whether the
+#: implementation honours what it advertises is a validation question, and this
+#: construction pass does not answer it.
+PAPER_CAPABILITIES = ExecutorCapabilities(
+    is_paper=True,
+    supports_market=False,
+    supports_limit=True,
+    supports_ioc=True,
+    supports_fok=False,
+    supports_post_only=True,
+    supports_gtc=True,
+    supports_cancel=True,
+    supports_cancel_all=True,
+    supports_order_lookup=True,
+    supports_unknown_resolution=True,
+    supports_execution_snapshot=True,
+)
 
 
 @dataclass
@@ -305,8 +344,143 @@ class PaperExecutor(Executor):
         )
         await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
 
+    # -- identity ----------------------------------------------------------
+
+    @property
+    def name(self) -> str:
+        return NAME
+
+    @property
+    def version(self) -> str:
+        return VERSION
+
+    @property
+    def capabilities(self) -> ExecutorCapabilities:
+        return PAPER_CAPABILITIES
+
+    # -- unknown resolution ------------------------------------------------
+
+    async def resolve_unknown(
+        self,
+        client_order_id: str,
+        authoritative_status: OrderStatus,
+        now_ms: Millis,
+    ) -> ExecutionCommandResult:
+        """Apply an authoritative answer to an UNKNOWN order.
+
+        NOTHING HERE DECIDES WHAT THE ANSWER IS
+        =======================================
+        The caller supplies ``authoritative_status`` because the caller is the
+        one holding evidence. This executor has none: the paper venue is this
+        object, and it does not learn anything by being asked again. It refuses
+        to resolve an order that is not UNKNOWN, and it never invents a status.
+
+        Nothing in this build calls this. It is the seam reconciliation (Phase
+        7) will use when it has a venue's answer to apply, and it exists now so
+        that when it does, it will not have to reach into the OMS.
+        """
+        order = self.oms.get(client_order_id)
+        if order is None:
+            return ExecutionCommandResult(
+                accepted=False,
+                client_order_id=client_order_id,
+                reason="no such order",
+                at_ms=now_ms,
+            )
+        if order.status is not OrderStatus.UNKNOWN:
+            return ExecutionCommandResult(
+                accepted=False,
+                client_order_id=client_order_id,
+                plan_id=order.plan_id,
+                status=order.status,
+                reason=f"order is {order.status.value}, not UNKNOWN",
+                at_ms=now_ms,
+            )
+
+        self.oms.resolve_unknown(client_order_id, authoritative_status)
+        await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
+        return ExecutionCommandResult(
+            accepted=True,
+            client_order_id=client_order_id,
+            plan_id=order.plan_id,
+            status=order.status,
+            reason="resolved by an authoritative caller",
+            at_ms=now_ms,
+        )
+
+    # -- queries -----------------------------------------------------------
+
     def open_orders(self) -> list[PaperOrder]:
+        """Orders known to be working. Excludes UNKNOWN — see below."""
         return self.oms.live_orders()
+
+    def outstanding_orders(self) -> list[PaperOrder]:
+        """Orders whose final venue truth is not yet known.
+
+        Everything :meth:`open_orders` returns, plus the UNKNOWN ones. The
+        difference is exactly the set of orders that might still turn out to
+        have traded while nobody can say so.
+        """
+        return self.oms.outstanding_orders()
+
+    def unknown_orders(self) -> list[PaperOrder]:
+        return self.oms.unknown_orders()
+
+    def all_orders(self) -> list[PaperOrder]:
+        return self.oms.all_orders()
+
+    def get_order(self, client_order_id: str) -> PaperOrder | None:
+        return self.oms.get(client_order_id)
+
+    def orders_for_plan(self, plan_id: str) -> list[PaperOrder]:
+        return self.oms.orders_for_plan(plan_id)
+
+    def execution_snapshot(self, now_ms: Millis) -> ExecutionSnapshot:
+        """What this executor believes at the supplied logical instant.
+
+        Built entirely from the OMS, which is the book of record. Nothing here
+        keeps a second copy of order state to fall out of step with it.
+        """
+        resident = self.oms.all_orders()
+        return ExecutionSnapshot(
+            created_at=now_ms,
+            orders=[OrderSummary.of(o) for o in resident],
+            open_order_ids=[o.client_order_id for o in resident if o.is_live],
+            outstanding_order_ids=[
+                o.client_order_id for o in resident if o.is_outstanding
+            ],
+            unknown_order_ids=[
+                o.client_order_id
+                for o in resident
+                if o.status is OrderStatus.UNKNOWN
+            ],
+            counts_by_status=self.oms.counts_by_status(),
+            fills_applied=self.oms.fills_applied,
+            orders_created=self.oms.orders_created,
+            duplicate_fills=self.oms.duplicate_fills,
+            illegal_transitions=self.oms.illegal_transitions,
+            archived_orders=self.oms.archived.count,
+        )
+
+    # -- retention ---------------------------------------------------------
+
+    def compact_terminal_state(self, *, unsealed_fills: set[str]) -> int:
+        """Release per-order bookkeeping the platform has finished with.
+
+        Delegates the order-side decision to ``OrderManager.compact``, which
+        already refuses anything that is not terminal or whose fills are still
+        awaiting reconciliation — and therefore never touches an UNKNOWN order,
+        because UNKNOWN is not terminal.
+
+        This executor's own ``_pending`` records are deliberately left alone in
+        this construction pass. Deciding when a venue-side timing record stops
+        being needed is a retention question with a safety edge (an UNKNOWN
+        order's arrival and cancel schedule are still needed if it ever
+        resolves), and answering it by deleting things now would be exactly the
+        kind of unmeasured change this phase is meant to avoid. The hook is
+        here; the policy is not.
+        """
+        return self.oms.compact(unsealed_fills)
 
     async def _publish_order(
         self, order: PaperOrder, event_type: EventType, now_ms: Millis

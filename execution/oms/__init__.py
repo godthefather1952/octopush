@@ -216,14 +216,44 @@ class OrderManager:
     def get(self, client_order_id: str) -> PaperOrder | None:
         return self.orders.get(client_order_id)
 
+    def all_orders(self) -> list[PaperOrder]:
+        """Every resident order, whatever its state.
+
+        Resident, not historical: an order compacted into :attr:`archived` is
+        gone from here by design, and its totals live there instead.
+        """
+        return list(self.orders.values())
+
     def live_orders(self) -> list[PaperOrder]:
+        """Orders known to be working. Excludes UNKNOWN, which is not known."""
         return [o for o in self.orders.values() if o.is_live]
+
+    def outstanding_orders(self) -> list[PaperOrder]:
+        """Orders whose final venue truth is not yet known.
+
+        Everything :meth:`live_orders` returns, plus the UNKNOWN ones. The two
+        differ only there, and the difference is the point: a caller asking
+        "what is still working?" wants the first, and a caller asking "what
+        might still turn out to have traded?" wants this.
+        """
+        return [o for o in self.orders.values() if o.is_outstanding]
+
+    def terminal_orders(self) -> list[PaperOrder]:
+        """Orders that have stopped moving. Never includes UNKNOWN."""
+        return [o for o in self.orders.values() if o.is_terminal]
 
     def unknown_orders(self) -> list[PaperOrder]:
         return [o for o in self.orders.values() if o.status is OrderStatus.UNKNOWN]
 
     def orders_for_plan(self, plan_id: str) -> list[PaperOrder]:
         return [o for o in self.orders.values() if o.plan_id == plan_id]
+
+    def counts_by_status(self) -> dict[str, int]:
+        """Resident order counts, keyed by status value."""
+        counts: dict[str, int] = {}
+        for order in self.orders.values():
+            counts[order.status.value] = counts.get(order.status.value, 0) + 1
+        return counts
 
     def all_fills(self) -> list[FillEvent]:
         return [fill for order in self.orders.values() for fill in order.fills]

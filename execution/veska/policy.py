@@ -1,0 +1,117 @@
+"""Execution policy — what an order type and time-in-force *mean*.
+
+One canonical location for the semantics of ``TimeInForce`` and ``OrderType``,
+so that the executor, the router, a preflight check and a future live adapter
+all answer "may this order rest?" the same way instead of each re-deriving it
+from an ``in`` test at the call site.
+
+WHAT THIS MODULE IS, AND IS NOT
+===============================
+It is a statement of intent: what the platform means by IOC, FOK, POST_ONLY and
+GTC. It is pure — no state, no clock, no configuration — so it can be read by
+anything without a dependency.
+
+It is **not** an enforcement layer, and this construction pass deliberately
+does not wire it into ``PaperExecutor``'s fill loop. Whether the executor's
+behaviour matches these definitions is exactly what a later validation pass
+exists to determine; changing the loop now would answer that question by
+assertion rather than by evidence, and would move the goalposts before the
+measurement.
+
+The one thing this module does establish is that there is now a single place to
+change if the answer turns out to be no.
+"""
+
+from __future__ import annotations
+
+from core.models.common import OrderType, TimeInForce
+
+#: Every time-in-force the schemas accept.
+ALL_TIME_IN_FORCE: frozenset[TimeInForce] = frozenset(TimeInForce)
+
+#: Those that grant exactly one executable attempt on arrival.
+IMMEDIATE: frozenset[TimeInForce] = frozenset({TimeInForce.IOC, TimeInForce.FOK})
+
+#: Those whose unfilled remainder may stay on the book.
+RESTING: frozenset[TimeInForce] = frozenset({TimeInForce.GTC, TimeInForce.POST_ONLY})
+
+#: Those that must fill in full or not at all.
+ALL_OR_NOTHING: frozenset[TimeInForce] = frozenset({TimeInForce.FOK})
+
+#: Those that must never remove liquidity.
+MAKER_ONLY: frozenset[TimeInForce] = frozenset({TimeInForce.POST_ONLY})
+
+
+def is_immediate(tif: TimeInForce) -> bool:
+    """One executable attempt on arrival; any remainder terminates at once."""
+    return tif in IMMEDIATE
+
+
+def can_rest(tif: TimeInForce) -> bool:
+    """Whether an unfilled remainder may stay working on the book."""
+    return tif in RESTING
+
+
+def requires_full_fill(tif: TimeInForce) -> bool:
+    """Whether a partial fill is an illegal outcome for this instruction."""
+    return tif in ALL_OR_NOTHING
+
+
+def must_not_take(tif: TimeInForce) -> bool:
+    """Whether this order is forbidden from removing liquidity.
+
+    A post-only order that would cross on arrival is rejected or repriced by a
+    real venue precisely so that it cannot take. That is the meaning; enforcing
+    it is a later pass's work.
+    """
+    return tif in MAKER_ONLY
+
+
+def expects_maker_fee(tif: TimeInForce) -> bool:
+    """Whether a fill under this instruction should be priced at the maker tier.
+
+    Only true where the instruction guarantees the order added liquidity. GTC
+    can do either, so it is not included: its liquidity flag has to come from
+    what actually happened, not from the instruction.
+    """
+    return tif in MAKER_ONLY
+
+
+def crosses_by_construction(order_type: OrderType, tif: TimeInForce) -> bool:
+    """Whether this combination is an aggressive instruction.
+
+    A MARKET order always crosses. A LIMIT order crosses when its
+    time-in-force says it gets one immediate attempt.
+    """
+    return order_type is OrderType.MARKET or is_immediate(tif)
+
+
+def describe(order_type: OrderType, tif: TimeInForce) -> str:
+    """A short human-readable statement of the instruction's meaning."""
+    parts = [f"{order_type.value} {tif.value}"]
+    parts.append("aggressive" if crosses_by_construction(order_type, tif) else "passive")
+    if requires_full_fill(tif):
+        parts.append("all-or-nothing")
+    if must_not_take(tif):
+        parts.append("must not take")
+    if can_rest(tif):
+        parts.append("may rest")
+    else:
+        parts.append("terminates on arrival")
+    return "; ".join(parts)
+
+
+__all__ = [
+    "ALL_OR_NOTHING",
+    "ALL_TIME_IN_FORCE",
+    "IMMEDIATE",
+    "MAKER_ONLY",
+    "RESTING",
+    "can_rest",
+    "crosses_by_construction",
+    "describe",
+    "expects_maker_fee",
+    "is_immediate",
+    "must_not_take",
+    "requires_full_fill",
+]

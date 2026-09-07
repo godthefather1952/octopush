@@ -14,6 +14,7 @@ from core.models.common import (
     TimeInForce,
     new_id,
 )
+from core.models.execution import ExecutionRole
 
 
 class OpportunityKind(StrEnum):
@@ -155,7 +156,16 @@ class TradeIntent(Envelope):
     deadline_ms: Millis
     urgency: float = Field(default=0.5, ge=0.0, le=1.0)
     #: Set when the intent is an exit rather than an entry.
+    #:
+    #: Kept as the authoritative flag for every existing reader. Phase 6 adds
+    #: :attr:`execution_role` beside it, which says the same thing with more
+    #: resolution (an exit and a hedge are both "not an entry", and they are
+    #: not the same activity). Nothing was migrated off ``is_exit`` in the
+    #: construction pass; which readers should move is a validation question.
     is_exit: bool = False
+    #: Why this intent exists, in risk terms. Defaults to ENTRY so every
+    #: existing construction site keeps its current meaning without change.
+    execution_role: ExecutionRole = ExecutionRole.ENTRY
 
 
 class PlannedOrder(Base):
@@ -177,7 +187,16 @@ class PlannedOrder(Base):
 
 
 class ExecutionPlan(Envelope):
-    """VESKA's concrete plan for an authorised intent."""
+    """VESKA's concrete plan for an authorised intent.
+
+    ``notional`` is the **per-leg** notional RUNE authorised, and every
+    existing reader treats it that way — the gross a plan consumes is
+    ``notional * len(orders)`` (P5-2). That meaning is unchanged. Phase 6 adds
+    :attr:`requested_notional` and :attr:`approved_notional` beside it so the
+    distinction between what was asked for and what was authorised is explicit
+    rather than reconstructed from the risk decision, and so a plan carries its
+    own origin without a reader searching orchestrator state.
+    """
 
     plan_id: str = Field(default_factory=lambda: new_id("plan"))
     intent_id: str
@@ -186,8 +205,21 @@ class ExecutionPlan(Envelope):
     orders: list[PlannedOrder]
     deadline_ms: Millis
     max_slippage_bps: float
+    #: Per-leg approved notional. Canonical meaning, unchanged.
     notional: float
+    #: What the orchestrator asked for, before risk sizing. Per-leg.
+    requested_notional: float = 0.0
+    #: What RUNE authorised. Per-leg, and equal to ``notional``; carried
+    #: separately so the pair reads unambiguously beside ``requested_notional``.
+    approved_notional: float = 0.0
+    #: Why this plan exists, in risk terms. Copied from the intent.
+    execution_role: ExecutionRole = ExecutionRole.ENTRY
 
     @property
     def total_quantity(self) -> float:
         return sum(o.quantity for o in self.orders)
+
+    @property
+    def gross_notional(self) -> float:
+        """What this plan consumes of a gross budget: per-leg times legs."""
+        return self.notional * len(self.orders)
