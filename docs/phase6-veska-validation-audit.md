@@ -1,6 +1,6 @@
 # Phase 6 — VESKA / paper-execution validation audit
 
-**Status: AUDIT CONSTRUCTED. TESTS NOT RUN.**
+**Status: AUDIT HARNESS CORRECTED / EXTERNAL RERUN REQUIRED.**
 
 **PRODUCTION CHANGES: NONE.**
 
@@ -20,7 +20,7 @@ Nothing here has been fixed, weakened, skipped or xfailed.
 > fully-accounted paper-order lifecycle without silently creating more risk
 > than RUNE authorised, or treating unresolved venue truth as resolved?
 
-Statically: **no, not yet.** Four findings are CRITICAL, five HIGH.
+Current finding inventory: **no, not yet.** Four findings are CRITICAL, eight HIGH.
 
 ## Baseline
 
@@ -32,6 +32,70 @@ Statically: **no, not yet.** Four findings are CRITICAL, five HIGH.
 | Audit branch | `validate-phase6-veska` |
 | Production changes | **NONE** |
 | Files added | `tests/audit/veska_fixtures.py`, `tests/audit/test_phase6_*.py` (16 modules), this document |
+
+## External validation — CI #53
+
+GitHub Actions run **#53** (run id `34161779859`) executed audit SHA
+`50e139622352e55515947e17b482e4c0e4c43a7b`.
+
+Full-suite result:
+
+- **3224 passed**
+- **215 failed**
+- **2 skipped**
+- **1 warning**
+
+The raw 215 failures are **not** the Phase 6 defect count. One failure already
+existed on the full-frame baseline, and 191 Phase 6 failures were blocked by an
+audit fixture that constructed `OrderBookSnapshot` with the wrong schema.
+
+At the moment CI #53 completed, the correct diagnosis was:
+
+**AUDIT HARNESS CORRECTION REQUIRED BEFORE BEHAVIORAL RESULTS ARE AUTHORITATIVE.**
+
+This commit corrects that harness surface. Current status is therefore:
+
+**AUDIT HARNESS CORRECTED / EXTERNAL RERUN REQUIRED.**
+
+### A. Valid product evidence
+
+- Eighteen H22 numeric/schema assertions reached production models and failed
+  independently of the broken market fixture. They establish P6-19 below.
+- `ORDER_TRANSITIONS[SUBMITTING]` contains `ACKNOWLEDGED`, `REJECTED` and
+  `UNKNOWN` only. It contains neither `CANCEL_PENDING` nor `CANCELLED`.
+  This strengthens P6-1 and corrects the audit's earlier remediation note.
+- P6-1 through P6-18 remain static findings except where this CI result
+  explicitly corrects their supporting claim. Fixture-blocked behavior is not
+  promoted to an external PASS or FAIL.
+
+### B. Invalid / blocked audit results
+
+- **191** Phase 6 tests failed before reaching execution because
+  `veska_fixtures.venue_state()` passed `created_at` to
+  `OrderBookSnapshot` and omitted required `exchange_ts` /
+  `received_ts`.
+- The non-paper VESKA guard test subclassed the `PaperExecutor` dataclass but
+  did not set the instance field `is_paper=False`; it therefore constructed
+  a paper executor and expected the wrong result.
+- Three baseline-protection tests searched their own raw source strings and
+  matched the forbidden phrases inside their own assertions/docstrings rather
+  than finding actual forbidden syntax.
+
+These are audit defects, not VESKA product defects.
+
+### C. Pre-existing baseline failures
+
+The source baseline
+`73d377e7e2e84453ed8484adf0cdac47a9e202fb` already had:
+
+- the `TF_FEED` compose contract failure because
+  `${TF_FEED:-simulated}` is not a literal member of the old contract's
+  `_FEEDS` check;
+- `I001` in `agents/marin/agent.py`;
+- `I001` in `agents/marin/source.py`;
+- `SIM102` in `agents/okapi/registry.py`.
+
+Those are deliberately unchanged and out of Phase 6 scope.
 
 ## Audit surface
 
@@ -135,11 +199,13 @@ The comment says the order "resolves once it arrives". It does not.
 during the latency window survives the cancellation and can trade. A halted
 platform does not stop what it believes it stopped.
 
-**Suggested remediation.** Transition to CANCEL_PENDING in the pre-ack branch,
-or record the request so `poll` consults `cancel_at` on arrival regardless of
-status. `SUBMITTING → CANCEL_PENDING` is already a legal transition
-(`ORDER_TRANSITIONS`), so no state-machine change is required — asserted by
-`TestTransitionLegality`.
+**Suggested remediation.** The current state machine has no direct
+`SUBMITTING → CANCEL_PENDING` or `SUBMITTING → CANCELLED` transition. A future
+production remediation therefore has at least two viable designs: (A) add an
+explicit legal pre-ack cancellation transition, or (B) retain the pending
+cancel request while SUBMITTING and have acknowledgement processing consume it
+deterministically before the order can work. This audit does not choose or
+implement either design.
 
 **Dependencies.** None. Independent of every other finding.
 
@@ -786,6 +852,52 @@ report. Either is cosmetic relative to everything above.
 
 ---
 
+### P6-19 — non-finite / invalid execution values are accepted
+
+| | |
+| --- | --- |
+| **Severity** | **HIGH** |
+| **Area** | `core/models/opportunity.py`, `core/models/execution.py` |
+| **Blocks Phase 6 validation** | Yes |
+
+**Invariant.** Execution-domain values that participate in sizing, price,
+fees, slippage or expiry must reject non-finite values and invalid negative
+durations at the model boundary.
+
+**External evidence.** CI #53 produced eighteen H22 failures that do not use
+the broken `OrderBookSnapshot` fixture and therefore reached the real Pydantic
+models. The following values were accepted when the audit required
+`ValidationError`:
+
+- `PlannedOrder.quantity = +inf`;
+- `PlannedOrder.expected_price = NaN, +inf, -inf`;
+- `PlannedOrder.limit_price = NaN, +inf`;
+- `ExecutionPlan.notional = NaN, +inf, -inf`;
+- `ExecutionPlan.max_slippage_bps = NaN, +inf`;
+- `FillEvent.fee = NaN, +inf, -inf`;
+- `FillEvent.slippage_bps = NaN, +inf, -inf`;
+- `PlannedOrder.ttl_ms = -1`.
+
+The same external run also established that `quantity = 0`, `quantity = -1`
+and `quantity = NaN` are already rejected; this finding does not generalize
+past the values above.
+
+**Consequence.** Malformed persisted, hand-built or replayed execution objects
+can carry non-finite numbers into arithmetic, comparisons, accounting or
+execution. Because Phase 6 preflight exists but is not enforced (P6-9), schema
+validation is a meaningful boundary rather than redundant defense.
+
+**Expected audit test.** `test_phase6_slippage.py::TestNumericSafety`.
+The harness now expects the precise Pydantic `ValidationError` rather than a
+blind `Exception`.
+
+**Suggested remediation.** Add finite-value and duration constraints to the
+execution-domain Pydantic models in a later production-remediation pass.
+
+**Dependencies.** Amplified by P6-9; independently confirmed by CI #53.
+
+---
+
 ## Hypothesis matrix
 
 `STATICALLY CONFIRMED` means the code was read and the defect established by
@@ -818,7 +930,7 @@ and the outcome is not knowable without running it.
 | H19 | Resource retention | **STATICALLY CONFIRMED** (`_pending`) | P6-16 | `test_phase6_resource_bounds.py` |
 | H20 | UNKNOWN retention | **STATICALLY REFUTED** — compaction refuses non-terminal orders, and UNKNOWN is not terminal | — | `test_phase6_resource_bounds.py`, `test_phase6_unknown.py` |
 | H21 | Execution report semantics | **STATICALLY CONFIRMED** | P6-18 | `test_phase6_registry.py` |
-| H22 | Numeric / schema safety | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED | — | `test_phase6_slippage.py` |
+| H22 | Numeric / schema safety | **EXTERNALLY CONFIRMED BY CI #53** | P6-19 | `test_phase6_slippage.py` |
 | H23 | Unknown venue | **PARTIALLY REFUTED** — the router cannot produce one (no market state ⇒ no route); the 40ms fallback is reachable only through a hand-built or replayed plan | — | `test_phase6_planning.py` |
 | H24 | Same-timestamp precedence | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED (behaviour pinned, not judged) | — | `test_phase6_cancel.py` |
 | H25 | Production-like probe | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED | — | `test_phase6_production_probe.py` |
@@ -931,4 +1043,4 @@ especially) need a judgement, not just a result.
   in Phase 1 and not re-litigated.
 * Nothing about the replay engine itself. H37 exercises the *property* replay
   depends on; the engine was validated in Phase 2 and is untouched.
-* **No test result whatsoever.** Every verdict above is static.
+* CI #53 supplied authoritative external evidence for H22/P6-19 and the SUBMITTING transition inventory. Fixture-blocked behavioral hypotheses still require a clean rerun.

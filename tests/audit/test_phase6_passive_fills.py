@@ -229,7 +229,7 @@ class TestPartialFillCap:
     async def test_a_passive_fill_respects_the_same_cap(self):
         """The invariant: one evaluation should not fill the whole order.
 
-        With ``max_partial_fraction`` at 0.10 an order filling 80–100% in a
+        With ``max_partial_fraction`` at 0.10 an order filling 80-100% in a
         single evaluation is a materially different execution model on the
         passive path than on the marketable one.
         """

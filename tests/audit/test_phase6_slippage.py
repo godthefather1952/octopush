@@ -37,6 +37,7 @@ from __future__ import annotations
 import inspect
 
 import pytest
+from pydantic import ValidationError
 
 from core.models.common import Liquidity, OrderType, Side, TimeInForce
 from core.models.execution import FillEvent, PaperOrder
@@ -460,7 +461,7 @@ class TestNumericSafety:
     def test_a_planned_order_rejects_a_non_positive_or_non_finite_quantity(
         self, bad: float
     ):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             PlannedOrder(
                 venue=VENUE_A,
                 symbol="BTC-USD",
@@ -474,7 +475,7 @@ class TestNumericSafety:
 
     @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
     def test_a_planned_order_rejects_a_non_finite_expected_price(self, bad: float):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             PlannedOrder(
                 venue=VENUE_A,
                 symbol="BTC-USD",
@@ -488,7 +489,7 @@ class TestNumericSafety:
 
     @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
     def test_a_planned_order_rejects_a_non_finite_limit_price(self, bad: float):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             PlannedOrder(
                 venue=VENUE_A,
                 symbol="BTC-USD",
@@ -503,7 +504,7 @@ class TestNumericSafety:
 
     @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
     def test_an_execution_plan_rejects_a_non_finite_notional(self, bad: float):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             ExecutionPlan(
                 created_at=T0,
                 intent_id="i",
@@ -519,7 +520,7 @@ class TestNumericSafety:
     def test_an_execution_plan_rejects_a_non_finite_slippage_budget(
         self, bad: float
     ):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             ExecutionPlan(
                 created_at=T0,
                 intent_id="i",
@@ -533,7 +534,7 @@ class TestNumericSafety:
 
     @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
     def test_a_fill_event_rejects_a_non_finite_fee(self, bad: float):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             FillEvent(
                 created_at=T0,
                 client_order_id="o",
@@ -548,7 +549,7 @@ class TestNumericSafety:
 
     @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
     def test_a_fill_event_rejects_a_non_finite_slippage(self, bad: float):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             FillEvent(
                 created_at=T0,
                 client_order_id="o",
@@ -564,7 +565,7 @@ class TestNumericSafety:
 
     @pytest.mark.parametrize("bad", [0.0, -1.0])
     def test_a_paper_order_rejects_a_non_positive_quantity(self, bad: float):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             PaperOrder(
                 created_at=T0,
                 venue=VENUE_A,
@@ -578,7 +579,7 @@ class TestNumericSafety:
 
     def test_a_planned_order_rejects_a_negative_ttl(self):
         """A negative TTL would set ``expires_at`` before ``created_at``."""
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             PlannedOrder(
                 venue=VENUE_A,
                 symbol="BTC-USD",

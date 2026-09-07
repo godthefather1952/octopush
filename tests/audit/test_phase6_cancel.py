@@ -329,20 +329,22 @@ class TestTransitionLegality:
         ):
             assert OrderStatus.CANCEL_PENDING in ORDER_TRANSITIONS[working]
 
-    def test_submitting_can_reach_cancelled_without_a_fill(self):
-        """The transition a correct pre-ack cancel would need.
+    def test_submitting_has_no_direct_cancellation_transition(self):
+        """Record the state-machine fact exposed by CI #53.
 
-        Recorded because it bears on remediation: if SUBMITTING → CANCELLED
-        were illegal, fixing H2 would require a state-machine change as well
-        as an executor change.
+        A SUBMITTING order currently has no direct route to CANCEL_PENDING or
+        CANCELLED. That does not excuse the lost cancel; it means a production
+        remediation must either add an explicit transition or retain the
+        request until acknowledgement processing can consume it deterministically.
         """
         reachable = ORDER_TRANSITIONS[OrderStatus.SUBMITTING]
-        assert OrderStatus.CANCEL_PENDING in reachable or (
-            OrderStatus.CANCELLED in reachable
-        ), (
-            "an order that has not been acknowledged has no legal route to "
-            f"cancellation: SUBMITTING may only become {reachable}"
-        )
+        assert OrderStatus.CANCEL_PENDING not in reachable
+        assert OrderStatus.CANCELLED not in reachable
+        assert reachable == {
+            OrderStatus.ACKNOWLEDGED,
+            OrderStatus.REJECTED,
+            OrderStatus.UNKNOWN,
+        }
 
     def test_symbol_and_venue_constants_match_the_shipped_venue_set(self):
         """Guards the fixtures themselves against a configuration drift."""

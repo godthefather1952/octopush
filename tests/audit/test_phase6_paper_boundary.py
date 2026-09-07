@@ -169,6 +169,7 @@ class TestVeskaRefusesANonPaperExecutor:
             oms=harness.oms,
             account=harness.account,
             simulator=harness.simulator,
+            is_paper=False,
         )
         with pytest.raises(RuntimeError, match="paper executors only"):
             Veska(
@@ -350,31 +351,67 @@ class TestShadowDoesNotExecute:
 class TestBaselineProtection:
     """The audit itself must contain no production change.
 
-    Scope check rather than a hash inventory: the branch's whole premise is
-    that ``tests/audit/**`` and one document are the only things that moved,
-    and that is what a reviewer can verify from the diff. This asserts the
-    complementary property from inside the suite — that the audit imports
-    production code and never writes to it.
+    These checks inspect Python syntax rather than raw source substrings, so
+    prose describing a forbidden construct does not trip the protection.
     """
 
-    def test_the_audit_package_contains_no_production_module(self):
+    @staticmethod
+    def _trees():
         for path in Path("tests/audit").rglob("*.py"):
-            text = path.read_text()
-            assert "def build_platform" not in text
-            assert "class PaperExecutor" not in text
-            assert "class Veska" not in text
+            yield path, ast.parse(path.read_text())
+
+    def test_the_audit_package_contains_no_production_module(self):
+        forbidden_classes = {"PaperExecutor", "Veska"}
+        for path, tree in self._trees():
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    assert node.name != "build_platform", (
+                        f"{path} defines production construction surface build_platform"
+                    )
+                elif isinstance(node, ast.ClassDef):
+                    assert node.name not in forbidden_classes, (
+                        f"{path} defines production class {node.name}"
+                    )
 
     def test_the_audit_never_monkeypatches_execution_internals(self):
         """Fixtures may construct; they may not rewrite what they measure."""
+        forbidden_roots = ("execution", "PaperExecutor", "FillSimulator")
         for path in Path("tests/audit").rglob("test_phase6_*.py"):
-            text = path.read_text()
-            assert "monkeypatch.setattr(execution" not in text
-            assert "monkeypatch.setattr(PaperExecutor" not in text
-            assert "monkeypatch.setattr(FillSimulator" not in text
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                is_monkeypatch_setattr = (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "setattr"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "monkeypatch"
+                )
+                if not is_monkeypatch_setattr or not node.args:
+                    continue
+                target = ast.unparse(node.args[0])
+                assert not target.startswith(forbidden_roots), (
+                    f"{path} monkeypatches execution internals via {target}"
+                )
 
     def test_the_audit_declares_no_skips_or_expected_failures(self):
+        forbidden_marks = {"pytest.mark.skip", "pytest.mark.xfail"}
         for path in Path("tests/audit").rglob("test_phase6_*.py"):
-            text = path.read_text()
-            assert "pytest.skip" not in text
-            assert "pytest.mark.skip" not in text
-            assert "pytest.mark.xfail" not in text
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    call_name = ast.unparse(node.func)
+                    assert call_name != "pytest.skip", (
+                        f"{path} contains an actual pytest.skip() call"
+                    )
+                if isinstance(
+                    node,
+                    (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+                ):
+                    for decorator in node.decorator_list:
+                        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+                        decorator_name = ast.unparse(target)
+                        assert decorator_name not in forbidden_marks, (
+                            f"{path} contains forbidden decorator {decorator_name}"
+                        )

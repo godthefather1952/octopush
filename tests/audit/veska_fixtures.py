@@ -164,12 +164,14 @@ def venue_state(
         last_update_ts=as_of,
         quality=quality,
         book=OrderBookSnapshot(
-            created_at=as_of,
             venue=venue,
             symbol=symbol,
+            exchange_ts=exchange_ts if exchange_ts is not None else as_of,
+            received_ts=as_of,
+            sequence=1,
             bids=bids,
             asks=asks,
-            sequence=1,
+            is_checkpoint=True,
         ),
         metrics=BookMetrics(
             best_bid=best_bid,
@@ -553,10 +555,10 @@ class ExplodingBus:
             )
         self.published.append(event)
 
-    def subscribe(self, handler, types=None, name=None):  # noqa: ANN001, ANN201
+    def subscribe(self, handler, types=None, name=None):
         return None
 
-    def add_middleware(self, middleware) -> None:  # noqa: ANN001
+    def add_middleware(self, middleware) -> None:
         return None
 
     async def drain(self) -> None:

@@ -191,7 +191,7 @@ class TestOpenOrderCapacity:
         """
         harness = build_harness()
         harness.update_market(_quiet_book())
-        _, order = await _make_unknown(harness)
+        await _make_unknown(harness)
 
         counted = len(harness.veska.open_orders())
         assert counted == 1, (
