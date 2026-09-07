@@ -24,6 +24,7 @@ from pydantic import (
 
 from core.models.common import AgentId, TradingMode
 from core.models.market import DEPTH_BUCKETS_BPS
+from core.models.runtime import FeedKind, OperationalProfile
 
 ENV_PREFIX = "TF_"
 
@@ -596,6 +597,16 @@ class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: TradingMode = TradingMode.PAPER
+    #: What this session is *for*. A separate axis from :attr:`mode`, which
+    #: stays PAPER whatever this says — SHADOW runs the same ``PaperExecutor``
+    #: against the same ``PaperAccount``, with extra observation recorded.
+    #: Read from ``TF_PROFILE``, never from ``TF_MODE``; defaults to PAPER so
+    #: nobody has to set anything new for today's behaviour.
+    operational_profile: OperationalProfile = OperationalProfile.PAPER
+    #: Where market data comes from — the third axis. Mirrors the ``TF_FEED``
+    #: value ``load_settings`` already validates, recorded on Settings so a
+    #: session manifest can state it rather than re-reading the environment.
+    feed: FeedKind = FeedKind.SIMULATED
     environment: str = "local"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     log_format: Literal["json", "text"] = "json"
@@ -811,6 +822,22 @@ def load_settings(**overrides: Any) -> Settings:
             f"{TradingMode.PAPER.value.lower()!r}."
         )
 
+    # The operational profile is read from its OWN variable. TF_MODE is not
+    # reinterpreted and gains no new accepted value: a profile must never be
+    # settable through the one variable whose only legal value is "paper", or
+    # the two concepts would be one keystroke apart.
+    requested_profile = str(
+        _env("PROFILE", OperationalProfile.PAPER.value)
+    ).strip().upper()
+    if requested_profile not in {p.value for p in OperationalProfile}:
+        raise ConfigError(
+            f"{ENV_PREFIX}PROFILE={requested_profile!r} is not a known operational "
+            f"profile. Expected one of "
+            f"{sorted(p.value.lower() for p in OperationalProfile)}. "
+            "The profile says what a session is for; it never changes the "
+            "trading mode, which is PAPER in every case."
+        )
+
     venue_configs = simulated_venues() if feed == "simulated" else default_venues()
     # The strategy universe defaults to what the venues actually carry. Pinning
     # it to a hardcoded ["BTC-USD", "ETH-USD"] was fine while every venue was
@@ -820,6 +847,8 @@ def load_settings(**overrides: Any) -> Settings:
     venue_symbols = sorted({s for v in venue_configs if v.enabled for s in v.symbols})
 
     base: dict[str, Any] = {
+        "operational_profile": requested_profile,
+        "feed": feed.upper(),
         "environment": _env("ENVIRONMENT", "local"),
         "log_level": _env("LOG_LEVEL", "INFO"),
         "log_format": _env("LOG_FORMAT", "json"),

@@ -121,7 +121,12 @@ def create_app(platform: Platform) -> FastAPI:
         snapshot = platform.health.snapshot()
         return {
             "status": snapshot.status.value,
+            # PAPER, in every configuration this build supports.
             "mode": platform.settings.mode.value,
+            # The other two axes, additive. A profile is not a mode.
+            "profile": platform.settings.operational_profile.value,
+            "feed": platform.settings.feed.value,
+            "executor": "PaperExecutor",
             "warmed_up": platform.orchestrator.warmed_up,
             "components": {
                 name: {
@@ -287,6 +292,54 @@ def create_app(platform: Platform) -> FastAPI:
     @app.get("/metrics", response_class=PlainTextResponse)
     async def prometheus() -> str:
         return platform.metrics.render()
+
+    @app.get("/api/operations")
+    async def operations() -> dict[str, Any]:
+        """The session, its readiness and the component summaries. **Read only.**
+
+        There is deliberately no counterpart that writes: no start, no stop,
+        no profile change. A running platform's lifecycle is owned by the
+        process that started it, and an HTTP route that could restart it — or
+        quietly move it to another profile — would be a control path nobody
+        specified who may use.
+        """
+        now = platform.clock.now_ms()
+        return platform.operational_snapshot(now).model_dump(mode="json")
+
+    @app.get("/api/shadow")
+    async def shadow() -> dict[str, Any]:
+        """The rehearsal record. **Read only.**
+
+        Under the PAPER profile this returns ``enabled: false`` with empty
+        counts — the observer is not attached and records nothing — rather than
+        404, so a client can ask the question in either profile.
+
+        There is no endpoint that enables shadow, disables it, submits a
+        rehearsal trade, or promotes one to live. **No promotion path exists
+        anywhere in this build**, and an HTTP route is the last place one
+        should.
+        """
+        now = platform.clock.now_ms()
+        snapshot = platform.shadow_snapshot(now).model_dump(mode="json")
+        # Stated on every response, not left to a field name: the fills these
+        # counts describe came from a simulator, not from a venue.
+        snapshot["execution_note"] = (
+            "Paper fills are the simulator's estimate of what might have "
+            "executed. They are not venue fills; no order reaches a venue."
+        )
+        return snapshot
+
+    @app.get("/api/pre-live")
+    async def pre_live() -> dict[str, Any]:
+        """What a live deployment would need, and what exists. **Read only.**
+
+        Every live-side entry reads ``NOT_IMPLEMENTED`` because that is the
+        truth, and every framework entry reads ``NOT_VALIDATED`` because a
+        framework existing is not a framework working. Nothing reads this
+        response to permit anything.
+        """
+        now = platform.clock.now_ms()
+        return platform.pre_live_readiness(now).model_dump(mode="json")
 
     @app.post("/api/kill-switch")
     async def engage(trigger: str = "MANUAL", detail: str = "engaged via API") -> dict[str, Any]:

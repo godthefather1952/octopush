@@ -38,6 +38,10 @@ if curl -fsS --max-time 5 "${TF_API_URL}/health" >/dev/null 2>&1; then
   MODE="$(health_field mode || echo unknown)"
   STATUS="$(health_field status || echo unknown)"
   WARMED="$(health_field warmed_up || echo unknown)"
+  # The other two axes. A profile is not a trading mode: SHADOW runs the same
+  # PaperExecutor as PAPER does, against real public prices.
+  PROFILE="$(health_field profile || echo PAPER)"
+  FEED="$(health_field feed || echo unknown)"
 
   REQUIRED="$(required_components_status || true)"
 
@@ -51,7 +55,17 @@ if curl -fsS --max-time 5 "${TF_API_URL}/health" >/dev/null 2>&1; then
   else
     check_line "Can trade" "FAIL" "waiting on: ${REQUIRED}"
   fi
-  check_line "Execution mode" "$([[ "$MODE" == "PAPER" ]] && echo OK || echo FAIL)" "$MODE"
+  check_line "Trading mode" "$([[ "$MODE" == "PAPER" ]] && echo OK || echo FAIL)" "$MODE"
+  check_line "Profile" "OK" "$PROFILE"
+  check_line "Market feed" "OK" "$FEED"
+  # Never labelled LIVE TRADING. A shadow session reads real public prices and
+  # simulates every order; calling it live would be the one mislabel in this
+  # tooling that could actually cost somebody money.
+  if [[ "$PROFILE" == "SHADOW" ]]; then
+    check_line "Execution" "OK" "REAL PUBLIC DATA / SIMULATED EXECUTION"
+  else
+    check_line "Execution" "OK" "PaperExecutor — simulated"
+  fi
   check_line "Warmed up" "$([[ "$WARMED" == "true" ]] && echo OK || echo WARMING)" "$WARMED"
   check_line "Aggregate" "$STATUS" "includes optional components"
 

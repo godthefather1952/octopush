@@ -47,11 +47,22 @@ services:
     environment:
       # Stated rather than left to the default: the stack agrees with the code
       # instead of relying on one. Startup aborts on any other value.
+      #
+      # HARD-CODED, and deliberately not ${TF_MODE:-paper}. Every other
+      # setting here may be selected from the environment; this one may not,
+      # because making it selectable would turn a structural guarantee into a
+      # variable somebody could set. There is no other accepted value, and no
+      # exchange order-submission implementation to switch to.
       TF_MODE: paper
       TF_ENVIRONMENT: docker
       TF_LOG_FORMAT: json
-      # Change to "live" for public read-only exchange feeds.
-      TF_FEED: simulated
+      # What the session is FOR — a separate axis from TF_MODE, which stays
+      # paper whatever this says. "shadow" runs the same PaperExecutor against
+      # the same paper account, with extra observation recorded.
+      TF_PROFILE: ${TF_PROFILE:-paper}
+      # Where market data comes from. "live" is public read-only exchange
+      # feeds: no authentication, no private channel, no order path.
+      TF_FEED: ${TF_FEED:-simulated}
       TF_BUS: redis
       TF_REDIS_URL: redis://redis:6379/0
       TF_STORAGE_BACKEND: postgres

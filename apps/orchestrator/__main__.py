@@ -52,7 +52,14 @@ async def run(args: argparse.Namespace) -> None:
     log.info(
         "starting paper session",
         extra={
+            # The three axes, stated rather than left to be inferred. ``mode``
+            # is PAPER in every case; ``profile`` says what the session is
+            # for; ``feed`` says where prices come from. A SHADOW profile is
+            # still paper execution against the same paper account.
             "mode": settings.mode.value,
+            "profile": settings.operational_profile.value,
+            "feed": settings.feed.value,
+            "executor": "PaperExecutor",
             "session_id": platform.session_id,
             "venues": [v.name for v in settings.enabled_venues],
             "symbols": settings.symbols,
@@ -110,6 +117,8 @@ async def run(args: argparse.Namespace) -> None:
             "session ended",
             extra={
                 "session_id": platform.session_id,
+                "profile": settings.operational_profile.value,
+                "feed": settings.feed.value,
                 "ticks": platform.orchestrator.ticks,
                 "events_recorded": platform.recorder.events_recorded,
                 "net_pnl": (

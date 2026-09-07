@@ -21,17 +21,36 @@ from agents.okapi import Okapi
 from agents.rune import Rune, RuneAI
 from agents.tidal import Tidal
 from agents.zephr import Zephr
+from apps.operations import OperationalRegistry
 from apps.orchestrator.agent_directory import AgentDirectory
 from apps.orchestrator.coordination import CoordinationRegistry
 from apps.orchestrator.orchestrator import Orchestrator
+from apps.shadow import ShadowObserver, ShadowRegistry
 from core.bus import EventBus, InMemoryEventBus, build_bus
 from core.clock import Clock, SystemClock
 from core.config import Settings, load_settings
 from core.events import Event, EventType
 from core.health import HealthRegistry
-from core.models.common import AgentId
+from core.models.common import AgentId, TradingMode
 from core.models.market import OrderBookSnapshot, TradeEvent
 from core.models.orchestration import AgentCadence, AgentSubjectScope
+from core.models.runtime import (
+    FeedKind,
+    OperationalComponentSummary,
+    OperationalProfile,
+    OperationalReadiness,
+    OperationalSnapshot,
+    PreLiveReadinessSnapshot,
+    SessionManifest,
+    SessionSummary,
+    ShutdownStage,
+    StartupStage,
+)
+from core.models.shadow import (
+    MarketDataProvenance,
+    ShadowReadiness,
+    ShadowSnapshot,
+)
 from core.state import SystemState
 from execution.oms import OrderManager
 from execution.paper import FillSimulator, PaperAccount, PaperExecutor
@@ -42,7 +61,7 @@ from risk.kill_switch import KillSwitch
 from simulation.market import SyntheticMarket, default_market
 from storage import EventStore, Recorder, build_store
 from strategies.consensus import ConsensusEngine
-from strategies.cross_venue import CrossVenueDetector
+from strategies.cross_venue import REQUIRED_COMPONENTS, CrossVenueDetector
 from venues.base.adapter import VenueAdapter
 from venues.base.messages import (
     BookDelta,
@@ -171,6 +190,14 @@ class Platform:
     oms: OrderManager
     kill_switch: KillSwitch
     orchestrator: Orchestrator
+    #: Phase 11. The platform's memory of its own runs: manifest, startup
+    #: stage, status, counters. Written to beside the existing lifecycle and
+    #: read by nothing that decides.
+    operations: OperationalRegistry = field(default_factory=OperationalRegistry)
+    #: Phase 12. The rehearsal record. Empty and unattached under the PAPER
+    #: profile.
+    shadow: ShadowRegistry = field(default_factory=ShadowRegistry)
+    shadow_observer: ShadowObserver | None = None
     adapters: dict[str, VenueAdapter] = field(default_factory=dict)
     publishers: dict[str, VenueFeedPublisher] = field(default_factory=dict)
     sim_driver: SimulatedMarketDriver | None = None
@@ -192,28 +219,66 @@ class Platform:
         """
         if self._started:
             return
-        if record:
-            await self.recorder.start()
-            self.recorder.attach(self.bus)
-            self._recording = True
-        if feeds:
-            for adapter in self.adapters.values():
-                await adapter.start()
-            if self.sim_driver is not None:
-                await self.sim_driver.start()
+        # Phase 11 metadata. Every call below sits beside an action that
+        # already happened; none of them changes an order of operations, a
+        # branch or a return, and nothing later reads what they record.
+        now = self.clock.now_ms()
+        self.operations.create_session(self.session_manifest(now, recording=record), now)
+        self.operations.mark_starting(now)
+        try:
+            if record:
+                self.operations.set_startup_stage(StartupStage.STORAGE, now)
+                await self.recorder.start()
+                self.recorder.attach(self.bus)
+                self._recording = True
+            self.operations.set_startup_stage(StartupStage.MARKET_FEEDS, now)
+            if feeds:
+                for adapter in self.adapters.values():
+                    await adapter.start()
+                if self.sim_driver is not None:
+                    await self.sim_driver.start()
+        except BaseException as exc:
+            # Record that startup raised, then re-raise the SAME exception.
+            # The registry is a witness, not a handler: swallowing this would
+            # leave a half-built platform looking like a running one.
+            self.operations.mark_failed(
+                self.clock.now_ms(), failure=f"{type(exc).__name__}: {exc}"
+            )
+            raise
         self._started = True
+        self.operations.mark_running(self.clock.now_ms())
 
     async def stop(self) -> None:
-        if self.sim_driver is not None:
-            await self.sim_driver.stop()
-        for adapter in self.adapters.values():
-            await adapter.stop()
-        await self.bus.stop()
-        if self._recording:
-            # Only close a store this platform actually opened.
-            await self.recorder.stop()
-            self._recording = False
+        now = self.clock.now_ms()
+        self.operations.mark_stopping(now)
+        try:
+            self.operations.set_shutdown_stage(ShutdownStage.STOPPING_FEEDS, now)
+            if self.sim_driver is not None:
+                await self.sim_driver.stop()
+            for adapter in self.adapters.values():
+                await adapter.stop()
+            self.operations.set_shutdown_stage(ShutdownStage.DRAINING_BUS, now)
+            await self.bus.stop()
+            if self._recording:
+                # Only close a store this platform actually opened.
+                self.operations.set_shutdown_stage(
+                    ShutdownStage.STOPPING_RECORDER, now
+                )
+                await self.recorder.stop()
+                self._recording = False
+        except BaseException as exc:
+            self.operations.mark_failed(
+                self.clock.now_ms(), failure=f"{type(exc).__name__}: {exc}"
+            )
+            raise
         self._started = False
+        stopped_at = self.clock.now_ms()
+        self.operations.update_counts(
+            stopped_at,
+            ticks=self.orchestrator.ticks,
+            events_recorded=self.recorder.events_recorded,
+        )
+        self.operations.mark_stopped(stopped_at)
 
     async def step_market(self, steps: int = 1) -> None:
         """Advance the synthetic market by ``steps`` and process the result."""
@@ -222,6 +287,302 @@ class Platform:
         for _ in range(steps):
             await self.sim_driver.step()
             await self.bus.drain()
+
+    # -- operational observability (Phases 11 + 12) ------------------------
+    #
+    # Every method below is a read. None is called from the tick path, the
+    # startup path or the shutdown path, and none mutates anything a decision
+    # depends on. This is the one aggregation surface, so a future dashboard,
+    # API or operator tool does not have to rummage through every component.
+
+    @property
+    def profile(self) -> OperationalProfile:
+        """What this session is for. **Not the trading mode.**
+
+        ``settings.mode`` is PAPER and stays PAPER whatever this says: SHADOW
+        runs the same ``PaperExecutor`` against the same ``PaperAccount``.
+        """
+        return self.settings.operational_profile
+
+    @property
+    def is_shadow(self) -> bool:
+        return self.profile is OperationalProfile.SHADOW
+
+    def session_manifest(
+        self, now_ms: int, *, recording: bool = True
+    ) -> SessionManifest:
+        """What this session was configured to be.
+
+        ``session_id`` is the recorder's, not a second identifier: every
+        recorded event already carries it, and minting another would give one
+        run two names.
+
+        The last three fields state the boundary in the record itself, so a
+        SHADOW manifest cannot be misread as a live one.
+        """
+        return SessionManifest(
+            session_id=self.session_id,
+            created_at=now_ms,
+            label=self.recorder.label,
+            trading_mode=self.settings.mode,
+            operational_profile=self.profile,
+            feed=self.settings.feed,
+            symbols=list(self.settings.symbols),
+            venues=[v.name for v in self.settings.enabled_venues],
+            bus_backend=self.settings.bus,
+            storage_backend=self.settings.storage.backend,
+            initial_paper_balance=self.settings.paper_initial_balance,
+            intelligence_provider=self.lumen.provider.name,
+            config_digest=self.recorder.config_hash,
+            recording_requested=recording,
+            paper_executor=True,
+            private_venue_access=False,
+            real_order_submission=False,
+        )
+
+    def current_session(self):
+        """The record for the run this process is executing, if started."""
+        return self.operations.current_session()
+
+    def operational_readiness(self, now_ms: int) -> OperationalReadiness:
+        """Whether the platform is in a fit state to operate. **Reporting only.**
+
+        This gates nothing: ``start()`` still starts, warm-up still decides
+        when trading may begin, and the kill switch still decides when it must
+        stop.
+
+        **LUMEN's absence never makes this unready.** LUMEN is optional — not
+        in the required-component set, not in ``required_agents`` — and the
+        shipped default provider is permanently unavailable. Reporting a fault
+        because the default configuration is the default configuration would
+        be reporting a fault where there is none.
+        """
+        # ``REQUIRED_COMPONENTS`` is TIDAL, NORO, ZEPHR, RUNE, VESKA, MARIN.
+        # LUMEN is deliberately not in it and is not added here: the same set
+        # the warm-up path already uses is the set this reports on, so the two
+        # cannot come to disagree about what the platform needs.
+        agents_ok, unhealthy = self.health.all_healthy(REQUIRED_COMPONENTS, now_ms)
+        market_ok = self.state.market is not None
+        kill_clear = self.state.kill_switch.trading_allowed
+        unknown_orders = len(self.veska.unknown_orders())
+        reconciled = self.marin.last_result is not None
+
+        reasons: list[str] = []
+        if not agents_ok:
+            reasons.extend(f"COMPONENT_UNHEALTHY:{name}" for name in unhealthy)
+        if not market_ok:
+            reasons.append("NO_MARKET_STATE")
+        if not kill_clear:
+            reasons.append("KILL_SWITCH_ENGAGED")
+        if not reconciled:
+            reasons.append("NO_RECONCILIATION_BASELINE")
+        if unknown_orders:
+            reasons.append(f"UNKNOWN_ORDERS:{unknown_orders}")
+        if not self._recording:
+            reasons.append("NOT_RECORDING")
+
+        return OperationalReadiness(
+            ready=not reasons,
+            created_at=now_ms,
+            profile=self.profile,
+            feed=self.settings.feed,
+            paper_mode_confirmed=self.settings.mode is TradingMode.PAPER,
+            feed_ready=bool(self.adapters),
+            storage_ready=self.recorder.healthy,
+            bus_ready=self._started,
+            market_ready=market_ok,
+            required_agents_ready=agents_ok,
+            risk_ready=True,
+            execution_ready=not self.state.kill_switch.execution_disabled,
+            reconciliation_ready=reconciled,
+            hedging_ready=bool(self.okapi.desired_delta),
+            recording_ready=self._recording,
+            kill_switch_clear=kill_clear,
+            # Reported, never required.
+            intelligence_available=self.lumen.consecutive_failures == 0
+            and self.lumen.calls > 0,
+            reason_codes=reasons,
+        )
+
+    def operational_snapshot(self, now_ms: int) -> OperationalSnapshot:
+        """One serializable view of the whole running platform.
+
+        Each nested field is the owning phase's own snapshot, serialized.
+        Copied, never recomputed and never interpreted — no decision is made
+        from any aggregate here.
+        """
+        snapshot = self.health.snapshot(now_ms)
+        portfolio = self.state.portfolio
+        return OperationalSnapshot(
+            created_at=now_ms,
+            session=self.current_session(),
+            components=[
+                OperationalComponentSummary(
+                    component=name,
+                    status=component.status.value,
+                    version=component.version,
+                    required=name in REQUIRED_COMPONENTS,
+                    last_heartbeat_ms=component.last_heartbeat_ms,
+                    queue_depth=component.queue_depth,
+                    error_count=component.error_count,
+                    detail=component.detail,
+                )
+                for name, component in sorted(snapshot.components.items())
+            ],
+            coordination=self.orchestrator.coordination_snapshot(now_ms).model_dump(
+                mode="json"
+            ),
+            risk={
+                "kill_switch_engaged": self.state.kill_switch.engaged,
+                "triggered_by": list(self.state.kill_switch.triggered_by),
+                "utilization": (
+                    self.state.risk_utilization.model_dump(mode="json")
+                    if self.state.risk_utilization
+                    else {}
+                ),
+            },
+            execution=self.veska.metrics().model_dump(mode="json"),
+            reconciliation={
+                "ok": (
+                    None if self.marin.last_result is None else self.marin.last_result.ok
+                ),
+                "open_discrepancies": len(self.marin.open_discrepancies()),
+            },
+            hedging=self.okapi.okapi_snapshot(
+                self.executor.account.snapshot(), self.state.market, now_ms
+            ).model_dump(mode="json"),
+            intelligence=self.lumen.lumen_snapshot(now_ms).model_dump(mode="json"),
+            portfolio=(portfolio.model_dump(mode="json") if portfolio else {}),
+            recording={
+                "requested": self._recording,
+                "active": self._recording and self.recorder.healthy,
+                "session_id": self.session_id,
+                "events_recorded": self.recorder.events_recorded,
+                "storage_backend": self.settings.storage.backend,
+                "config_digest": self.recorder.config_hash,
+            },
+            metrics=self.operations.metrics(
+                ticks=self.orchestrator.ticks,
+                events_recorded=self.recorder.events_recorded,
+                shadow_decisions=len(self.shadow.decisions),
+            ),
+            readiness=self.operational_readiness(now_ms),
+            incidents=self.operations.open_incidents(),
+        )
+
+    def session_summary(self, now_ms: int) -> SessionSummary:
+        """What this session did. **No judgement of any kind.**
+
+        Facts only: counts and P&L. Nothing here classifies a session as good,
+        bad, profitable enough, or ready for anything.
+        """
+        record = self.current_session()
+        portfolio = self.state.portfolio
+        execution = self.veska.metrics()
+        return SessionSummary(
+            session_id=self.session_id,
+            profile=self.profile,
+            feed=self.settings.feed,
+            started_at=record.started_at if record else None,
+            stopped_at=record.stopped_at if record else None,
+            ticks=self.orchestrator.ticks,
+            events_recorded=self.recorder.events_recorded,
+            orders=execution.orders_created,
+            fills=execution.fills,
+            hedges=self.okapi.hedges_requested,
+            starting_equity=self.settings.paper_initial_balance,
+            ending_equity=(portfolio.equity if portfolio else 0.0),
+            net_pnl=(portfolio.net_pnl if portfolio else 0.0),
+            kill_switch_triggers=list(self.state.kill_switch.triggered_by),
+        )
+
+    def pre_live_readiness(self, now_ms: int) -> PreLiveReadinessSnapshot:
+        """What a live deployment would need, and what actually exists.
+
+        **This starts nothing.** There is no promotion path and no code that
+        reads it to permit anything. Every live-side field is
+        ``NOT_IMPLEMENTED`` because that is the truth, and every framework
+        field is ``NOT_VALIDATED`` because a framework existing is not a
+        framework working.
+        """
+        return PreLiveReadinessSnapshot(created_at=now_ms)
+
+    # -- shadow ------------------------------------------------------------
+
+    def shadow_readiness(self, now_ms: int) -> ShadowReadiness:
+        """Whether a rehearsal is set up the way one should be. **Observational.**
+
+        Blocks nothing. A shadow session against the simulated feed still
+        runs; it is simply not a genuine live-market rehearsal, and this says
+        so here rather than refusing at configuration load, where it would be
+        a policy this phase may not set.
+
+        ``private_execution_absent`` reports True because only
+        ``PaperExecutor`` exists. It is phrased as an absence deliberately: a
+        field named for the presence of live execution would be a place for
+        someone to later set True, and there must be no such place.
+        """
+        live_feed = self.settings.feed is FeedKind.LIVE
+        reasons: list[str] = []
+        if not self.is_shadow:
+            reasons.append("PROFILE_NOT_SHADOW")
+        if not live_feed:
+            reasons.append("FEED_NOT_PUBLIC_LIVE")
+        if self.state.market is None:
+            reasons.append("NO_MARKET_STATE")
+        if not self._recording:
+            reasons.append("NOT_RECORDING")
+        if self.marin.last_result is None:
+            reasons.append("NO_RECONCILIATION_BASELINE")
+
+        return ShadowReadiness(
+            ready=not reasons,
+            created_at=now_ms,
+            profile_is_shadow=self.is_shadow,
+            paper_mode_confirmed=self.settings.mode is TradingMode.PAPER,
+            public_live_feed_configured=live_feed,
+            market_data_available=self.state.market is not None,
+            recording_active=self._recording,
+            coordination_available=True,
+            risk_available=True,
+            paper_execution_available=not self.state.kill_switch.execution_disabled,
+            reconciliation_available=self.marin.last_result is not None,
+            hedging_available=bool(self.okapi.desired_delta),
+            private_execution_absent=True,
+            reason_codes=reasons,
+        )
+
+    def shadow_snapshot(self, now_ms: int) -> ShadowSnapshot:
+        """The rehearsal, summarised.
+
+        Under the PAPER profile this reports ``enabled=False`` with empty
+        counts: the observer is not attached and records nothing.
+
+        Equity and P&L come from the platform's single ``PaperAccount``. There
+        is no second shadow ledger — two would eventually disagree and nobody
+        would know which to believe.
+        """
+        portfolio = self.state.portfolio
+        return self.shadow.snapshot(
+            now_ms,
+            session_id=self.session_id,
+            enabled=self.is_shadow,
+            paper_equity=(portfolio.equity if portfolio else 0.0),
+            paper_pnl=(portfolio.net_pnl if portfolio else 0.0),
+            readiness=self.shadow_readiness(now_ms),
+        )
+
+    def shadow_decision(self, decision_id: str):
+        """One rehearsal record, by registry id or by opportunity id."""
+        return self.shadow.get(decision_id) or self.shadow.for_opportunity(decision_id)
+
+    def shadow_decisions(self, limit: int = 50):
+        """The most recent rehearsal records, newest last."""
+        return self.shadow.recent(limit)
+
+    def shadow_executions(self, decision_id: str | None = None):
+        """Hypothetical execution records. **These are simulator output.**"""
+        return self.shadow.execution_records(decision_id)
 
 
 def build_platform(
@@ -354,10 +715,33 @@ def build_platform(
     for symbol in settings.symbols:
         okapi.set_desired_delta(symbol, 0.0)
 
+    # Phase 12: the rehearsal record, and the observer that fills it.
+    #
+    # The observer is attached to the bus ONLY under the SHADOW profile, so an
+    # ordinary paper session neither subscribes nor accumulates a history it
+    # will never read. That activation is observational: no economic branch
+    # anywhere differs because the observer is running, which is the property
+    # that makes a shadow session a rehearsal of THIS platform rather than of
+    # a slightly different one.
+    #
+    # It is given a bus and a registry, and nothing else. There is no
+    # orchestrator, executor or account reference on it, so there is no path
+    # through the observer to anything that trades.
+    is_shadow = settings.operational_profile is OperationalProfile.SHADOW
+    shadow_registry = ShadowRegistry(
+        market_data=(
+            MarketDataProvenance.PUBLIC_LIVE_FEED
+            if settings.feed is FeedKind.LIVE
+            else MarketDataProvenance.SIMULATED
+        )
+    )
+    shadow_observer = ShadowObserver(bus, shadow_registry, enabled=is_shadow)
+
     tidal.subscribe()
     noro.subscribe()
     zephr.subscribe()
     orchestrator.subscribe()
+    shadow_observer.subscribe()
     bus.subscribe(
         lambda event: _lumen_market(lumen, event),
         types=[EventType.MARKET_STATE],
@@ -443,6 +827,9 @@ def build_platform(
         oms=oms,
         kill_switch=kill_switch,
         orchestrator=orchestrator,
+        operations=OperationalRegistry(),
+        shadow=shadow_registry,
+        shadow_observer=shadow_observer,
         adapters=adapters,
         publishers=publishers,
         sim_driver=sim_driver,
