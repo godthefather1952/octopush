@@ -12,18 +12,43 @@ Three independent views are compared:
 3. the fills the OMS holds against its orders.
 
 A critical mismatch suspends new trading.  It is never logged and ignored.
+
+THE PHASE 7 FRAMEWORK AROUND IT
+===============================
+``reconcile()`` above is unchanged, and remains the platform's current
+reconciliation answer: the same comparisons, the same tolerances, the same
+severities, feeding the same ``ReconciliationResult`` that the orchestrator's
+protection path reads.
+
+Phase 7 adds a framework *around* it rather than through it:
+
+* **sources** — each account of the truth (execution, account, and the venue
+  and recorded seams that have no implementation) captured through one
+  interface, at a supplied logical instant;
+* **snapshots** — an immutable bundle of those accounts, which states what it
+  could not capture rather than silently omitting it;
+* **a registry** — runs, tracked discrepancies and proposed resolutions, so
+  "is this the same problem as last time?" has an answer;
+* **readiness** — the question a future live start must ask before enabling
+  execution.
+
+Nothing in that framework decides anything. The registry takes no safety
+action, ``readiness`` gates nothing, and no discrepancy is acknowledged,
+resolved or ignored except by an explicit caller. ``run()`` mirrors its result
+into the registry strictly *after* the existing algorithm has produced it, so
+the mirror cannot influence the answer.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from core.bus import EventBus
 from core.clock import Clock
 from core.events import Event, EventType
 from core.health import HealthRegistry
 from core.models.common import MONEY_EPSILON, QTY_EPSILON, Millis
-from core.models.execution import OrderStatus
+from core.models.execution import ExecutionSnapshot, OrderStatus
 from core.models.ops import (
     HealthStatus,
     Mismatch,
@@ -31,11 +56,32 @@ from core.models.ops import (
     ReconciliationResult,
     Severity,
 )
+from core.models.reconciliation import (
+    AccountSnapshot,
+    DiscrepancyStatus,
+    ReconciliationDiscrepancy,
+    ReconciliationMetrics,
+    ReconciliationReadiness,
+    ReconciliationResolution,
+    ReconciliationRunRecord,
+    ReconciliationRunStatus,
+    ReconciliationSnapshot,
+    ReconciliationSourceKind,
+    ReconciliationTrigger,
+    RecordedTruthSnapshot,
+    ResolutionAction,
+    ResolutionStatus,
+    SourceHealth,
+    StartupReconciliationRequest,
+    VenueTruthSnapshot,
+)
+from agents.marin.registry import ReconciliationRegistry
+from agents.marin.source import ReconciliationSource
 from execution.oms import OrderManager
 from execution.paper.account import PaperAccount
 
 SERVICE = "MARIN"
-VERSION = "marin-0.1"
+VERSION = "marin-0.2"
 
 #: Cash tolerance. Prices and sizes are float64, so two arithmetically
 #: identical paths can differ in the last bits; anything larger is a real bug.
@@ -62,8 +108,52 @@ class Marin:
     fills_sealed: int = 0
     orders_archived: int = 0
 
+    # -- Phase 7 framework, all optional ----------------------------------
+    #
+    # Every field below defaults to something inert, so an existing
+    # construction site that passes only ``bus``, ``clock``, ``health``,
+    # ``oms`` and ``account`` builds exactly the MARIN it built before.
+
+    #: Runs, tracked discrepancies and proposed resolutions.
+    registry: ReconciliationRegistry = field(
+        default_factory=ReconciliationRegistry
+    )
+    #: What execution believes. ``None`` when not wired.
+    execution_source: ReconciliationSource | None = None
+    #: What the ledger believes. ``None`` when not wired.
+    account_source: ReconciliationSource | None = None
+    #: External venue accounts. Empty, and no implementation exists.
+    venue_sources: list[ReconciliationSource] = field(default_factory=list)
+    #: Reconstruction from durable events. ``None``; no implementation exists.
+    recorded_source: ReconciliationSource | None = None
+    #: The most recent captured bundle, for inspection.
+    last_snapshot: ReconciliationSnapshot | None = None
+
     def __post_init__(self) -> None:
         self.health.register(SERVICE, VERSION)
+
+    def attach_sources(
+        self,
+        *,
+        execution: ReconciliationSource | None = None,
+        account: ReconciliationSource | None = None,
+        venues: list[ReconciliationSource] | None = None,
+        recorded: ReconciliationSource | None = None,
+    ) -> None:
+        """Wire truth sources after construction.
+
+        Offered so the composition root can build MARIN, then hand it sources
+        that depend on components built later, without changing the existing
+        constructor call. Passing ``None`` leaves a source as it was.
+        """
+        if execution is not None:
+            self.execution_source = execution
+        if account is not None:
+            self.account_source = account
+        if venues is not None:
+            self.venue_sources = list(venues)
+        if recorded is not None:
+            self.recorded_source = recorded
 
     def reconcile(self, now_ms: Millis | None = None) -> ReconciliationResult:
         now = self.clock.now_ms() if now_ms is None else now_ms
@@ -226,6 +316,402 @@ class Marin:
         self.last_result = result
         return result
 
+    # ==================================================================
+    # Phase 7 framework
+    #
+    # Everything below is additive. None of it is consulted by
+    # ``reconcile()``, by the orchestrator's protection path, or by any risk
+    # decision. It captures, records and answers questions.
+    # ==================================================================
+
+    # -- capture -----------------------------------------------------------
+
+    def _sources(self) -> list[ReconciliationSource]:
+        configured: list[ReconciliationSource] = []
+        if self.execution_source is not None:
+            configured.append(self.execution_source)
+        if self.account_source is not None:
+            configured.append(self.account_source)
+        configured.extend(self.venue_sources)
+        if self.recorded_source is not None:
+            configured.append(self.recorded_source)
+        return configured
+
+    def capture_snapshot(self, now_ms: Millis) -> ReconciliationSnapshot:
+        """Capture every configured source into one bundle at ``now_ms``.
+
+        Records no mismatch and declares no agreement — it is a bundle, and
+        comparison is a separate act.
+
+        A source that fails is recorded as unavailable with the reason,
+        rather than being dropped. The distinction is the difference between
+        "the venue reported nothing" and "the venue was never asked", which are
+        opposite conclusions, and a bundle that cannot express the second one
+        invites a reconciler to invent agreement out of silence.
+        """
+        execution: ExecutionSnapshot | None = None
+        account: AccountSnapshot | None = None
+        venue: VenueTruthSnapshot | None = None
+        recorded: RecordedTruthSnapshot | None = None
+        healths: list[SourceHealth] = []
+        notes: list[str] = []
+
+        for source in self._sources():
+            try:
+                capture = source.capture(now_ms)
+            except Exception as exc:  # a source must never take the run down
+                healths.append(
+                    SourceHealth(
+                        kind=source.kind,
+                        name=source.name,
+                        authority=source.authority,
+                        available=False,
+                        complete=False,
+                        captured_at=now_ms,
+                        detail=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+                notes.append(f"{source.name} could not be captured")
+                continue
+
+            healths.append(capture.health)
+            if capture.snapshot is None:
+                continue
+            if source.kind is ReconciliationSourceKind.EXECUTION:
+                execution = capture.snapshot
+            elif source.kind is ReconciliationSourceKind.ACCOUNT:
+                account = capture.snapshot
+            elif source.kind is ReconciliationSourceKind.VENUE:
+                # One venue snapshot is held for now. A multi-venue platform
+                # needs a list here, which is a shape question a later pass
+                # answers once a venue source actually exists.
+                venue = capture.snapshot
+            elif source.kind is ReconciliationSourceKind.RECORDED:
+                recorded = capture.snapshot
+
+        snapshot = ReconciliationSnapshot(
+            created_at=now_ms,
+            execution=execution,
+            account=account,
+            venue=venue,
+            recorded=recorded,
+            sources=healths,
+            notes=notes,
+        )
+        self.last_snapshot = snapshot
+        return snapshot
+
+    # -- run lifecycle -----------------------------------------------------
+
+    def begin_reconciliation(
+        self,
+        now_ms: Millis,
+        *,
+        trigger: ReconciliationTrigger = ReconciliationTrigger.MANUAL,
+        reason: str = "",
+    ) -> ReconciliationRunRecord:
+        """Open a workflow run and capture the available truth.
+
+        Stops at CAPTURING. It deliberately does **not** compare anything: the
+        existing algorithm in :meth:`reconcile` remains the platform's
+        comparison, and forcing it through a new engine during a construction
+        pass would change behaviour under the guise of structure.
+
+        Nothing calls this automatically. The orchestrator's cadence is
+        unchanged, and no new run is triggered anywhere.
+        """
+        record = self.registry.register_run(
+            now_ms, trigger=trigger, reason=reason
+        )
+        self.registry.set_run_status(
+            record.run_id, ReconciliationRunStatus.CAPTURING, now_ms
+        )
+        snapshot = self.capture_snapshot(now_ms)
+        self.registry.attach_snapshot(
+            record.run_id,
+            now_ms,
+            snapshot_id=snapshot.snapshot_id,
+            execution_snapshot_id=(
+                snapshot.execution.snapshot_id if snapshot.execution else None
+            ),
+            account_snapshot_id=(
+                snapshot.account.snapshot_id if snapshot.account else None
+            ),
+            venue_snapshot_id=(
+                snapshot.venue.snapshot_id if snapshot.venue else None
+            ),
+            recorded_snapshot_id=(
+                snapshot.recorded.snapshot_id if snapshot.recorded else None
+            ),
+            source_kinds=snapshot.available_sources,
+            missing_source_kinds=snapshot.missing_sources,
+        )
+        return record
+
+    def mirror_result(
+        self,
+        result: ReconciliationResult,
+        now_ms: Millis,
+        *,
+        trigger: ReconciliationTrigger = ReconciliationTrigger.PERIODIC,
+        reason: str = "",
+    ) -> ReconciliationRunRecord:
+        """Record an already-produced result into the workflow registry.
+
+        Strictly after the fact. The existing algorithm has already decided
+        everything by the time this runs, and nothing here can change the
+        answer — it reads ``result`` and writes to the registry, in that
+        direction only. That is what makes it safe to call from :meth:`run`
+        without altering reconciliation behaviour.
+
+        Each mismatch becomes, or updates, a tracked discrepancy. Severity,
+        kind, key and numbers cross over untouched; no comparison logic moves
+        here and no new mismatch is detected.
+        """
+        record = self.registry.register_run(
+            now_ms, trigger=trigger, reason=reason, run_id=result.run_id
+        )
+        self.registry.set_run_status(
+            record.run_id, ReconciliationRunStatus.COMPARING, now_ms
+        )
+        for mismatch in result.mismatches:
+            self.registry.add_mismatch(mismatch, run_id=record.run_id, now_ms=now_ms)
+            if mismatch.actual == OrderStatus.UNKNOWN.value:
+                self.registry.unknown_orders_seen += 1
+
+        self.registry.set_run_status(
+            record.run_id,
+            (
+                ReconciliationRunStatus.DISCREPANCIES_FOUND
+                if result.mismatches
+                else ReconciliationRunStatus.CLEAN
+            ),
+            now_ms,
+        )
+        return record
+
+    # -- resolution --------------------------------------------------------
+
+    def propose_resolution(
+        self,
+        discrepancy_id: str,
+        now_ms: Millis,
+        *,
+        action: ResolutionAction = ResolutionAction.ESCALATE_OPERATOR,
+        authoritative_source: ReconciliationSourceKind | None = None,
+        target_entity: str | None = None,
+        target_status: OrderStatus | None = None,
+        reason: str = "",
+        evidence: dict[str, str] | None = None,
+    ) -> ReconciliationResolution:
+        """Record an intended response to a discrepancy.
+
+        Proposing has no side effect whatsoever. The resolution is written down
+        as PROPOSED and nothing acts on it; something else has to, and in this
+        build only an explicit caller can.
+        """
+        discrepancy = self.registry.get_discrepancy(discrepancy_id)
+        resolution = ReconciliationResolution(
+            discrepancy_id=discrepancy_id,
+            run_id=discrepancy.run_id if discrepancy is not None else None,
+            created_at=now_ms,
+            updated_at=now_ms,
+            action=action,
+            authoritative_source=authoritative_source,
+            target_entity=target_entity,
+            target_status=target_status,
+            reason=reason,
+            evidence=dict(evidence or {}),
+        )
+        return self.registry.register_resolution(resolution, now_ms)
+
+    async def apply_order_resolution(
+        self,
+        veska,
+        client_order_id: str,
+        authoritative_status: OrderStatus,
+        now_ms: Millis,
+        *,
+        source: ReconciliationSourceKind = ReconciliationSourceKind.OPERATOR,
+        evidence: dict[str, str] | None = None,
+        discrepancy_id: str | None = None,
+        reason: str = "",
+    ):
+        """Apply authoritative evidence to an order whose state is unknown.
+
+        THE BRIDGE, AND WHY IT IS NEVER AUTOMATIC
+        =========================================
+        Phase 6 gave the execution layer one explicit door out of UNKNOWN
+        (``veska.resolve_unknown``). This is the reconciliation side of that
+        door: it records what is being applied and on whose evidence, then
+        opens it.
+
+        **Nothing calls this.** Not ``reconcile``, not ``run``, not a
+        heartbeat, not a timeout, not the registry. An order is UNKNOWN
+        precisely because the platform does not know what happened to it, and
+        the only honest way out is a caller arriving with an answer from
+        somewhere that does. MARIN adds no judgement of its own: it does not
+        query a venue, does not guess a status, and does not invent a fill.
+
+        The resolution is recorded before the attempt and updated with the
+        outcome, so an application that fails leaves evidence rather than
+        silence.
+        """
+        resolution = self.propose_resolution(
+            discrepancy_id or f"order:{client_order_id}",
+            now_ms,
+            action=ResolutionAction.RESOLVE_ORDER,
+            authoritative_source=source,
+            target_entity=client_order_id,
+            target_status=authoritative_status,
+            reason=reason or "authoritative order status supplied by caller",
+            evidence=evidence,
+        )
+        self.registry.set_resolution_status(
+            resolution.resolution_id, ResolutionStatus.APPLYING, now_ms
+        )
+
+        result = await veska.resolve_unknown(
+            client_order_id, authoritative_status, now_ms
+        )
+
+        self.registry.set_resolution_status(
+            resolution.resolution_id,
+            ResolutionStatus.APPLIED if result.accepted else ResolutionStatus.FAILED,
+            now_ms,
+            note=result.reason,
+        )
+        if result.accepted and discrepancy_id is not None:
+            self.registry.set_discrepancy_status(
+                discrepancy_id,
+                DiscrepancyStatus.RESOLVED,
+                now_ms,
+                note=f"resolved to {authoritative_status.value}",
+            )
+        return result
+
+    # -- readiness ---------------------------------------------------------
+
+    def readiness(self, now_ms: Millis) -> ReconciliationReadiness:
+        """Whether reconciliation says the platform is in a known-good state.
+
+        **Observability only.** Nothing gates trading on this. The
+        orchestrator's protection path still reads ``last_result.ok`` exactly
+        as it did, and no kill-switch trigger consults it.
+
+        It exists because a live start will eventually have to ask this
+        question — connect the venues, capture authoritative truth, reconcile,
+        and only then enable execution — and building the answer now means that
+        phase adds a caller rather than a concept.
+
+        ``ready`` is False whenever anything is unestablished, including when
+        no run has happened. Absence of evidence is not readiness.
+        """
+        latest = self.registry.latest_run()
+        open_critical = self.registry.open_critical()
+        open_warning = self.registry.open_warnings()
+        unresolved = len(self.oms.unknown_orders())
+
+        reasons: list[str] = []
+        if self.execution_source is None:
+            reasons.append("NO_EXECUTION_SOURCE")
+        if self.account_source is None:
+            reasons.append("NO_ACCOUNT_SOURCE")
+        if self.last_result is None:
+            reasons.append("NO_RECONCILIATION_YET")
+        elif not self.last_result.ok:
+            reasons.append("LAST_RUN_HAD_CRITICAL_MISMATCH")
+        if open_critical:
+            reasons.append("OPEN_CRITICAL_DISCREPANCY")
+        if unresolved:
+            reasons.append("UNRESOLVED_ORDERS")
+
+        return ReconciliationReadiness(
+            ready=not reasons,
+            created_at=now_ms,
+            last_run_id=latest.run_id if latest is not None else None,
+            last_run_status=latest.status if latest is not None else None,
+            last_run_at=latest.created_at if latest is not None else None,
+            open_critical=len(open_critical),
+            open_warning=len(open_warning),
+            unresolved_orders=unresolved,
+            execution_source_available=self.execution_source is not None,
+            account_source_available=self.account_source is not None,
+            venue_sources_available=len(self.venue_sources),
+            recorded_source_available=self.recorded_source is not None,
+            reason_codes=reasons,
+        )
+
+    def prepare_startup_reconciliation(
+        self, now_ms: Millis, *, reason: str = ""
+    ) -> StartupReconciliationRequest:
+        """Describe what a live start would have to reconcile first.
+
+        Framework only. ``Platform.start()`` is unchanged and does not block on
+        this; no venue is queried; paper trading is unaffected.
+
+        What it produces is the shape of the requirement: which sources a live
+        start must have, which are actually present, and the two conditions
+        that cannot be waived — no unresolved critical discrepancy, and no
+        order whose venue-side state is unknown. A platform that enabled
+        execution while holding either would be trading against books it could
+        not vouch for.
+        """
+        snapshot = self.capture_snapshot(now_ms)
+        return StartupReconciliationRequest(
+            created_at=now_ms,
+            trigger=ReconciliationTrigger.STARTUP,
+            required_sources=[
+                ReconciliationSourceKind.EXECUTION,
+                ReconciliationSourceKind.ACCOUNT,
+                # A live start additionally requires the venue's own account.
+                # Listed as required so the request reports it missing rather
+                # than quietly succeeding without it.
+                ReconciliationSourceKind.VENUE,
+            ],
+            available_sources=snapshot.available_sources,
+            require_no_critical=True,
+            require_no_unknown_orders=True,
+            reason=reason or "startup reconciliation requirement",
+        )
+
+    # -- queries -----------------------------------------------------------
+
+    def get_run(self, run_id: str) -> ReconciliationRunRecord | None:
+        return self.registry.get_run(run_id)
+
+    def latest_run(self) -> ReconciliationRunRecord | None:
+        return self.registry.latest_run()
+
+    def open_discrepancies(self) -> list[ReconciliationDiscrepancy]:
+        return self.registry.open_discrepancies()
+
+    def open_critical(self) -> list[ReconciliationDiscrepancy]:
+        return self.registry.open_critical()
+
+    def discrepancies_for_run(self, run_id: str) -> list[ReconciliationDiscrepancy]:
+        return self.registry.discrepancies_for_run(run_id)
+
+    def resolutions_for(self, discrepancy_id: str) -> list[ReconciliationResolution]:
+        return self.registry.resolutions_for_discrepancy(discrepancy_id)
+
+    def metrics(self) -> ReconciliationMetrics:
+        """Counters. No thresholds, no rates, no alerting, no backend."""
+        return self.registry.metrics()
+
+    # -- retention ---------------------------------------------------------
+
+    def compact_reconciliation_history(self, *, keep_terminal: bool = True) -> int:
+        """Release finished workflow records. Releases nothing by default.
+
+        Separate from :meth:`compact`, which seals the fill log and archives
+        orders and is unchanged. This one touches only the Phase 7 registry.
+
+        An OPEN discrepancy, a pending resolution, and any run holding either
+        are never eligible, whatever the arguments say.
+        """
+        return self.registry.compact(keep_terminal=keep_terminal)
+
     # -- compaction --------------------------------------------------------
 
     def _seal_boundary(self) -> int:
@@ -288,6 +774,14 @@ class Marin:
         result = self.reconcile(now_ms)
         if result.ok:
             self.compact()
+        # Phase 7: record the workflow, strictly after the answer exists.
+        # ``result`` is already final here — the mirror reads it and writes to
+        # the registry, never the other way round — so it cannot influence
+        # reconciliation, the published event, or the orchestrator's
+        # protection path. Nothing downstream consults the registry.
+        self.mirror_result(
+            result, result.created_at, trigger=ReconciliationTrigger.PERIODIC
+        )
         await self.bus.publish(
             Event(
                 type=(
@@ -339,4 +833,12 @@ class Marin:
         )
 
 
-__all__ = ["CASH_TOLERANCE", "MONEY_EPSILON", "QTY_EPSILON", "SERVICE", "VERSION", "Marin"]
+__all__ = [
+    "CASH_TOLERANCE",
+    "MONEY_EPSILON",
+    "QTY_EPSILON",
+    "QTY_TOLERANCE",
+    "SERVICE",
+    "VERSION",
+    "Marin",
+]

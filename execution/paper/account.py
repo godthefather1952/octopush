@@ -29,6 +29,7 @@ from core.clock import Clock
 from core.models.common import Millis
 from core.models.execution import FillEvent
 from core.models.portfolio import PortfolioState, PositionState
+from core.models.reconciliation import AccountSnapshot, PositionSummary
 
 #: Milliseconds in a trading day, used for the daily-loss reset.
 DAY_MS = 24 * 60 * 60 * 1000
@@ -181,6 +182,50 @@ class PaperAccount:
             day_started_at=self.day_started_at,
         )
         return state
+
+    def reconciliation_snapshot(self, now_ms: Millis) -> AccountSnapshot:
+        """What this ledger believes, captured for reconciliation.
+
+        Additional to :meth:`snapshot`, not a replacement for it: that returns
+        a ``PortfolioState`` for the risk and dashboard paths and is unchanged.
+        This returns the reconciliation-shaped view, which differs in three
+        ways that matter to a reconciler and not to a risk gate.
+
+        It **takes its instant** rather than reading the clock, so a capture
+        made during replay carries the instant the original run recorded.
+
+        It **names the unsealed tail** (``unsealed_fill_ids``) alongside the
+        checkpoint totals, so a reader can tell which history is still
+        comparable fill-by-fill from which is covered only by its aggregates.
+        A reconciler that could not tell those apart would report a missing
+        fill every time a prefix was sealed.
+
+        It **summarises positions** rather than copying live objects, for the
+        same reason ``snapshot`` copies them deeply: a capture that aliases
+        mutable state is not a capture.
+
+        No comparison, no mutation, no decision.
+        """
+        return AccountSnapshot(
+            created_at=now_ms,
+            initial_balance=self.initial_balance,
+            cash=self.cash,
+            equity=self.equity,
+            peak_equity=max(self.peak_equity, self.equity),
+            realized_pnl=self.realized_pnl,
+            unrealized_pnl=self.unrealized_pnl,
+            fees_paid=self.fees_paid,
+            day_realized_pnl=self.day_realized_pnl,
+            fills_applied=self.fills_applied,
+            fills_sealed=self.checkpoint.fills_sealed,
+            unsealed_fill_ids=[fill.fill_id for fill in self.fill_log],
+            retained_fills=self.retained_fills,
+            positions=[PositionSummary.of(p) for p in self.positions.values()],
+            checkpoint_cash=self.checkpoint.cash,
+            checkpoint_realized_pnl=self.checkpoint.realized_pnl,
+            checkpoint_fees_paid=self.checkpoint.fees_paid,
+            checkpoint_sealed_at=self.checkpoint.sealed_at,
+        )
 
     def recompute_from_fills(self) -> tuple[float, dict[str, PositionState], float]:
         """Independently rebuild cash and positions from the fill log.

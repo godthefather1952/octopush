@@ -12,6 +12,10 @@ from dataclasses import dataclass, field
 
 from agents.lumen import Lumen, build_provider
 from agents.marin import Marin
+from agents.marin.source import (
+    AccountReconciliationSource,
+    ExecutionReconciliationSource,
+)
 from agents.noro import Noro
 from agents.okapi import Okapi
 from agents.rune import Rune, RuneAI
@@ -299,6 +303,17 @@ def build_platform(
     )
     veska = Veska(bus, clock, settings, health, executor)
     marin = Marin(bus=bus, clock=clock, health=health, oms=oms, account=account)
+    # Phase 7: the two accounts of the truth this build actually has. The
+    # execution source reads VESKA's snapshot rather than the OMS directly, so
+    # it sees plan state as well as orders. No venue source is constructed --
+    # none exists -- and no recorded source either; both are interfaces only.
+    # Attaching these changes nothing about how reconciliation runs: MARIN's
+    # existing algorithm is untouched, and the sources feed only the Phase 7
+    # capture surface.
+    marin.attach_sources(
+        execution=ExecutionReconciliationSource(veska),
+        account=AccountReconciliationSource(account),
+    )
 
     kill_switch = KillSwitch(bus, clock, settings)
     orchestrator = Orchestrator(
