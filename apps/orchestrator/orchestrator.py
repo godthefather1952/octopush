@@ -32,6 +32,8 @@ from agents.okapi import Okapi
 from agents.rune import RiskContext, Rune
 from agents.tidal import Tidal
 from agents.zephr import Zephr
+from apps.orchestrator.agent_directory import AgentDirectory
+from apps.orchestrator.coordination import CoordinationRegistry
 from core.bus import EventBus
 from core.bus.barrier import ResponseBarrier
 from core.clock import Clock
@@ -51,6 +53,20 @@ from core.models.opportunity import (
     TradeIntent,
 )
 from core.models.ops import HealthStatus, Severity, SystemEvent
+from core.models.orchestration import (
+    AgentDirectorySnapshot,
+    BarrierSnapshot,
+    ConsensusEvaluationRecord,
+    ConsensusPurpose,
+    ConsensusRequestRecord,
+    CoordinationReadiness,
+    DecisionTrace,
+    OpinionReference,
+    OpportunityWorkflowSummary,
+    OrchestrationPhase,
+    OrchestrationSnapshot,
+    OrchestrationTickRecord,
+)
 from core.models.portfolio import PortfolioState
 from core.models.risk import CommittedExposure, RiskDecision, RiskVerdict
 from core.state import OpportunityRecord, SystemState
@@ -99,6 +115,15 @@ class Orchestrator:
     #: bus.drain() means "the agents have answered" — a guarantee no
     #: distributed transport can make (see core/bus/base.py clause 4).
     barrier: ResponseBarrier | None = None
+    #: Phase 8. The platform's memory of what it coordinated: which tick, which
+    #: phase, which agents were asked, who answered, which consensus produced
+    #: which intent. Written to beside the code that already decides and read
+    #: by nothing in the tick path — a registry a decision consulted would be a
+    #: second decision authority, and an untested one.
+    coordination: CoordinationRegistry = field(default_factory=CoordinationRegistry)
+    #: Phase 8. Agent metadata for display. ``ConsensusConfig.required_agents``
+    #: still decides who is required; this only describes them.
+    agent_directory: AgentDirectory = field(default_factory=AgentDirectory)
     scorecard: Scorecard = field(default_factory=Scorecard)
     #: Reconcile every N ticks; every tick would be wasteful and every hour
     #: would be too late.
@@ -240,6 +265,17 @@ class Orchestrator:
                 ).to_json_dict(),
             )
         )
+        # Phase 8: mirror the state onto the trace. ``record.state`` above
+        # remains the authority -- this is a copy for readers of the trace, and
+        # a copy that disagrees means the mirror is stale, never that the
+        # record is wrong. ``trace_for_opportunity`` returns None for an
+        # opportunity with no trace, which is why nothing here can fail.
+        self.coordination.update_trace_state(
+            record.opportunity.opportunity_id,
+            target,
+            record.updated_at,
+            rejected_reason=record.rejected_reason,
+        )
         if target in (StrategyState.CLOSED, StrategyState.REJECTED):
             self.detector.release(record.opportunity.symbol, record.opportunity.opportunity_id)
             self.working_notional.pop(record.opportunity.opportunity_id, None)
@@ -331,6 +367,19 @@ class Orchestrator:
         self._tick_time = market.created_at
         try:
             await self._tick_body(market)
+        except BaseException as exc:
+            # Phase 8: record that the tick failed, then re-raise the SAME
+            # exception. The registry is a witness, not a handler -- it does
+            # not catch, retry, translate or downgrade anything. A framework
+            # that turned a raised tick into a tidy note would be making a
+            # recovery decision nobody asked for, and the caller would never
+            # learn the tick did not run.
+            self.coordination.fail_tick(
+                self.tick_time, error=f"{type(exc).__name__}: {exc}"
+            )
+            raise
+        else:
+            self.coordination.complete_tick(self.tick_time)
         finally:
             self._tick_time = None
 
@@ -338,13 +387,36 @@ class Orchestrator:
         """The rest of the tick, running at the fixed :attr:`tick_time`."""
         now = self.tick_time
 
+        # Phase 8 coordination metadata. Every call below sits BESIDE the code
+        # that already ran; none of them changes an order of operations, a
+        # branch or a return. Nothing later in this method reads what they
+        # record.
+        self.coordination.begin_tick(
+            now,
+            tick_number=self.ticks,
+            market_timestamp=market.created_at,
+            warming_up=not self.warmed_up,
+        )
+        # OBSERVE has already happened: it is what produced ``market``, at
+        # exactly this instant. It is recorded as opened and closed here
+        # rather than around ``_observe()`` because the tick's logical time is
+        # not known until the snapshot exists, and a phase stamped from a
+        # clock read would not survive replay.
+        self.coordination.enter_phase(OrchestrationPhase.OBSERVE, now)
+        self.coordination.complete_phase(OrchestrationPhase.OBSERVE, now)
+
         # Unconditional -- a warm-up tick or one that produces no trades is
         # still a real tick boundary.
         await self._mark_tick_boundary(now)
 
+        self.coordination.enter_phase(OrchestrationPhase.SETTLE, now)
         await self._settle(now)
+        self.coordination.complete_phase(OrchestrationPhase.SETTLE, now)
+
+        self.coordination.enter_phase(OrchestrationPhase.MEASURE, now)
         portfolio = self._measure(market)
         self._refresh_risk_utilization(portfolio)
+        self.coordination.complete_phase(OrchestrationPhase.MEASURE, now)
 
         if not self.warmed_up:
             self.warmup_ticks += 1
@@ -376,10 +448,22 @@ class Orchestrator:
                     log.debug("warming up", extra={"pending": bad})
                 return
 
+        self.coordination.enter_phase(OrchestrationPhase.PROTECT, now)
         await self._protect(market, portfolio)
+        self.coordination.complete_phase(OrchestrationPhase.PROTECT, now)
+
+        self.coordination.enter_phase(OrchestrationPhase.MANAGE, now)
         await self._manage(market, portfolio)
+        self.coordination.complete_phase(OrchestrationPhase.MANAGE, now)
+
         if self.state.kill_switch.trading_allowed:
+            # The guard is unchanged and still decides whether SEEK runs. The
+            # phase is recorded inside it, so a tick with no SEEK record is a
+            # tick where seeking was not allowed -- which is the fact worth
+            # keeping.
+            self.coordination.enter_phase(OrchestrationPhase.SEEK, now)
             await self._seek(market, portfolio)
+            self.coordination.complete_phase(OrchestrationPhase.SEEK, now)
         await self._publish_state(portfolio)
         self._prune()
         self._heartbeat()
@@ -888,6 +972,32 @@ class Orchestrator:
             self.barrier.expect(
                 opportunity.opportunity_id, set(self.settings.consensus.required_agents)
             )
+            # Phase 8: record that the question was asked. Beside
+            # ``barrier.expect``, never instead of it -- the barrier is still
+            # the only thing that decides who answered.
+            self.coordination.trace_for_opportunity(
+                opportunity.opportunity_id,
+                self.tick_time,
+                create=True,
+                correlation_id=opportunity.opportunity_id,
+                strategy=opportunity.strategy,
+                symbol=opportunity.symbol,
+            )
+            self.coordination.register_consensus_request(
+                opportunity.opportunity_id,
+                self.tick_time,
+                purpose=ConsensusPurpose.ENTRY,
+                required_agents=set(self.settings.consensus.required_agents),
+                symbol=opportunity.symbol,
+                strategy=opportunity.strategy,
+                deadline_ms=opportunity.created_at
+                + self.settings.consensus.agent_response_timeout_ms,
+            )
+            self.coordination.count_tick(
+                opportunities_seen=1,
+                opportunities_created=1,
+                now_ms=self.tick_time,
+            )
             await self.transition(record, StrategyState.AGENTS_EVALUATING)
             # drain() gives local completion only (bus contract clause 4), so
             # it settles in-process agents but proves nothing about remote
@@ -911,6 +1021,13 @@ class Orchestrator:
         required = set(self.settings.consensus.required_agents)
 
         if required <= responded:
+            self._record_barrier_outcome(
+                opportunity.opportunity_id,
+                required=required,
+                responded=responded,
+                waited_ms=self.tick_time - opportunity.created_at,
+                timed_out=False,
+            )
             self.barrier.forget(opportunity.opportunity_id)
             await self._decide(record, market, portfolio)
             return
@@ -933,8 +1050,43 @@ class Orchestrator:
                 },
             )
             self.metrics.inc(M.AGENT_RESPONSE_TIMEOUT, agents=",".join(missing) or "none")
+            self._record_barrier_outcome(
+                opportunity.opportunity_id,
+                required=required,
+                responded=responded,
+                waited_ms=waited,
+                timed_out=True,
+            )
             self.barrier.forget(opportunity.opportunity_id)
             await self._decide(record, market, portfolio)
+
+    def _record_barrier_outcome(
+        self,
+        correlation_id: str,
+        *,
+        required: set[AgentId],
+        responded: set[AgentId],
+        waited_ms: int,
+        timed_out: bool,
+    ) -> None:
+        """Copy a barrier outcome into the coordination record.
+
+        A metadata call, made just before ``barrier.forget`` discards the only
+        copy of who answered. It computes nothing the barrier had not already
+        established, and the platform's behaviour is identical with or without
+        it — which is the property that makes it safe to add to a decision
+        path.
+        """
+        self.coordination.record_barrier_result(
+            correlation_id,
+            self.tick_time,
+            required=required,
+            responded=responded & required,
+            missing=required - responded,
+            complete=required <= responded,
+            timed_out=timed_out,
+            waited_ms=max(0, waited_ms),
+        )
 
     async def _await_pending_agents(
         self, market: MarketState, portfolio: PortfolioState
@@ -947,6 +1099,20 @@ class Orchestrator:
     # -- opportunity pipeline ---------------------------------------------
 
     def _consensus_for(self, record: OpportunityRecord) -> ConsensusResult:
+        result, _ = self._consensus_with_opinions(record)
+        return result
+
+    def _consensus_with_opinions(
+        self, record: OpportunityRecord
+    ) -> tuple[ConsensusResult, list[OpinionReference]]:
+        """The consensus, and compact references to the opinions behind it.
+
+        The consensus computation is byte-for-byte the one that was here
+        before: the same opinions, the same engine call, the same arguments.
+        The second return value is a Phase 8 addition built from the very
+        opinions the engine was handed, so the record cannot describe a
+        different input set than the decision used.
+        """
         opportunity = record.opportunity
         opinions = self.state.opinions_for(
             opportunity.opportunity_id,
@@ -954,12 +1120,56 @@ class Orchestrator:
             degraded_grace_ms=self.settings.consensus.degraded_grace_ms,
             now_ms=self.tick_time,
         )
-        return self.consensus.combine(
+        result = self.consensus.combine(
             symbol=opportunity.symbol,
             strategy=opportunity.strategy,
             opinions=opinions,
             correlation_id=opportunity.opportunity_id,
             now_ms=self.tick_time,
+        )
+        refs = [
+            OpinionReference(
+                agent_id=agent_id,
+                subject=slot.opinion.correlation_id or opportunity.symbol,
+                created_at=slot.opinion.created_at,
+                expires_at=slot.opinion.expires_at,
+                quality=slot.quality,
+                signal=slot.opinion.signal,
+                confidence=slot.opinion.confidence,
+                abstain=slot.opinion.abstain,
+                model_version=slot.opinion.model_version,
+            )
+            for agent_id, slot in opinions.items()
+        ]
+        return result, refs
+
+    def _record_consensus(
+        self,
+        record: OpportunityRecord,
+        result: ConsensusResult,
+        refs: list[OpinionReference],
+        *,
+        purpose: ConsensusPurpose,
+        allowed: bool | None,
+    ) -> None:
+        """Mirror a decided consensus into the coordination record.
+
+        ``allowed`` is what ``ConsensusEngine.entry_allowed`` or
+        ``continuation_allowed`` returned at the call site above, passed down
+        rather than recomputed. Re-deriving it from ``agreement`` and a
+        threshold would put a second, untested decision beside the real one.
+        """
+        self.coordination.record_consensus(
+            result,
+            self.tick_time,
+            purpose=purpose,
+            correlation_id=record.opportunity.opportunity_id,
+            required_agents=list(self.settings.consensus.required_agents),
+            opinion_refs=refs,
+            entry_threshold=self.settings.consensus.entry_threshold,
+            continuation_threshold=self.settings.consensus.exit_threshold,
+            allowed=allowed,
+            opportunity_id=record.opportunity.opportunity_id,
         )
 
     async def _publish_consensus(self, result: ConsensusResult) -> None:
@@ -985,14 +1195,36 @@ class Orchestrator:
             await self._reject(record, "OPPORTUNITY_EXPIRED")
             return
 
-        result = self._consensus_for(record)
+        result, opinion_refs = self._consensus_with_opinions(record)
         await self._publish_consensus(result)
         record.last_agreement = result.agreement
 
         if not result.complete:
+            # ``allowed=None``, not False: the engine's ``entry_allowed`` was
+            # never called on this path, and writing down an answer nobody
+            # asked for would be the record deciding. Incompleteness is
+            # already visible on the record itself.
+            self._record_consensus(
+                record,
+                result,
+                opinion_refs,
+                purpose=ConsensusPurpose.ENTRY,
+                allowed=None,
+            )
             await self._reject(record, "CONSENSUS_INCOMPLETE")
             return
-        if not self.consensus.entry_allowed(result):
+        # The engine decides; the result is then recorded. Calling it once and
+        # reusing the answer keeps the record and the decision from being two
+        # separate evaluations that could differ.
+        entry_allowed = self.consensus.entry_allowed(result)
+        self._record_consensus(
+            record,
+            result,
+            opinion_refs,
+            purpose=ConsensusPurpose.ENTRY,
+            allowed=entry_allowed,
+        )
+        if not entry_allowed:
             await self._reject(record, "CONSENSUS_BELOW_THRESHOLD")
             return
 
@@ -1004,6 +1236,9 @@ class Orchestrator:
             await self._reject(record, "NO_EXECUTABLE_SIZE")
             return
         record.intent = intent
+        self.coordination.link_intent(
+            opportunity.opportunity_id, intent.intent_id, now
+        )
         await self.bus.publish(
             Event(
                 type=EventType.TRADE_INTENT,
@@ -1018,6 +1253,10 @@ class Orchestrator:
         await self.transition(record, StrategyState.RISK_CHECK)
         decision = await self._risk_check(intent, record, market, portfolio, result)
         record.decision = decision
+        self.coordination.link_risk_decision(
+            opportunity.opportunity_id, decision.decision_id, now
+        )
+        self.coordination.count_tick(risk_evaluations=1, now_ms=now)
         if not decision.approved:
             self.state.record_rejection(decision)
             for gate in decision.failed_gates:
@@ -1055,6 +1294,18 @@ class Orchestrator:
         await self.transition(record, StrategyState.EXECUTING)
         report = await self.veska.execute(plan, self.tick_time)
         record.order_ids = [order.client_order_id for order in report.orders]
+        # Identifiers only. Phase 6's registry still owns the plan and its
+        # orders; a copy here could drift from the truth it copied.
+        self.coordination.link_execution_plan(
+            opportunity.opportunity_id,
+            plan.plan_id,
+            self.tick_time,
+            order_ids=list(record.order_ids),
+        )
+        self.coordination.link_trade_ref(
+            opportunity.opportunity_id, plan.plan_id, self.tick_time
+        )
+        self.coordination.count_tick(execution_plans=1, now_ms=self.tick_time)
         await self.bus.drain()
 
     def _build_intent(
@@ -1348,6 +1599,18 @@ class Orchestrator:
         self.barrier.expect(
             opportunity.opportunity_id, set(self.settings.consensus.required_agents)
         )
+        # Phase 8: the same question, asked for a different reason. Tagging it
+        # CONTINUATION is what lets a reader tell an entry consensus from a
+        # continuation one; the thresholds either is measured against are
+        # unchanged.
+        self.coordination.register_consensus_request(
+            opportunity.opportunity_id,
+            self.tick_time,
+            purpose=ConsensusPurpose.CONTINUATION,
+            required_agents=set(self.settings.consensus.required_agents),
+            symbol=opportunity.symbol,
+            strategy=opportunity.strategy,
+        )
         await self.bus.publish(
             Event(
                 type=EventType.OPPORTUNITY_DETECTED,
@@ -1361,12 +1624,28 @@ class Orchestrator:
         await self.bus.drain()
         # Continuous re-evaluation uses the same completion tracking; a
         # position is not exited merely because a remote agent was slow.
+        required = set(self.settings.consensus.required_agents)
+        self._record_barrier_outcome(
+            opportunity.opportunity_id,
+            required=required,
+            responded=self.barrier.responded(opportunity.opportunity_id),
+            waited_ms=0,
+            timed_out=False,
+        )
         self.barrier.forget(opportunity.opportunity_id)
-        result = self._consensus_for(record)
+        result, opinion_refs = self._consensus_with_opinions(record)
         await self._publish_consensus(result)
         record.last_agreement = result.agreement
 
-        if self.consensus.continuation_allowed(result):
+        continuation_allowed = self.consensus.continuation_allowed(result)
+        self._record_consensus(
+            record,
+            result,
+            opinion_refs,
+            purpose=ConsensusPurpose.CONTINUATION,
+            allowed=continuation_allowed,
+        )
+        if continuation_allowed:
             return
         # Below the continuation threshold: cancel what is working and unwind.
         for order_id in record.order_ids:
@@ -1677,6 +1956,202 @@ class Orchestrator:
                 correlation_id=record.opportunity.opportunity_id,
                 payload=attribution.to_json_dict(),
             )
+        )
+
+    # -- coordination observability (Phase 8) ------------------------------
+    #
+    # Every method below is a read. None of them is called from the tick path,
+    # and nothing in the tick path calls anything that calls them. A future
+    # dashboard, API or operator surface can answer "what is this platform
+    # doing?" through these instead of reaching into orchestrator internals.
+
+    def current_tick_record(self) -> OrchestrationTickRecord | None:
+        """The tick currently open, or ``None`` between ticks."""
+        return self.coordination.current_tick()
+
+    def recent_ticks(self, limit: int = 20) -> list[OrchestrationTickRecord]:
+        """The most recently opened tick records, newest last."""
+        return self.coordination.recent_ticks(limit)
+
+    def consensus_requests(self) -> list[ConsensusRequestRecord]:
+        """Every consensus request the registry still holds."""
+        return list(self.coordination.consensus_requests.values())
+
+    def consensus_evaluations(self) -> list[ConsensusEvaluationRecord]:
+        """Every recorded consensus evaluation, entry and continuation."""
+        return list(self.coordination.consensus_evaluations.values())
+
+    def trace_for_opportunity(self, opportunity_id: str) -> DecisionTrace | None:
+        """The causal spine of one opportunity, in identifiers.
+
+        Reading never creates a trace. An opportunity the platform never
+        worked has no trace, and inventing an empty one to avoid returning
+        ``None`` would make "we have no record of this" indistinguishable from
+        "this happened and produced nothing".
+        """
+        return self.coordination.trace_for_opportunity(opportunity_id)
+
+    def agent_directory_snapshot(
+        self, now_ms: Millis | None = None
+    ) -> AgentDirectorySnapshot:
+        """The agent directory, with configuration's required list mirrored in."""
+        return self.agent_directory.snapshot(
+            self.tick_time if now_ms is None else now_ms,
+            required_agents=list(self.settings.consensus.required_agents),
+        )
+
+    def barrier_snapshots(self, now_ms: Millis | None = None) -> list[BarrierSnapshot]:
+        """Every response barrier still waiting, observed without disturbing it."""
+        if self.barrier is None:
+            return []
+        return self.barrier.all_pending_snapshots(
+            self.tick_time if now_ms is None else now_ms
+        )
+
+    def coordination_readiness(
+        self, now_ms: Millis | None = None
+    ) -> CoordinationReadiness:
+        """Whether the coordination layer says the platform is in a fit state.
+
+        **This gates nothing.** Warm-up still decides when trading may begin,
+        the kill switch still decides when it must stop, and
+        ``ConsensusResult.complete`` still decides whether a consensus counts.
+        Replacing any of those with this would swap a tested decision for an
+        untested one.
+
+        ``ready`` is False whenever anything is unestablished — absence of
+        evidence is not readiness.
+        """
+        now = self.tick_time if now_ms is None else now_ms
+        required = list(self.settings.consensus.required_agents)
+        agents_healthy, unhealthy = self.health.all_healthy(
+            [agent.value for agent in required], now
+        )
+        unknown_orders = len(self.veska.unknown_orders())
+        kill_switch_clear = self.state.kill_switch.trading_allowed
+        reconciliation_ok = (
+            self.marin.last_result is not None and self.marin.last_result.ok
+        )
+
+        reasons: list[str] = []
+        if not self.warmed_up:
+            reasons.append("WARMUP_INCOMPLETE")
+        if not required:
+            reasons.append("NO_REQUIRED_AGENTS_CONFIGURED")
+        if not agents_healthy:
+            reasons.extend(f"AGENT_UNHEALTHY:{name}" for name in unhealthy)
+        if not kill_switch_clear:
+            reasons.append("KILL_SWITCH_ENGAGED")
+        if unknown_orders:
+            reasons.append(f"UNKNOWN_ORDERS:{unknown_orders}")
+        if not reconciliation_ok:
+            reasons.append("RECONCILIATION_NOT_CLEAN")
+
+        return CoordinationReadiness(
+            ready=not reasons,
+            created_at=now,
+            warmup_complete=self.warmed_up,
+            warmup_ticks=self.warmup_ticks,
+            required_agents_known=bool(required),
+            required_agents_healthy=agents_healthy,
+            consensus_available=True,
+            risk_available=True,
+            execution_available=not self.state.kill_switch.execution_disabled,
+            reconciliation_available=self.marin.last_result is not None,
+            kill_switch_clear=kill_switch_clear,
+            open_unknown_orders=unknown_orders,
+            components=[],
+            reason_codes=reasons,
+        )
+
+    def coordination_snapshot(
+        self, now_ms: Millis | None = None
+    ) -> OrchestrationSnapshot:
+        """One serializable view of the whole coordination layer.
+
+        Compact references and counts rather than embedded snapshots: a view
+        that carried every order and every fill would be sized by session
+        history rather than by what is currently happening.
+        """
+        now = self.tick_time if now_ms is None else now_ms
+        current = self.coordination.current_tick()
+        barriers = self.barrier_snapshots(now)
+        execution = self.veska.metrics()
+        discrepancies = self.marin.open_discrepancies()
+
+        return OrchestrationSnapshot(
+            created_at=now,
+            ticks_completed=self.coordination.ticks_completed,
+            current_tick_id=current.tick_id if current else None,
+            current_tick_number=current.tick_number if current else 0,
+            current_phase=(
+                current.current_phase if current else OrchestrationPhase.IDLE
+            ),
+            warmed_up=self.warmed_up,
+            warmup_ticks=self.warmup_ticks,
+            agent_directory=self.agent_directory_snapshot(now),
+            barrier_outstanding=self.barrier.outstanding if self.barrier else 0,
+            barriers=barriers,
+            pending_consensus_requests=self.coordination.pending_requests(),
+            open_opportunities=[
+                self._workflow_summary(record)
+                for record in self.state.open_opportunities()
+            ],
+            kill_switch_engaged=self.state.kill_switch.engaged,
+            kill_switch_triggers=list(self.state.kill_switch.triggered_by),
+            execution_open_orders=len(self.veska.open_orders()),
+            execution_outstanding_orders=execution.orders_outstanding,
+            execution_unknown_orders=execution.orders_unknown,
+            execution_active_plans=len(self.veska.active_plans()),
+            reconciliation_ok=(
+                None
+                if self.marin.last_result is None
+                else self.marin.last_result.ok
+            ),
+            reconciliation_open_critical=sum(
+                1
+                for discrepancy in discrepancies
+                if discrepancy.severity is Severity.CRITICAL
+            ),
+            coordination_metrics=self.coordination.metrics(
+                late_agent_responses=self.barrier.late_responses
+                if self.barrier
+                else 0
+            ),
+            readiness=self.coordination_readiness(now),
+        )
+
+    def _workflow_summary(
+        self, record: OpportunityRecord
+    ) -> OpportunityWorkflowSummary:
+        """Flatten one opportunity's position in the pipeline.
+
+        Every field is copied from something that stays authoritative:
+        ``OpportunityRecord`` for state and economics, the trace for the
+        identifiers linking the phases together.
+        """
+        opportunity = record.opportunity
+        trace = self.coordination.trace_for_opportunity(opportunity.opportunity_id)
+        return OpportunityWorkflowSummary(
+            opportunity_id=opportunity.opportunity_id,
+            strategy=opportunity.strategy,
+            symbol=opportunity.symbol,
+            strategy_state=record.state,
+            created_at=opportunity.created_at,
+            updated_at=record.updated_at,
+            trace_id=trace.trace_id if trace else None,
+            intent_id=record.intent.intent_id if record.intent else None,
+            risk_decision_id=(
+                record.decision.decision_id if record.decision else None
+            ),
+            execution_plan_ids=list(trace.execution_plan_ids) if trace else [],
+            order_ids=list(record.order_ids),
+            entry_agreement=record.entry_agreement,
+            last_agreement=record.last_agreement,
+            filled_notional=record.filled_notional,
+            fees=record.fees,
+            realized_pnl=record.realized_pnl,
+            rejected_reason=record.rejected_reason,
         )
 
     # -- publishing --------------------------------------------------------

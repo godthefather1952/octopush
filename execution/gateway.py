@@ -26,10 +26,11 @@ HTTP, no WebSocket, no signing, no key handling, no exchange SDK — not stubbed
 not commented out, not "for later". A seam that carries a half-written
 credential path is not a seam, it is a liability.
 
-The result models below are transport-neutral on purpose. A venue adapter's job
-would be to normalise its own private truth *into* these shapes, so that
-nothing above it ever learns a venue-specific field name. That is what makes
-reconciliation possible against more than one venue at a time.
+The transport-neutral result models a venue adapter would normalise into live
+in :mod:`core.models.venue_execution` and are re-exported here for
+compatibility. They moved in Phase 8 so that ``core/`` no longer depends on
+``execution/``; the interface below stays, because an interface is not a value
+type.
 
 THE PAPER BOUNDARY IS UNCHANGED
 ===============================
@@ -42,119 +43,30 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from pydantic import Field
-
-from core.models.common import (
-    Base,
-    Liquidity,
-    Millis,
-    OrderType,
-    Side,
-    TimeInForce,
+from core.models.common import Millis, OrderType, Side, TimeInForce
+from core.models.venue_execution import (
+    VenueBalanceSnapshot,
+    VenueFillSnapshot,
+    VenueGatewayCapabilities,
+    VenueOrderAck,
+    VenueOrderSnapshot,
+    VenuePositionSnapshot,
 )
-from core.models.execution import OrderStatus
-
 
 # ======================================================================
 # transport-neutral venue truth
 # ======================================================================
-
-
-class VenueOrderAck(Base):
-    """A venue's acknowledgement that it has accepted (or refused) an order."""
-
-    accepted: bool
-    client_order_id: str
-    #: The venue's own identifier, where it issues one.
-    venue_order_id: str | None = None
-    status: OrderStatus = OrderStatus.SUBMITTING
-    #: The venue's timestamp for the acknowledgement, normalised to millis.
-    at_ms: Millis | None = None
-    reason: str = ""
-
-
-class VenueOrderSnapshot(Base):
-    """What a venue says one order currently is.
-
-    The authoritative answer an UNKNOWN order is waiting for. Deliberately
-    minimal: quantities, a status, and the venue's own time — anything richer
-    would start encoding one venue's model.
-    """
-
-    client_order_id: str
-    venue_order_id: str | None = None
-    venue: str
-    symbol: str
-    side: Side
-    order_type: OrderType
-    time_in_force: TimeInForce
-    status: OrderStatus
-    quantity: float
-    filled_quantity: float = 0.0
-    average_price: float | None = None
-    limit_price: float | None = None
-    at_ms: Millis | None = None
-
-
-class VenueFillSnapshot(Base):
-    """One execution as the venue reports it."""
-
-    fill_id: str
-    client_order_id: str
-    venue: str
-    symbol: str
-    side: Side
-    quantity: float
-    price: float
-    fee: float = 0.0
-    #: Venues that do not report this leave it unset rather than guessing.
-    liquidity: Liquidity | None = None
-    at_ms: Millis | None = None
-
-
-class VenuePositionSnapshot(Base):
-    """A position as the venue holds it, in base-asset units."""
-
-    venue: str
-    symbol: str
-    #: Signed: positive is long, negative is short.
-    quantity: float
-    average_entry_price: float | None = None
-    at_ms: Millis | None = None
-
-
-class VenueBalanceSnapshot(Base):
-    """A balance as the venue holds it."""
-
-    venue: str
-    asset: str
-    total: float
-    available: float
-    at_ms: Millis | None = None
-
-
-class VenueGatewayCapabilities(Base):
-    """What a venue adapter would claim its exchange supports.
-
-    Separate from ``ExecutorCapabilities``: that describes what an executor
-    implements, this would describe what a venue permits. A future live
-    executor's capabilities would be the intersection of the two.
-    """
-
-    supports_market: bool = False
-    supports_limit: bool = True
-    supports_ioc: bool = False
-    supports_fok: bool = False
-    supports_post_only: bool = False
-    supports_gtc: bool = True
-    supports_cancel_all: bool = False
-    supports_order_lookup: bool = False
-    supports_position_query: bool = False
-    supports_balance_query: bool = False
-    #: Venue-declared limits, where the venue publishes them.
-    min_order_notional: float | None = None
-    max_order_notional: float | None = None
-    notes: list[str] = Field(default_factory=list)
+#
+# The value models moved to ``core.models.venue_execution`` in Phase 8 and are
+# re-exported here, so ``from execution.gateway import VenueOrderSnapshot``
+# keeps working. There is one canonical definition of each class, in core; this
+# module defines none of them.
+#
+# They moved because reconciliation needed them too, and importing them from
+# ``execution/`` made ``core/`` depend on ``execution/`` -- backwards in a
+# repository where the dependency has always run the other way. The abstract
+# gateway below stays here: it is an execution-layer interface, not a value
+# type.
 
 
 # ======================================================================

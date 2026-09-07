@@ -21,13 +21,17 @@ from agents.okapi import Okapi
 from agents.rune import Rune, RuneAI
 from agents.tidal import Tidal
 from agents.zephr import Zephr
+from apps.orchestrator.agent_directory import AgentDirectory
+from apps.orchestrator.coordination import CoordinationRegistry
 from apps.orchestrator.orchestrator import Orchestrator
 from core.bus import EventBus, InMemoryEventBus, build_bus
 from core.clock import Clock, SystemClock
 from core.config import Settings, load_settings
 from core.events import Event, EventType
 from core.health import HealthRegistry
+from core.models.common import AgentId
 from core.models.market import OrderBookSnapshot, TradeEvent
+from core.models.orchestration import AgentCadence, AgentSubjectScope
 from core.state import SystemState
 from execution.oms import OrderManager
 from execution.paper import FillSimulator, PaperAccount, PaperExecutor
@@ -316,6 +320,14 @@ def build_platform(
     )
 
     kill_switch = KillSwitch(bus, clock, settings)
+
+    # Phase 8: describe the participants this composition root just built.
+    # Metadata only -- no callable, no address, no credential. Registration
+    # changes nothing about trading: an unregistered agent still publishes
+    # opinions, is still tracked by the barrier and is still weighed by the
+    # consensus engine. ``settings.consensus`` is read, never written.
+    agent_directory = _build_agent_directory(settings)
+
     orchestrator = Orchestrator(
         bus=bus,
         clock=clock,
@@ -334,6 +346,8 @@ def build_platform(
         consensus=ConsensusEngine(settings.consensus, clock),
         detector=CrossVenueDetector(settings, clock),
         recorder=recorder,
+        coordination=CoordinationRegistry(),
+        agent_directory=agent_directory,
     )
 
     # Cross-venue relative value intends to carry no directional exposure.
@@ -435,6 +449,85 @@ def build_platform(
         market_generator=generator,
         resync_bridge=resync_bridge,
     )
+
+
+#: What each agent looks at and how often, as this build actually wires them.
+#: Description only -- nothing dispatches on a scope or a cadence, and getting
+#: one wrong changes no behaviour, only a display.
+_AGENT_METADATA: dict[AgentId, tuple[str, AgentSubjectScope, AgentCadence, str]] = {
+    AgentId.TIDAL: (
+        "tidal-0.1",
+        AgentSubjectScope.SYMBOL,
+        AgentCadence.FAST,
+        "Market data and microstructure: books, spreads, executability.",
+    ),
+    AgentId.NORO: (
+        "noro-0.1",
+        AgentSubjectScope.OPPORTUNITY,
+        AgentCadence.FAST,
+        "Relative valuation across venues.",
+    ),
+    AgentId.ZEPHR: (
+        "zephr-0.1",
+        AgentSubjectScope.OPPORTUNITY,
+        AgentCadence.FAST,
+        "Execution feasibility of a proposed trade.",
+    ),
+    AgentId.LUMEN: (
+        "lumen-0.1",
+        AgentSubjectScope.SYMBOL,
+        AgentCadence.SLOW,
+        "Narrative and regime context from an intelligence provider.",
+    ),
+    AgentId.OKAPI: (
+        "okapi-0.1",
+        AgentSubjectScope.SYMBOL,
+        AgentCadence.EVENT_DRIVEN,
+        "Delta measurement and standing hedge maintenance.",
+    ),
+    AgentId.RUNE: (
+        "rune-0.1",
+        AgentSubjectScope.GLOBAL,
+        AgentCadence.EVENT_DRIVEN,
+        "Risk authority: sizing and gates. Not a consensus participant.",
+    ),
+    AgentId.MARIN: (
+        "marin-0.1",
+        AgentSubjectScope.GLOBAL,
+        AgentCadence.SLOW,
+        "Reconciliation between execution and account truth.",
+    ),
+    AgentId.VESKA: (
+        "veska-0.1",
+        AgentSubjectScope.GLOBAL,
+        AgentCadence.EVENT_DRIVEN,
+        "Execution: planning, submission and order lifecycle.",
+    ),
+}
+
+
+def _build_agent_directory(settings: Settings) -> AgentDirectory:
+    """Describe the platform's participants for display.
+
+    ``settings.consensus.required_agents`` and ``settings.consensus.weights``
+    are mirrored into each descriptor and remain the authority: if the
+    directory and the configuration ever disagree, the configuration is right
+    and the directory is stale. Nothing here writes to ``settings``.
+    """
+    directory = AgentDirectory()
+    required = set(settings.consensus.required_agents)
+    for agent_id, (version, scope, cadence, description) in _AGENT_METADATA.items():
+        directory.register(
+            agent_id,
+            service=agent_id.value,
+            version=version,
+            scope=scope,
+            cadence=cadence,
+            required_by_default=agent_id in required,
+            weight=settings.consensus.weights.get(agent_id),
+            description=description,
+        )
+    return directory
 
 
 async def _lumen_market(lumen: Lumen, event: Event) -> None:

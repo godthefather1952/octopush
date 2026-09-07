@@ -34,17 +34,14 @@ in :mod:`core.models.ops` and keep their exact meaning.
 not a replacement for it — a mismatch is a measurement, a discrepancy is a
 measurement someone is tracking through to a resolution.
 
-A NOTE ON ONE IMPORT
-====================
-This module imports the venue snapshot models from :mod:`execution.gateway`,
-which is the one place in ``core/`` that reaches into ``execution/``. Phase 6
-put those transport-neutral shapes there, and duplicating them here to preserve
-the layering would create two definitions of venue truth that could drift —
-much worse than one import in one direction. There is no import cycle:
-``execution.gateway`` depends only on ``core.models.common`` and
-``core.models.execution``, neither of which knows this module exists. Relocating
-the venue models to ``core/models/`` is a reasonable later cleanup; it is not
-worth churning Phase 6 for during a construction pass.
+VENUE VALUE TYPES COME FROM CORE
+===============================
+The venue snapshot models are imported from :mod:`core.models.venue_execution`.
+Phase 7 imported them from ``execution.gateway`` — the one place ``core/`` ever
+reached into ``execution/`` — and noted the exception as a later cleanup. Phase
+8 performed it: the value types moved into core, the abstract gateway stayed in
+``execution/`` where an execution-layer interface belongs, and ``core/`` no
+longer imports ``execution/`` at all.
 """
 
 from __future__ import annotations
@@ -55,7 +52,7 @@ from core.models.common import Base, Envelope, Millis, StrEnum, new_id
 from core.models.execution import ExecutionSnapshot, OrderStatus
 from core.models.ops import Mismatch, MismatchKind, Severity
 from core.models.portfolio import PositionState
-from execution.gateway import (
+from core.models.venue_execution import (
     VenueBalanceSnapshot,
     VenueFillSnapshot,
     VenueOrderSnapshot,

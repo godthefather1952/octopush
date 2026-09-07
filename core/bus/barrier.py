@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 
 from core.clock import Clock
 from core.models.common import AgentId, Millis
+from core.models.orchestration import BarrierSnapshot
 
 
 @dataclass
@@ -94,6 +95,49 @@ class ResponseBarrier:
     def outstanding(self) -> int:
         return len(self._pending)
 
+    # -- observation -------------------------------------------------------
+    #
+    # Read-only views added in Phase 8 so that "who are we still waiting on?"
+    # can be answered without waiting. None of them registers, records,
+    # completes or forgets anything: calling them cannot change what a
+    # concurrent ``wait`` will return, which is the only property that makes
+    # them safe to call from a display or a snapshot.
+
+    def snapshot(self, correlation_id: str, now_ms: Millis) -> BarrierSnapshot | None:
+        """What one outstanding registration looks like right now.
+
+        Returns ``None`` for an id that was never registered or has already
+        been forgotten — and those two cases are indistinguishable here on
+        purpose. The barrier does not keep a history, and inventing one would
+        make a completed wait look outstanding forever.
+
+        ``now_ms`` is supplied by the caller rather than read from the clock,
+        so a snapshot taken during replay carries the replay's instant.
+        """
+        pending = self._pending.get(correlation_id)
+        if pending is None:
+            return None
+        return BarrierSnapshot(
+            correlation_id=correlation_id,
+            required=sorted(pending.required),
+            responded=sorted(pending.responded),
+            missing=sorted(pending.required - pending.responded),
+            complete=pending.required <= pending.responded,
+            captured_at=now_ms,
+        )
+
+    def pending_ids(self) -> list[str]:
+        """Every correlation id currently registered, in registration order."""
+        return list(self._pending.keys())
+
+    def all_pending_snapshots(self, now_ms: Millis) -> list[BarrierSnapshot]:
+        """A snapshot of every outstanding registration."""
+        return [
+            snapshot
+            for correlation_id in self.pending_ids()
+            if (snapshot := self.snapshot(correlation_id, now_ms)) is not None
+        ]
+
     async def wait(self, correlation_id: str, timeout_ms: int) -> BarrierResult:
         """Wait for every required responder, or until ``timeout_ms`` elapses.
 
@@ -144,4 +188,4 @@ class ResponseBarrier:
         return result
 
 
-__all__ = ["BarrierResult", "ResponseBarrier"]
+__all__ = ["BarrierResult", "BarrierSnapshot", "ResponseBarrier"]
