@@ -43,6 +43,7 @@ from core.health import HealthRegistry
 from core.models.agent import AgentOpinion, ConsensusResult
 from core.models.common import AgentId, Millis, Side
 from core.models.execution import ExecutionRole, FillEvent, OrderStatus
+from core.models.hedging import HedgeRequestStatus
 from core.models.market import MarketState, safe_bps
 from core.models.opportunity import (
     STRATEGY_TRANSITIONS,
@@ -1823,7 +1824,41 @@ class Orchestrator:
             self.working_hedges[hedge.symbol] = [
                 order.client_order_id for order in report.orders
             ]
+            # Phase 9: link the residual to what it became. Identifiers only --
+            # Phase 6's registry still owns the plan and its orders, and
+            # ``working_hedges`` above remains the authority on whether a hedge
+            # is in flight. Nothing below is read by any branch in this method.
+            self._link_hedge(hedge, hedge_intent, plan, report, now)
             await self.bus.drain()
+
+    def _link_hedge(self, hedge, hedge_intent, plan, report, now: Millis) -> None:
+        """Record a hedge's trade intent, plan and orders against its request.
+
+        Every value is copied from objects the code above already built. The
+        registry lookup goes through ``HedgeIntent.hedge_id``, which
+        ``build_hedges`` minted and which is the correlation id on the trade
+        intent, the plan and every order — so a downstream record can always
+        find its way back.
+
+        Returns nothing, and a missing registry record is a silent no-op: a
+        bookkeeping call that raised because a mirror was absent would let the
+        record break the thing it records.
+        """
+        record = self.okapi.hedge_registry.for_intent(hedge.hedge_id)
+        if record is None:
+            return
+        registry = self.okapi.hedge_registry
+        registry.attach_trade_intent(record.hedge_id, hedge_intent.intent_id, now)
+        registry.attach_execution_plan(record.hedge_id, plan.plan_id, now)
+        registry.attach_orders(
+            record.hedge_id,
+            [order.client_order_id for order in report.orders],
+            now,
+        )
+        # SUBMITTING is what just happened -- the plan was handed to VESKA.
+        # Where it goes next is Phase 6's to establish; ``derive_hedge_status``
+        # offers a reading of it, and no caller applies that automatically.
+        registry.set_status(record.hedge_id, HedgeRequestStatus.SUBMITTING, now)
 
     def _hedge_in_flight(self, symbol: str) -> bool:
         """Whether a hedge for this symbol is still working."""
@@ -2113,6 +2148,14 @@ class Orchestrator:
                 for discrepancy in discrepancies
                 if discrepancy.severity is Severity.CRITICAL
             ),
+            # Phase 9: three counts off a registry the orchestrator already
+            # holds. No hedge record is embedded, and no LUMEN state is read —
+            # the orchestrator has no reference to LUMEN, and giving it one to
+            # populate a display field would couple the fast loop to the
+            # intelligence layer for no operational gain.
+            hedges_active=len(self.okapi.active_hedges()),
+            hedges_outstanding=len(self.okapi.outstanding_hedges()),
+            hedges_unknown=len(self.okapi.unknown_hedges()),
             coordination_metrics=self.coordination.metrics(
                 late_agent_responses=self.barrier.late_responses
                 if self.barrier

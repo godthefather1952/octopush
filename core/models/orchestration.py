@@ -864,6 +864,18 @@ class OrchestrationSnapshot(Base):
     reconciliation_ok: bool | None = None
     reconciliation_open_critical: int = 0
 
+    #: Phase 9. Counts, read off OKAPI's hedge registry — which the
+    #: orchestrator already holds — rather than embedding hedge records.
+    #:
+    #: There are deliberately no LUMEN fields here. The orchestrator has no
+    #: reference to LUMEN: intelligence reaches it only as an ``AgentOpinion``
+    #: on the bus, and adding a ``lumen`` dependency to aggregate a readiness
+    #: flag would create a coupling the architecture has always avoided.
+    #: ``Lumen.lumen_snapshot`` answers those questions where LUMEN lives.
+    hedges_active: int = 0
+    hedges_outstanding: int = 0
+    hedges_unknown: int = 0
+
     coordination_metrics: CoordinationMetrics = Field(
         default_factory=CoordinationMetrics
     )

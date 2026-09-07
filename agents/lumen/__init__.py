@@ -8,17 +8,29 @@ from agents.lumen.provider import (
     ScriptedProvider,
     build_provider,
 )
+from agents.lumen.providers import (
+    IntelligenceProviderDirectory,
+    describe_provider,
+)
+from agents.lumen.registry import IntelligenceRegistry, IntelligenceStore
+from agents.lumen.source import IntelligenceSource, LocalHeadlineSource
 
 __all__ = [
     "SERVICE",
     "VERSION",
     "ClaudeProvider",
     "IntelligenceProvider",
+    "IntelligenceProviderDirectory",
+    "IntelligenceRegistry",
     "IntelligenceRequest",
     "IntelligenceResponse",
+    "IntelligenceSource",
+    "IntelligenceStore",
+    "LocalHeadlineSource",
     "Lumen",
     "NewsItem",
     "NullProvider",
     "ScriptedProvider",
     "build_provider",
+    "describe_provider",
 ]

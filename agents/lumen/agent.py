@@ -25,14 +25,36 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from agents.lumen.provider import IntelligenceProvider, IntelligenceRequest
+from agents.lumen.provider import (
+    IntelligenceProvider,
+    IntelligenceRequest,
+    IntelligenceResponse,
+)
+from agents.lumen.providers import IntelligenceProviderDirectory, describe_provider
+from agents.lumen.registry import IntelligenceRegistry
 from core.bus import EventBus
 from core.clock import Clock
 from core.config import Settings
 from core.events import Event, EventType
 from core.health import HealthRegistry
 from core.models.agent import AgentOpinion
-from core.models.common import AgentId
+from core.models.common import AgentId, Millis
+from core.models.intelligence import (
+    EvidenceFreshness,
+    IntelligenceAnalysisRecord,
+    IntelligenceEvidence,
+    IntelligenceEvidenceBundle,
+    IntelligenceLoopSnapshot,
+    IntelligenceLoopStatus,
+    IntelligenceMarketContext,
+    IntelligenceProviderDescriptor,
+    IntelligenceReplayProvenance,
+    IntelligenceSourceKind,
+    LumenContextSnapshot,
+    LumenReadiness,
+    LumenSnapshot,
+    PublishedOpinionRef,
+)
 from core.models.market import MarketState
 from core.models.ops import HealthStatus
 
@@ -109,9 +131,23 @@ class Lumen:
     consecutive_failures: int = 0
     last_call_ms: int | None = None
     latencies_ms: list[float] = field(default_factory=list)
+    #: Phase 10. Provenance for each pass of the slow loop: what LUMEN saw,
+    #: what it asked, what came back, and which opinion that produced. Written
+    #: to beside the code that already decides and read by nothing — whether an
+    #: opinion is produced still depends only on the provider response and
+    #: :meth:`_to_opinion`.
+    intel_registry: IntelligenceRegistry = field(default_factory=IntelligenceRegistry)
+    #: Phase 10. Provider metadata for display. ``build_provider`` still selects
+    #: by configured name, and nothing here switches or fails over.
+    provider_directory: IntelligenceProviderDirectory = field(
+        default_factory=IntelligenceProviderDirectory
+    )
 
     def __post_init__(self) -> None:
         self.health.register(SERVICE, VERSION)
+        # Describe the provider wiring already chose. Metadata only: this
+        # neither selects a provider nor touches a credential.
+        self.provider_directory.register_provider(self.provider, active=True)
 
     # -- input -------------------------------------------------------------
 
@@ -158,19 +194,29 @@ class Lumen:
         """Ask the provider for a read. Returns ``None`` when unavailable."""
         self.calls += 1
         self.last_call_ms = self.clock.now_ms()
-        response = await self.provider.analyze(
-            IntelligenceRequest(
-                task="information_environment",
-                system=SYSTEM_PROMPT,
-                payload=self._context(symbol),
-                response_schema=RESPONSE_SCHEMA,
-                max_tokens=self.settings.lumen.max_tokens,
-                timeout_s=self.settings.lumen.timeout_s,
-            )
+        # The request is built exactly as before and handed to the provider
+        # unchanged. It is bound to a local first only so the provenance record
+        # can be built from the very payload that was sent -- calling
+        # ``_context`` a second time would read the clock again and could
+        # describe a different ``as_of_ms`` than the provider actually saw.
+        request = IntelligenceRequest(
+            task="information_environment",
+            system=SYSTEM_PROMPT,
+            payload=self._context(symbol),
+            response_schema=RESPONSE_SCHEMA,
+            max_tokens=self.settings.lumen.max_tokens,
+            timeout_s=self.settings.lumen.timeout_s,
         )
+        analysis = self._begin_analysis(symbol, request)
+        # ONE call. Provenance never costs a second request: against a
+        # non-deterministic model a second call would record a different
+        # answer than the one the platform used.
+        response = await self.provider.analyze(request)
         self.latencies_ms.append(response.latency_ms)
         if len(self.latencies_ms) > 200:
             del self.latencies_ms[:100]
+
+        self._record_response(analysis, response)
 
         if not response.ok:
             self.failures += 1
@@ -184,6 +230,7 @@ class Lumen:
         self.consecutive_failures = 0
         opinion = self._to_opinion(symbol, response.data)
         self._heartbeat()
+        self._record_outcome(analysis, opinion)
         return opinion
 
     def _to_opinion(self, symbol: str, data: dict[str, Any]) -> AgentOpinion | None:
@@ -263,6 +310,360 @@ class Lumen:
                 log.exception("LUMEN loop failed")
                 self.failures += 1
             await self.clock.sleep(self.settings.lumen.poll_interval_s)
+
+    # -- provenance (Phase 10) --------------------------------------------
+    #
+    # Everything below records or reports. The three ``_record``/``_begin``
+    # helpers are writes whose results nothing branches on; the rest are reads
+    # that nothing in the slow loop calls. Removing all of it would leave
+    # LUMEN's behaviour identical.
+
+    def _logical_now(self) -> Millis:
+        """The instant the provenance records use.
+
+        Reuses ``last_call_ms``, the clock read :meth:`evaluate` already made
+        for this pass, rather than taking another. Phase 10 adds no clock read
+        to LUMEN; the existing slow-loop clock behaviour is untouched and its
+        logical-time correctness is validation work, not this phase's.
+        """
+        return self.last_call_ms if self.last_call_ms is not None else 0
+
+    def _evidence_from_payload(
+        self, symbol: str, payload: dict[str, Any], now_ms: Millis
+    ) -> list[IntelligenceEvidence]:
+        """Adapt the headlines that were actually sent into evidence.
+
+        Built from ``request.payload`` — the object the provider received — so
+        the record cannot describe a different input set than the one that was
+        analysed. No filtering happens here: ``_context`` already applied
+        LUMEN's own window (last ten, published within the hour) and a second
+        filter that disagreed would misdescribe what the provider saw.
+
+        ``freshness`` is left UNKNOWN rather than derived, for the same reason.
+        """
+        return [
+            IntelligenceEvidence(
+                kind=IntelligenceSourceKind.HEADLINE,
+                source=str(item.get("source", "")),
+                title=str(item.get("headline", "")),
+                published_at=item.get("published_ms"),
+                captured_at=now_ms,
+                symbol=symbol,
+                body_excerpt=str(item.get("body", ""))[:1000],
+                freshness=EvidenceFreshness.UNKNOWN,
+            )
+            for item in payload.get("recent_headlines", [])
+            if isinstance(item, dict)
+        ]
+
+    def _market_context_from_payload(
+        self, symbol: str, payload: dict[str, Any], now_ms: Millis
+    ) -> IntelligenceMarketContext | None:
+        """Type the coarse market summary that was sent, if there was one."""
+        summary = payload.get("market_summary")
+        if not isinstance(summary, dict):
+            return None
+        return IntelligenceMarketContext(
+            created_at=now_ms,
+            symbol=symbol,
+            reference_price=summary.get("reference_price"),
+            venues_quoting=int(summary.get("venues_quoting", 0) or 0),
+            max_cross_venue_deviation_bps=summary.get(
+                "max_cross_venue_deviation_bps"
+            ),
+            short_vol_bps=float(summary.get("short_vol_bps", 0.0) or 0.0),
+            source_data_timestamp=(
+                self.market.source_data_timestamp if self.market is not None else None
+            ),
+        )
+
+    def _begin_analysis(
+        self, symbol: str, request: IntelligenceRequest
+    ) -> IntelligenceAnalysisRecord:
+        """Open the provenance record for one pass, from the request just built.
+
+        Records the evidence bundle and a *summary* of the request. The system
+        prompt and the response schema are module constants; storing either
+        per call would make the record's size a function of how often the slow
+        loop ran.
+        """
+        now = self._logical_now()
+        bundle = self.intel_registry.register_evidence_bundle(
+            symbol,
+            now,
+            evidence=self._evidence_from_payload(symbol, request.payload, now),
+            market_context=self._market_context_from_payload(
+                symbol, request.payload, now
+            ),
+            complete=True,
+        )
+        analysis = self.intel_registry.begin_analysis(
+            symbol,
+            now,
+            task=request.task,
+            provider=self.provider.name,
+            model=getattr(self.provider, "model", None),
+            evidence_bundle_id=bundle.bundle_id,
+        )
+        self.intel_registry.attach_request(
+            analysis.analysis_id,
+            now,
+            task=request.task,
+            provider=self.provider.name,
+            model=getattr(self.provider, "model", None),
+            max_tokens=request.max_tokens,
+            timeout_s=request.timeout_s,
+            payload_summary={
+                "symbol": symbol,
+                "headlines": str(len(bundle.evidence)),
+                "market_summary": str("market_summary" in request.payload),
+            },
+            schema_name="lumen_information_environment",
+        )
+        return analysis
+
+    def _record_response(
+        self, analysis: IntelligenceAnalysisRecord, response: IntelligenceResponse
+    ) -> None:
+        """Mirror the outcome of the one call that was made.
+
+        Runs before the failure branch in :meth:`evaluate` and changes none of
+        its counters. ``unavailable`` and a plain failure are kept apart
+        because the provider already keeps them apart: an outage is not a
+        defect.
+        """
+        now = self._logical_now()
+        self.intel_registry.attach_response(
+            analysis.analysis_id,
+            now,
+            ok=response.ok,
+            provider=response.provider,
+            model=response.model,
+            latency_ms=response.latency_ms,
+            unavailable=response.unavailable,
+            error=response.error or "",
+            data=response.data,
+        )
+        if not response.ok:
+            if response.unavailable:
+                self.intel_registry.mark_unavailable(
+                    analysis.analysis_id, now, error=response.error or ""
+                )
+            else:
+                self.intel_registry.mark_failed(
+                    analysis.analysis_id, now, error=response.error or ""
+                )
+
+    def _record_outcome(
+        self, analysis: IntelligenceAnalysisRecord, opinion: AgentOpinion | None
+    ) -> None:
+        """Record what a successful call became.
+
+        ``opinion is None`` here means ``_to_opinion`` found the payload
+        unreadable — it has already logged, already counted a failure, and
+        already published nothing. The registry marks the analysis malformed
+        *after* that outcome. It never invents a neutral opinion to fill the
+        gap: a fabricated neutral vote is a lie, and publishing nothing is the
+        honest answer the platform already gives.
+        """
+        now = self._logical_now()
+        if opinion is None:
+            self.intel_registry.mark_malformed(
+                analysis.analysis_id, now, error="response payload unreadable"
+            )
+            return
+        self.intel_registry.complete_analysis(analysis.analysis_id, now)
+        self.intel_registry.link_opinion(
+            analysis.analysis_id,
+            PublishedOpinionRef(
+                agent_id=opinion.agent_id,
+                symbol=opinion.symbol,
+                created_at=opinion.created_at,
+                expires_at=opinion.expires_at,
+                model_version=opinion.model_version,
+                correlation_id=opinion.correlation_id,
+                signal=opinion.signal,
+                confidence=opinion.confidence,
+            ),
+            now,
+        )
+
+    # -- query surface (Phase 10) -----------------------------------------
+
+    def analyses(self, limit: int = 20) -> list[IntelligenceAnalysisRecord]:
+        """The most recent analyses, newest last."""
+        return self.intel_registry.recent_analyses(limit)
+
+    def analysis_for_id(self, analysis_id: str) -> IntelligenceAnalysisRecord | None:
+        return self.intel_registry.get_analysis(analysis_id)
+
+    def latest_analysis(self, symbol: str) -> IntelligenceAnalysisRecord | None:
+        return self.intel_registry.latest_for_symbol(symbol)
+
+    def evidence_bundles(self, limit: int = 20) -> list[IntelligenceEvidenceBundle]:
+        """The most recently captured evidence bundles."""
+        return self.intel_registry.evidence_bundle_list(limit)
+
+    def provider_descriptor(self) -> IntelligenceProviderDescriptor:
+        """What provider is wired, and what it is like.
+
+        Carries no API key, no header and no client object, and must never
+        learn to.
+        """
+        return self.provider_directory.active() or describe_provider(self.provider)
+
+    def context_snapshot(
+        self, analysis_id: str
+    ) -> LumenContextSnapshot | None:
+        """What LUMEN saw for one analysis.
+
+        References the stored bundle rather than re-assembling the payload, so
+        it cannot describe a different input set than the provider was sent.
+        """
+        analysis = self.intel_registry.get_analysis(analysis_id)
+        if analysis is None:
+            return None
+        bundle = (
+            self.intel_registry.get_bundle(analysis.evidence_bundle_id)
+            if analysis.evidence_bundle_id
+            else None
+        )
+        return LumenContextSnapshot(
+            created_at=analysis.created_at,
+            symbol=analysis.symbol,
+            analysis_id=analysis.analysis_id,
+            evidence_bundle_id=analysis.evidence_bundle_id,
+            market_context=bundle.market_context if bundle else None,
+            headline_ids=[item.evidence_id for item in bundle.evidence]
+            if bundle
+            else [],
+            headlines_in_scope=len(bundle.evidence) if bundle else 0,
+        )
+
+    def replay_provenance(
+        self, analysis_id: str
+    ) -> IntelligenceReplayProvenance | None:
+        """How a recorded analysis behaves under replay.
+
+        Always the same three answers, for every analysis this build produces:
+        recorded, replayed as an external input, and **the provider is not
+        reinvoked**. Replay republishes the recorded ``AGENT_OPINION`` events;
+        it could not re-ask a non-deterministic model deterministically, and a
+        replay that did would not be a replay of anything.
+
+        This describes the replay engine. It does not configure it, and the
+        replay engine is untouched by this phase.
+        """
+        analysis = self.intel_registry.get_analysis(analysis_id)
+        if analysis is None:
+            return None
+        return IntelligenceReplayProvenance(
+            analysis_id=analysis.analysis_id,
+            opinion_reference=analysis.published_opinion_ref,
+            provider=analysis.provider,
+            model=analysis.model,
+            recorded=analysis.published,
+            replayed_as_external_input=True,
+            provider_reinvoked=False,
+        )
+
+    def loop_snapshot(self, now_ms: Millis) -> IntelligenceLoopSnapshot:
+        """Where the slow loop stands, derived from state that already exists.
+
+        ``run_forever`` is untouched, so RUNNING and SLEEPING are not
+        distinguishable from outside it — the status reported is DEGRADED when
+        the provider has failed consecutively, IDLE before the first call, and
+        SLEEPING between passes. Adding a status assignment inside the loop
+        would be rewriting the loop, which this phase may not do.
+        """
+        interval_ms = int(self.settings.lumen.poll_interval_s * 1000)
+        if self.last_call_ms is None:
+            status = IntelligenceLoopStatus.IDLE
+        elif self.consecutive_failures:
+            status = IntelligenceLoopStatus.DEGRADED
+        else:
+            status = IntelligenceLoopStatus.SLEEPING
+        return IntelligenceLoopSnapshot(
+            created_at=now_ms,
+            status=status,
+            last_run_at=self.last_call_ms,
+            next_run_due_at=(
+                None if self.last_call_ms is None else self.last_call_ms + interval_ms
+            ),
+            poll_interval_s=self.settings.lumen.poll_interval_s,
+            symbols_total=len(self.settings.symbols),
+            symbols_processed=len(self.intel_registry.latest_analysis_ids()),
+            analyses_started=self.intel_registry.analyses_started,
+            analyses_completed=self.intel_registry.analyses_completed,
+        )
+
+    def readiness(self, now_ms: Millis) -> LumenReadiness:
+        """Whether the intelligence layer is in a fit state. **Reporting only.**
+
+        **LUMEN IS OPTIONAL**, and ``ready=False`` here must never stop
+        trading. LUMEN is not in ``required_agents``, a missing LUMEN opinion
+        does not make a consensus incomplete, and with the shipped
+        ``NullProvider`` configuration this reports unready permanently while
+        the platform trades normally — the designed state, not a fault.
+
+        Provider health is separate and unchanged: :meth:`_heartbeat` still
+        decides OFFLINE, DEGRADED and HEALTHY exactly as before.
+        """
+        descriptor = self.provider_descriptor()
+        recent = self.intel_registry.recent_analyses(1)
+        reasons: list[str] = []
+        if not descriptor.configured:
+            reasons.append("NO_PROVIDER_CONFIGURED")
+        if self.consecutive_failures:
+            reasons.append(f"CONSECUTIVE_FAILURES:{self.consecutive_failures}")
+        if not self.headlines:
+            reasons.append("NO_EVIDENCE")
+        if self.market is None:
+            reasons.append("NO_MARKET_CONTEXT")
+        if not recent:
+            reasons.append("NO_RECENT_ANALYSIS")
+
+        return LumenReadiness(
+            ready=not reasons,
+            created_at=now_ms,
+            provider_configured=descriptor.configured,
+            provider_available=self.consecutive_failures == 0 and self.calls > 0,
+            evidence_available=bool(self.headlines),
+            market_context_available=self.market is not None,
+            recent_analysis_available=bool(recent),
+            consecutive_failures=self.consecutive_failures,
+            optional=True,
+            reason_codes=reasons,
+            detail=f"provider={descriptor.name}",
+        )
+
+    def lumen_snapshot(self, now_ms: Millis) -> LumenSnapshot:
+        """One serializable view of the intelligence layer.
+
+        Compact metadata: counters, the provider descriptor, and *ids* for
+        recent analyses. A snapshot embedding every analysis with its evidence
+        would be sized by how much news the platform had ingested rather than
+        by what is currently happening.
+        """
+        return LumenSnapshot(
+            created_at=now_ms,
+            provider=self.provider_descriptor(),
+            last_call_ms=self.last_call_ms,
+            calls=self.calls,
+            failures=self.failures,
+            consecutive_failures=self.consecutive_failures,
+            mean_latency_ms=self.mean_latency_ms,
+            headline_count=len(self.headlines),
+            pending_analyses=len(self.intel_registry.pending()),
+            recent_analysis_ids=[
+                record.analysis_id for record in self.intel_registry.recent_analyses(10)
+            ],
+            latest_analysis_by_symbol=self.intel_registry.latest_analysis_ids(),
+            latest_opinion_by_symbol=self.intel_registry.latest_opinions(),
+            loop=self.loop_snapshot(now_ms),
+            metrics=self.intel_registry.metrics(),
+            readiness=self.readiness(now_ms),
+        )
 
     @property
     def mean_latency_ms(self) -> float:
