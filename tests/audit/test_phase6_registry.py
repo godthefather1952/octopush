@@ -476,6 +476,7 @@ class TestExecutionReportSemantics:
         await harness.veska.execute(plan, T0)
         for step in range(1, 5):
             await harness.veska.poll(T0 + step * _latency(harness))
+        await harness.drain_events()
 
         reports = harness.events_of(EventType.EXECUTION_REPORT)
         assert len(reports) == 1, (

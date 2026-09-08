@@ -460,6 +460,16 @@ class ExecutionHarness:
 
     # -- events -------------------------------------------------------
 
+    async def drain_events(self) -> None:
+        """Dispatch queued audit events through the real bus before inspection.
+
+        InMemoryEventBus.publish is enqueue-only. Event-integrity tests
+        therefore drive the bus's own drain lifecycle before reading
+        captured events. This preserves production dispatch semantics
+        without patching or substituting the bus.
+        """
+        await self.bus.drain()
+
     def events_of(self, *types: EventType) -> list[Event]:
         wanted = set(types)
         return [e for e in self.published if e.type in wanted]
@@ -549,7 +559,7 @@ class ExplodingBus:
 
     async def publish(self, event: Event) -> None:
         self.publishes += 1
-        if self.fail_on_publish is not None and self.publishes >= self.fail_on_publish:
+        if self.fail_on_publish is not None and self.publishes == self.fail_on_publish:
             raise RuntimeError(
                 f"audit-injected transport failure on publish #{self.publishes}"
             )

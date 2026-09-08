@@ -103,7 +103,7 @@ def _fingerprint(harness, plan_id: str, at: int) -> dict[str, Any]:
             "fees_paid": harness.account.fees_paid,
             "fills_applied": harness.account.fills_applied,
             "positions": {
-                key: (position.quantity, position.average_price)
+                key: (position.quantity, position.average_entry_price)
                 for key, position in sorted(harness.account.positions.items())
             },
         },

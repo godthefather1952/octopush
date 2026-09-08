@@ -1,6 +1,6 @@
 # Phase 6 — VESKA / paper-execution validation audit
 
-**Status: AUDIT HARNESS CORRECTED / EXTERNAL RERUN REQUIRED.**
+**Status: CI #54 CLASSIFIED / AUDIT HARNESS CORRECTED / EXTERNAL RERUN REQUIRED.**
 
 **PRODUCTION CHANGES: NONE.**
 
@@ -20,7 +20,7 @@ Nothing here has been fixed, weakened, skipped or xfailed.
 > fully-accounted paper-order lifecycle without silently creating more risk
 > than RUNE authorised, or treating unresolved venue truth as resolved?
 
-Current finding inventory: **no, not yet.** Four findings are CRITICAL, eight HIGH.
+Current finding inventory: **no, not yet.** Four findings are CRITICAL, nine HIGH.
 
 ## Baseline
 
@@ -96,6 +96,64 @@ The source baseline
 - `SIM102` in `agents/okapi/registry.py`.
 
 Those are deliberately unchanged and out of Phase 6 scope.
+
+## External validation — CI #54 classification
+
+GitHub Actions run **#54** (run id `34163556013`) executed audit SHA
+`0a5d1f76e7bf45dfe40f94be38e85fa7e437bf6c`.
+
+Python 3.12 full-suite result:
+
+- **3347 passed**
+- **92 failed**
+- **2 skipped**
+- **1 warning**
+
+The 92 failures classify as:
+
+- **1** known Phase 11/12 packaging baseline failure;
+- **91** Phase 6 audit failures.
+
+Of those 91 Phase 6 failures:
+
+- **61** are attributable to production behaviour under the current audit;
+- **30** are attributable to remaining audit-test / harness defects.
+
+The 30 audit defects fall into four groups and are corrected by the audit-only
+commit following this classification:
+
+1. **Undrained `InMemoryEventBus` capture.** The Phase 6 harness subscribed a
+   capture handler but read `published` without driving the real bus dispatch
+   lifecycle. Those event-integrity failures did not establish missing product
+   events.
+2. **Incorrect replay fingerprint field.**
+   `test_phase6_replay.py::_fingerprint` read `PositionState.average_price`;
+   the production schema field is `average_entry_price`.
+3. **Persistent `ExplodingBus` failure injection / stale publish ordinals.**
+   The audit bus raised on every publication at or after the requested ordinal,
+   so later consequences could not be observed, and two single-order tests
+   injected failure before the event they claimed to measure.
+4. **Two malformed production-probe invariants.** The probe hand-built fixed
+   quantities while increasing expected prices, manufacturing its own
+   approved-notional breach, and used VENUE_A's taker fee as an aggregate
+   ceiling even though VENUE_B has a different fee schedule.
+
+These are audit defects, not VESKA defects. Correcting them does not weaken any
+valid Phase 6 invariant and changes no production module.
+
+**P6-17 remains STATIC ONLY** until its corrected event/state atomicity
+reproduction is executed externally. The static mutation-before-publication
+ordering remains evidence, but CI #54 did not provide an authoritative
+behavioural reproduction because the failure injection was mis-targeted.
+
+**P6-18 is PARTIALLY CONFIRMED.** The submission-report semantics are
+established, but its event-count test in CI #54 was blocked by the undrained
+capture harness.
+
+The known baseline remains separate: the Phase 11/12 `TF_FEED` compose
+contract failure plus Ruff `I001` in `agents/marin/agent.py` and
+`agents/marin/source.py`, and `SIM102` in `agents/okapi/registry.py`.
+None is changed here.
 
 ## Audit surface
 
@@ -898,6 +956,46 @@ execution-domain Pydantic models in a later production-remediation pass.
 
 ---
 
+### P6-20 — an unconfigured venue is silently assigned fallback execution semantics
+
+| | |
+| --- | --- |
+| **Severity** | **HIGH** |
+| **Area** | `execution/paper/executor.py::_latency`, `execution/veska/preflight.py`, `execution/veska/engine.py::execute` |
+| **Blocks Phase 6 validation** | Yes |
+| **Status** | **PROPOSED / EXTERNALLY OBSERVED — NOT REMEDIATED** |
+
+**Invariant.** A hand-built, persisted or replayed plan naming a venue that is
+not present in configuration must not be executed using fabricated venue
+semantics.
+
+**Evidence.** The normal router cannot build a plan for a venue with no market
+state, so the primary production planning path is structurally blocked.
+However, `Veska.execute` accepts a plan it is handed directly.
+`PaperExecutor._latency` catches an unknown venue and silently returns `40`,
+while the current preflight contract does not check venue reachability and
+execute does not consult preflight in any case.
+
+CI #54 externally demonstrated the behavioural consequence: a hand-built plan
+for an unconfigured venue was accepted rather than refused and was assigned
+the silent 40ms fallback.
+
+**Consequence.** Replayed, persisted or externally constructed execution input
+can acquire timing semantics for a venue the platform does not actually know.
+That turns malformed execution truth into apparently valid paper execution
+rather than failing closed.
+
+**Scope.** This does not overturn H23's router-side refutation: the shipped
+router still cannot produce the unknown venue. P6-20 covers the distinct
+hand-built/replayed execution surface.
+
+**Suggested remediation.** Later production remediation should fail closed on
+unconfigured venues at the execution boundary and/or enforce a preflight that
+actually validates venue reachability. No remediation is made in this audit
+commit.
+
+---
+
 ## Hypothesis matrix
 
 `STATICALLY CONFIRMED` means the code was read and the defect established by
@@ -925,15 +1023,15 @@ and the outcome is not knowable without running it.
 | H14 | Latency double counting | **INCONCLUSIVE** — classification requested | P6-15 | `test_phase6_slippage.py` |
 | H15 | Passive trade-flow accrual | **STATICALLY CONFIRMED** | P6-12 | `test_phase6_passive_fills.py` |
 | H16 | `max_partial_fraction` | **STATICALLY CONFIRMED** | P6-13 | `test_phase6_passive_fills.py` |
-| H17 | Event/state atomicity | **STATICALLY CONFIRMED** | P6-17 | `test_phase6_atomicity.py` |
+| H17 | Event/state atomicity | **STATIC ONLY — CI #54 behavioural reproduction blocked by audit injection defect** | P6-17 | `test_phase6_atomicity.py` |
 | H18 | Fill source timestamp | **STATICALLY CONFIRMED** | P6-14 | `test_phase6_passive_fills.py` |
 | H19 | Resource retention | **STATICALLY CONFIRMED** (`_pending`) | P6-16 | `test_phase6_resource_bounds.py` |
 | H20 | UNKNOWN retention | **STATICALLY REFUTED** — compaction refuses non-terminal orders, and UNKNOWN is not terminal | — | `test_phase6_resource_bounds.py`, `test_phase6_unknown.py` |
-| H21 | Execution report semantics | **STATICALLY CONFIRMED** | P6-18 | `test_phase6_registry.py` |
+| H21 | Execution report semantics | **PARTIALLY CONFIRMED — semantics established; event-count reproduction blocked by capture defect** | P6-18 | `test_phase6_registry.py` |
 | H22 | Numeric / schema safety | **EXTERNALLY CONFIRMED BY CI #53** | P6-19 | `test_phase6_slippage.py` |
-| H23 | Unknown venue | **PARTIALLY REFUTED** — the router cannot produce one (no market state ⇒ no route); the 40ms fallback is reachable only through a hand-built or replayed plan | — | `test_phase6_planning.py` |
+| H23 | Unknown venue | **PARTIAL — router path refuted; hand-built/replayed path externally confirmed** | P6-20 | `test_phase6_planning.py` |
 | H24 | Same-timestamp precedence | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED (behaviour pinned, not judged) | — | `test_phase6_cancel.py` |
-| H25 | Production-like probe | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED | — | `test_phase6_production_probe.py` |
+| H25 | Production-like probe | **CI #54 BLOCKED BY TWO AUDIT-INVARIANT DEFECTS — corrected external rerun required** | — | `test_phase6_production_probe.py` |
 | H26 | Execution registry truth | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED | — | `test_phase6_registry.py` |
 | H27 | Registry identity | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED | — | `test_phase6_registry.py` |
 | H28 | Execution snapshot consistency | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED | — | `test_phase6_snapshots.py` |

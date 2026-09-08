@@ -114,7 +114,9 @@ class TestPartialMultiLegSubmission:
 
     async def _submit_failing_on_second_leg(self):
         # Publish #1 is EXECUTION_PLAN, #2 is leg A's PAPER_ORDER_CREATED,
-        # #3 is leg B's. Failing on #3 leaves leg A accepted and leg B not.
+        # #3 is leg B's. ExplodingBus fails on exactly that publication,
+        # then permits later polling so the stranded-leg consequence can
+        # be observed rather than hidden by a permanently failing audit bus.
         bus = ExplodingBus(fail_on_publish=3)
         harness = build_harness(bus=bus)
         harness.update_market(two_venue_market())
@@ -207,7 +209,10 @@ class TestFillStateVersusEventTruth:
         some recovery must exist. Neither holds today: the account has the
         fill, the bus never saw it, and the exception simply propagates.
         """
-        bus = ExplodingBus(fail_on_publish=4)
+        # #1 EXECUTION_PLAN, #2 PAPER_ORDER_CREATED, #3 EXECUTION_REPORT,
+        # #4 acknowledgement/open PAPER_ORDER_UPDATED, #5 PAPER_FILL.
+        # Fail on #5 so OMS/account mutation precedes the injected failure.
+        bus = ExplodingBus(fail_on_publish=5)
         harness = build_harness(bus=bus)
         harness.update_market(two_venue_market())
         latency = harness.settings.venue(VENUE_A).latency_ms
@@ -241,7 +246,9 @@ class TestFillStateVersusEventTruth:
 
     async def test_an_order_transition_is_not_lost_when_its_event_fails(self):
         """The same question for a status change rather than a fill."""
-        bus = ExplodingBus(fail_on_publish=3)
+        # #1 EXECUTION_PLAN, #2 PAPER_ORDER_CREATED, #3 EXECUTION_REPORT,
+        # #4 is the acknowledgement/open PAPER_ORDER_UPDATED under test.
+        bus = ExplodingBus(fail_on_publish=4)
         harness = build_harness(bus=bus)
         harness.update_market(two_venue_market())
         latency = harness.settings.venue(VENUE_A).latency_ms

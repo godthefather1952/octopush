@@ -75,6 +75,7 @@ class TestWhichEventsExecutionEmits:
             correlation_id=CORRELATION,
         )
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
 
         types = [e.type for e in harness.published]
         assert types == [
@@ -91,7 +92,9 @@ class TestWhichEventsExecutionEmits:
             planned_order(quantity=0.5, limit_price=101.0), created_at=T0
         )
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
         await harness.veska.poll(T0 + _latency(harness))
+        await harness.drain_events()
 
         emitted = {e.type for e in harness.published}
         forbidden = {
@@ -113,7 +116,9 @@ class TestWhichEventsExecutionEmits:
             planned_order(quantity=0.5, limit_price=101.0), created_at=T0
         )
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
         await harness.veska.poll(T0 + _latency(harness))
+        await harness.drain_events()
 
         for event in harness.published:
             assert event.source in {"VESKA", "PAPER_EXECUTOR"}, (
@@ -134,9 +139,11 @@ class TestEveryStateChangeIsPublished:
             created_at=T0,
         )
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
         before = len(harness.events_of(EventType.PAPER_ORDER_UPDATED))
 
         await harness.veska.poll(T0 + _latency(harness))
+        await harness.drain_events()
 
         after = len(harness.events_of(EventType.PAPER_ORDER_UPDATED))
         assert after > before, "the OPEN transition was not published"
@@ -151,6 +158,7 @@ class TestEveryStateChangeIsPublished:
             created_at=T0,
         )
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
         fills = await harness.veska.poll(T0 + _latency(harness))
 
         assert fills, "no fill; the publication check below is untested"
@@ -169,12 +177,16 @@ class TestEveryStateChangeIsPublished:
             created_at=T0,
         )
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
         oid = harness.orders_of(plan.plan_id)[0].client_order_id
         await harness.veska.poll(T0 + latency)
+        await harness.drain_events()
 
         before = len(harness.events_of(EventType.PAPER_ORDER_UPDATED))
         await harness.veska.cancel(oid, T0 + latency + 1)
+        await harness.drain_events()
         await harness.veska.poll(T0 + latency + 1 + cancel_latency)
+        await harness.drain_events()
 
         after = len(harness.events_of(EventType.PAPER_ORDER_UPDATED))
         assert after >= before + 2, (
@@ -193,10 +205,12 @@ class TestEveryStateChangeIsPublished:
             created_at=T0,
         )
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
         order = harness.orders_of(plan.plan_id)[0]
 
         before = len(harness.events_of(EventType.PAPER_ORDER_UPDATED))
         await harness.veska.poll(order.expires_at)
+        await harness.drain_events()
 
         assert order.status is OrderStatus.EXPIRED
         assert len(harness.events_of(EventType.PAPER_ORDER_UPDATED)) > before
@@ -211,11 +225,13 @@ class TestEveryStateChangeIsPublished:
             created_at=T0,
         )
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
         oid = harness.orders_of(plan.plan_id)[0].client_order_id
         harness.executor.inject_timeout(oid)
 
         before = len(harness.events_of(EventType.PAPER_ORDER_UPDATED))
         await harness.veska.poll(T0 + _latency(harness))
+        await harness.drain_events()
 
         assert harness.oms.get(oid).status is OrderStatus.UNKNOWN
         assert len(harness.events_of(EventType.PAPER_ORDER_UPDATED)) > before, (
@@ -230,6 +246,7 @@ class TestEveryStateChangeIsPublished:
         plan = execution_plan(planned_order(), created_at=T0)
 
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
 
         updates = harness.events_of(EventType.PAPER_ORDER_UPDATED)
         assert updates, "a rejection was not published"
@@ -246,6 +263,7 @@ class TestEventTimestamps:
         plan = execution_plan(planned_order(), created_at=T0)
 
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
 
         created = harness.events_of(EventType.PAPER_ORDER_CREATED)
         assert created and created[0].ts_ms == T0, (
@@ -264,6 +282,7 @@ class TestEventTimestamps:
             created_at=T0,
         )
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
         at = T0 + _latency(harness)
         fills = await harness.veska.poll(at)
 
@@ -279,6 +298,7 @@ class TestEventTimestamps:
         plan = execution_plan(planned_order(), created_at=T0)
 
         await harness.veska.execute(plan, T0 + 5_000)
+        await harness.drain_events()
 
         published = harness.events_of(EventType.EXECUTION_PLAN)
         assert published and published[0].ts_ms == plan.created_at == T0
@@ -298,7 +318,9 @@ class TestCorrelationSurvivesTheWholePath:
             correlation_id=CORRELATION,
         )
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
         await harness.veska.poll(T0 + _latency(harness))
+        await harness.drain_events()
 
         for event in harness.published:
             assert event.correlation_id == CORRELATION, (
@@ -313,6 +335,7 @@ class TestCorrelationSurvivesTheWholePath:
             planned_order(), created_at=T0, correlation_id=CORRELATION
         )
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
         assert harness.orders_of(plan.plan_id)[0].correlation_id == CORRELATION
 
     async def test_a_fill_carries_the_correlation_id_of_its_order(self):
@@ -326,6 +349,7 @@ class TestCorrelationSurvivesTheWholePath:
             correlation_id=CORRELATION,
         )
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
         fills = await harness.veska.poll(T0 + _latency(harness))
         assert fills
         assert all(f.correlation_id == CORRELATION for f in fills)
@@ -340,6 +364,7 @@ class TestCorrelationSurvivesTheWholePath:
             correlation_id=CORRELATION,
         )
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
         assert {o.correlation_id for o in harness.orders_of(plan.plan_id)} == {
             CORRELATION
         }
@@ -353,6 +378,7 @@ class TestPayloadIntegrity:
         harness.update_market(_quiet())
         plan = execution_plan(planned_order(), created_at=T0)
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
 
         event = harness.events_of(EventType.PAPER_ORDER_CREATED)[0]
         assert event.schema_name == "PaperOrder"
@@ -373,6 +399,7 @@ class TestPayloadIntegrity:
             created_at=T0,
         )
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
         fills = await harness.veska.poll(T0 + _latency(harness))
         assert fills
 
@@ -390,6 +417,7 @@ class TestPayloadIntegrity:
         harness.update_market(_quiet())
         plan = execution_plan(planned_order(), created_at=T0)
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
 
         event = harness.events_of(EventType.EXECUTION_PLAN)[0]
         assert event.schema_name == "ExecutionPlan"
@@ -412,11 +440,13 @@ class TestPayloadIntegrity:
         harness.update_market(_quiet())
         plan = execution_plan(planned_order(), created_at=T0)
         await harness.veska.execute(plan, T0)
+        await harness.drain_events()
 
         created = harness.events_of(EventType.PAPER_ORDER_CREATED)[0]
         assert created.payload["status"] == OrderStatus.SUBMITTING.value
 
         await harness.veska.poll(T0 + _latency(harness))
+        await harness.drain_events()
 
         assert created.payload["status"] == OrderStatus.SUBMITTING.value, (
             "the creation event's payload changed after the order moved on"

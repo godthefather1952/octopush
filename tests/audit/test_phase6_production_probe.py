@@ -156,7 +156,7 @@ async def run_probe() -> tuple[ProbeResult, object]:
                 planned_order(
                     venue=VENUE_A,
                     side=Side.BUY,
-                    quantity=approved / 100.0,
+                    quantity=approved / (100.05 * (1 + index * 0.0002)),
                     time_in_force=TimeInForce.IOC,
                     limit_price=100.5 * (1 + index * 0.0002),
                     expected_price=100.05 * (1 + index * 0.0002),
@@ -168,7 +168,7 @@ async def run_probe() -> tuple[ProbeResult, object]:
                 planned_order(
                     venue=VENUE_A,
                     side=Side.BUY,
-                    quantity=approved / 100.0,
+                    quantity=approved / (99.95 * (1 + index * 0.0002)),
                     time_in_force=TimeInForce.POST_ONLY,
                     limit_price=99.95 * (1 + index * 0.0002),
                     expected_price=99.95 * (1 + index * 0.0002),
@@ -181,7 +181,7 @@ async def run_probe() -> tuple[ProbeResult, object]:
                 planned_order(
                     venue=VENUE_A,
                     side=Side.BUY,
-                    quantity=approved / 100.0,
+                    quantity=approved / (100.05 * (1 + index * 0.0002)),
                     time_in_force=TimeInForce.IOC,
                     limit_price=100.5 * (1 + index * 0.0002),
                     expected_price=100.05 * (1 + index * 0.0002),
@@ -190,7 +190,7 @@ async def run_probe() -> tuple[ProbeResult, object]:
                 planned_order(
                     venue=VENUE_B,
                     side=Side.SELL,
-                    quantity=approved / 100.0,
+                    quantity=approved / (100.10 * (1 + index * 0.0002)),
                     time_in_force=TimeInForce.IOC,
                     limit_price=99.5 * (1 + index * 0.0002),
                     expected_price=100.10 * (1 + index * 0.0002),
@@ -203,7 +203,7 @@ async def run_probe() -> tuple[ProbeResult, object]:
                 planned_order(
                     venue=VENUE_A,
                     side=Side.BUY,
-                    quantity=approved / 100.0,
+                    quantity=approved / (99.0 * (1 + index * 0.0002)),
                     time_in_force=TimeInForce.GTC,
                     limit_price=99.0 * (1 + index * 0.0002),
                     expected_price=99.0 * (1 + index * 0.0002),
@@ -370,11 +370,16 @@ class TestProbeInvariants:
     async def test_fees_are_non_negative_and_proportionate(self):
         result, harness = await run_probe()
         assert result.fees >= 0.0
-        taker_bps = harness.settings.venue(VENUE_A).fees.fee_bps(False)
-        ceiling = result.filled_notional * taker_bps / 10_000 * 1.01
+        expected = 0.0
+        for order in harness.executor.all_orders():
+            for fill in order.fills:
+                fees = harness.settings.venue(fill.venue).fees
+                fee_bps = fees.fee_bps(fill.liquidity is Liquidity.MAKER)
+                expected += fill.notional * fee_bps / 10_000
+        ceiling = expected * 1.01
         assert result.fees <= ceiling, (
-            f"fees of {result.fees:.4f} exceed the taker-rate ceiling "
-            f"{ceiling:.4f} for {result.filled_notional:.2f} of fills"
+            f"fees of {result.fees:.4f} exceed the per-fill venue/liquidity "
+            f"ceiling {ceiling:.4f} for {result.filled_notional:.2f} of fills"
         )
 
     async def test_the_probe_is_reproducible(self):
