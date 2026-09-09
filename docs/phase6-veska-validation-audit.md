@@ -2,15 +2,15 @@
 
 **Status: PHASE 6 BATCH A PATCHED / EXTERNAL VALIDATION REQUIRED.**
 
-**PRODUCTION CHANGES: NONE.**
+**CURRENT PRODUCTION CHANGES: PHASE 6 BATCH A ONLY.**
 
-This is the first validation pass after the full platform frame was built. It
-inspects the Phase 6 execution boundary statically, constructs strict audit
-tests and deterministic reproduction fixtures, and stops. External validation
-runs the suite.
+This document preserves the original Phase 6 validation history and now records
+the first production-remediation batch. The frozen audit surface remains the
+source of truth for what Batch A is intended to change and what later batches
+must leave red.
 
-A failing audit test is expected and desirable where it proves a defect.
-Nothing here has been fixed, weakened, skipped or xfailed.
+No valid invariant has been weakened, skipped or xfailed. Historical audit
+checkpoints remain intact; current remediation status is recorded explicitly.
 
 ---
 

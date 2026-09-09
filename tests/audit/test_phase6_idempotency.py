@@ -1,30 +1,15 @@
 """H9 — one client order id names one order, and a retry is not a second order.
 
-WHAT THE CODE DOES
-==================
-``OrderManager.create`` ends with::
+Batch A closes the two identity-loss paths this module originally exposed:
 
-    self.orders[order.client_order_id] = order
-    self.orders_created += 1
+* an exact retry of a successfully submitted plan returns existing order truth
+  rather than recreating the order or resetting venue timing;
+* duplicate client-order ids fail closed before mutation, and OrderManager
+  independently refuses to overwrite a resident identity.
 
-An unconditional dictionary assignment. If an order with that id is already
-resident — because the same plan was submitted twice, because a retry landed,
-because a replayed plan carries the ids the original used — the existing
-``PaperOrder`` is **replaced**. With it goes its ``filled_quantity``, its
-``fills``, its ``fees_paid``, its ``history`` and its status.
-
-``Veska.execute`` registers the plan idempotently (``register_plan`` returns the
-held record) but then calls ``self.executor.submit(plan, now_ms)`` again with no
-guard at all, so idempotency at the registry does not reach the OMS.
-
-WHY THIS IS THE DANGEROUS SHAPE
-===============================
-The replaced order is not gone from the venue's point of view — in a paper
-build it is gone from the OMS, and its ``_pending`` record is overwritten too,
-so the platform's belief about what it has working is reset to zero while the
-fills that already happened remain in the paper account. The two ledgers
-disagree, and the direction of the disagreement is "the platform thinks it has
-less on than it does".
+The tests retain the economic invariants: fills, history and pending timing
+survive retries, lifetime creation counters do not increment, and a caller
+cannot replace an existing order by bypassing VESKA.
 """
 
 from __future__ import annotations
@@ -60,14 +45,16 @@ def _fixed_plan(**kwargs):
     )
 
 
-class TestCreateIsUnguarded:
-    """Static evidence for the mechanism."""
+class TestCreateRejectsIdentityOverwrite:
+    """The OMS itself is the final identity boundary."""
 
-    def test_create_assigns_into_the_order_map_unconditionally(self):
+    def test_create_checks_identity_before_assigning_into_the_order_map(self):
         from execution.oms import OrderManager
 
         source = inspect.getsource(OrderManager.create)
-        assert "self.orders[order.client_order_id] = order" in source
+        guard = source.index("already exists")
+        assignment = source.index("self.orders[order.client_order_id] = order")
+        assert guard < assignment
         assert "if order.client_order_id in self.orders" not in source, (
             "create now guards against a duplicate id; this finding may be "
             "resolved and its evidence needs re-deriving"

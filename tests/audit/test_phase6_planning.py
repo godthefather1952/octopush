@@ -2,24 +2,10 @@
 
 H11: THE SIZING BRANCH
 ======================
-``Veska.build_plan``::
-
-    quantity = (
-        leg.quantity
-        if leg.quantity is not None and leg.quantity > 0
-        else notional / routing.expected_price
-    )
-
-``notional`` is ``decision.approved_notional``. The branch is unconditional on
-``execution_role``: an ENTRY leg carrying an explicit quantity is sized from
-that quantity and never sees ``approved_notional`` at all.
-
-That branch exists for a good reason — an exit or hedge closes *that quantity*,
-not a notional estimate that can leave a residual — and this audit does not
-propose removing it. What it tests is that the risk-increasing path cannot use
-it. The shipped ``CrossVenueDetector`` leaves entry legs' ``quantity`` unset,
-so the gap is latent rather than live; that bounds the severity and does not
-close the gap, because nothing structural keeps it closed.
+Batch A makes execution role part of sizing. ENTRY is risk-increasing and is
+always derived from ``approved_notional / expected_price``, so an explicit leg
+quantity cannot enlarge RUNE's grant. EXIT and HEDGE remain allowed to carry
+the exact quantity needed to neutralise exposure that already exists.
 
 H12: CONSERVATION
 =================

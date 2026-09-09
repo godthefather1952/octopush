@@ -1,37 +1,13 @@
 """H6, H7, H20, H30 — UNKNOWN is outstanding, and nothing may forget it.
 
-THE DISTINCTION PHASE 6 DREW
-============================
-``PaperOrder`` carries two properties that differ on exactly one status::
+``PaperOrder.is_live`` and ``PaperOrder.is_outstanding`` intentionally answer
+different questions. UNKNOWN is not known to be working, but it may still have
+traded and therefore remains outstanding.
 
-    is_live         = not is_terminal and status is not UNKNOWN
-    is_outstanding  = not is_terminal
-
-``is_live`` asks *is this order known to be working?* — False for UNKNOWN,
-correctly, because nobody knows. ``is_outstanding`` asks *could this still
-turn out to have traded?* — True for UNKNOWN, because it could.
-
-The model's own docstring says a caller deciding whether to **wait** wants the
-first and a caller deciding whether the platform is **exposed** wants the
-second. This module audits every place the second question is asked with the
-first predicate.
-
-WHAT THE AUDIT FOUND STATICALLY
-===============================
-Three orchestrator sites read ``is_live``:
-
-* ``_advance_execution`` — an UNKNOWN entry order is not live, so the method
-  falls through to "nothing traded: there is no position to hedge or monitor"
-  and closes the opportunity.
-* ``_hedge_in_flight`` — an UNKNOWN hedge is not live, so a second hedge for
-  the same symbol is submitted.
-* ``_advance_exit`` — an UNKNOWN exit order is not live, so the exit is
-  retried.
-
-One site does **not**, and deserves saying: RUNE's committed-exposure snapshot
-tests terminality rather than liveness, and its docstring explains why at
-length. That surface is correct and is asserted below so a regression in it
-would be caught.
+Batch A moves the three orchestrator finality decisions and the risk-capacity
+input to outstanding truth without redefining ``is_live`` or automatically
+resolving UNKNOWN. H20/H30 resolution and retention behavior remain separately
+audited below; Batch A does not open a new automatic resolution path.
 """
 
 from __future__ import annotations

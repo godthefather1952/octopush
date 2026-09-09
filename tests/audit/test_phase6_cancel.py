@@ -1,33 +1,19 @@
-"""H2 and H24 — a cancel must never silently disappear.
+"""H2 and H24 — cancellation must never silently disappear.
 
 H2: CANCEL BEFORE ACKNOWLEDGEMENT
 =================================
-``PaperExecutor.cancel`` branches on status:
+Batch A makes a pre-ack cancellation explicit ``CANCEL_PENDING`` state.
+The executor preserves the original arrival instant and consumes that request
+as cancel-on-arrival before acknowledgement, OPEN, or any fill attempt.
 
-    if order.status in (CREATED, SUBMITTING):
-        self._pending.setdefault(...).cancel_at = now_ms
-        return
-
-It records ``cancel_at`` and returns **without transitioning the order to
-CANCEL_PENDING**. The comment says the order "resolves once it arrives".
-
-It does not. ``poll`` reads ``cancel_at`` only inside
-
-    if order.status is OrderStatus.CANCEL_PENDING:
-
-and by the time the order arrives, ``poll`` has already moved it
-SUBMITTING → ACKNOWLEDGED → OPEN. The status is OPEN, so the CANCEL_PENDING
-branch is skipped, ``cancel_at`` is never read again, and the order proceeds
-to ``_attempt_fill``.
-
-The cancellation is not a race that was lost. It is a request that left no
-trace on the order at all.
+The regression surface below proves that the request leaves order history,
+cannot fill afterwards, and behaves the same through ``cancel_all()``.
 
 H24: SAME-TIMESTAMP PRECEDENCE
 ==============================
-At one instant a cancel can arrive, an expiry can fall due and the book can be
-fillable. The policy need not match anyone's preference, but it must be
-explicit, deterministic and replayable. These tests pin what it currently is.
+The ordinary post-ack cancel/fill race remains separate. At one instant a
+cancel can arrive, an expiry can fall due and the book can be fillable; those
+tests continue to pin deterministic precedence without changing that policy.
 """
 
 from __future__ import annotations
