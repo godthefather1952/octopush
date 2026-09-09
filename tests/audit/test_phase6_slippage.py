@@ -18,6 +18,12 @@ That distinction matters: a plan whose ``limit_price`` was set by anything
 other than the router carries no bound at all, and a MARKET order
 (``limit_price is None``) skips the filter entirely.
 
+H22: EXECUTION NUMERIC SAFETY
+=============================
+Batch B hardens the execution schemas themselves so non-finite quantities,
+prices, notionals, fees and slippage values, plus negative TTLs, fail during
+Pydantic validation before arithmetic or event emission.
+
 H14: LATENCY, POSSIBLY TWICE
 ============================
 ``poll`` will not act on an order until ``now_ms >= pending.ack_at``, where

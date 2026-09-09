@@ -55,30 +55,20 @@ def _plan_with_deadline(**kwargs):
 
 
 class TestWhereTheDeadlineIsRead:
-    """Static inventory, so the finding's scope is exact."""
+    """Static inventory for the submission boundary."""
 
-    def test_no_execution_module_compares_against_the_deadline(self):
-        reading: list[str] = []
-        for path in Path("execution").rglob("*.py"):
-            text = path.read_text()
-            for line in text.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("#") or stripped.startswith("*"):
-                    continue
-                if "deadline_ms" not in stripped:
-                    continue
-                # An assignment carries it; a comparison enforces it.
-                if any(op in stripped for op in (">", "<", ">=", "<=")):
-                    reading.append(f"{path.as_posix()}: {stripped}")
-        assert reading == [], (
-            f"an execution module now compares against the deadline: {reading}"
-        )
+    def test_preflight_owns_the_absolute_submission_comparison(self):
+        from execution.veska.preflight import preflight_plan
 
-    def test_the_plan_record_documents_that_nothing_enforces_it(self):
+        source = inspect.getsource(preflight_plan)
+        assert "now_ms > plan.deadline_ms" in source
+        assert "EXPIRED_DEADLINE" in source
+
+    def test_the_plan_record_remains_observability_not_enforcement(self):
         text = Path("core/models/execution.py").read_text()
         assert "nothing enforces it here" in text
 
-    def test_the_only_enforcement_is_the_orchestrators_cleanup(self):
+    def test_the_orchestrator_cleanup_still_handles_already_working_orders(self):
         from apps.orchestrator import orchestrator as orch_module
 
         source = inspect.getsource(orch_module.Orchestrator._advance_execution)
@@ -133,16 +123,11 @@ class TestSubmissionAgainstTheDeadline:
 
         report = await harness.veska.execute(plan, DEADLINE + 1)
 
-        workable = [
-            o
-            for o in report.orders
-            if o.status not in (OrderStatus.REJECTED,)
-        ]
-        assert not workable, (
-            f"a plan whose deadline was {DEADLINE} was submitted at "
-            f"{DEADLINE + 1} and produced {len(workable)} workable order(s): "
-            f"{[o.status.value for o in workable]}"
-        )
+        assert report.orders == []
+        assert harness.orders_of(plan.plan_id) == []
+        assert harness.oms.orders_created == 0
+        assert harness.executor._pending == {}
+        assert any("EXPIRED_DEADLINE" in note for note in report.notes)
 
     async def test_an_order_submitted_after_the_deadline_does_not_fill(self):
         """The economic consequence of the same gap."""

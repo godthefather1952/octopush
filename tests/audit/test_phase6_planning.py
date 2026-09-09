@@ -245,12 +245,13 @@ class TestPlanConservation:
 class TestUnknownVenue:
     """H23 — a plan naming a venue the configuration does not have."""
 
-    def test_the_latency_lookup_has_a_silent_fallback(self):
+    def test_the_latency_lookup_has_no_silent_fallback(self):
         from execution.paper.executor import PaperExecutor
 
         source = inspect.getsource(PaperExecutor._latency)
-        assert "except KeyError" in source
-        assert "return 40" in source
+        assert "return self.settings.venue(venue).latency_ms" in source
+        assert "except KeyError" not in source
+        assert "return 40" not in source
 
     async def test_the_router_cannot_produce_an_unknown_venue_plan(self):
         """The primary path is structurally blocked, which bounds severity."""
@@ -286,14 +287,12 @@ class TestUnknownVenue:
         )
 
         report = await harness.veska.execute(plan, T0)
-        order = harness.orders_of(plan.plan_id)[0]
 
-        refused = order.status is OrderStatus.REJECTED or bool(report.notes)
-        assert refused, (
-            "a plan naming an unconfigured venue was accepted and given a "
-            f"default 40ms latency: the order is {order.status.value} with "
-            f"ack at {harness.executor._pending[order.client_order_id].ack_at}"
-        )
+        assert report.orders == []
+        assert harness.orders_of(plan.plan_id) == []
+        assert harness.oms.orders_created == 0
+        assert harness.executor._pending == {}
+        assert any("UNKNOWN_VENUE" in note for note in report.notes), report.notes
 
 
 class TestPreflightContract:
@@ -339,12 +338,17 @@ class TestPreflightContract:
         assert result.ok
         assert result.reason_codes == ()
 
-    def test_it_does_not_check_the_deadline(self):
-        """Named absences, so the contract is unambiguous."""
+    def test_it_checks_the_deadline_when_logical_time_is_supplied(self):
         plan = execution_plan(
             planned_order(), created_at=T0, deadline_ms=T0 - 100_000
         )
-        assert preflight_plan(plan, capabilities=PAPER_CAPABILITIES).ok
+        result = preflight_plan(
+            plan,
+            capabilities=PAPER_CAPABILITIES,
+            now_ms=T0,
+        )
+        assert result.blocked
+        assert "EXPIRED_DEADLINE" in result.reason_codes
 
     def test_it_does_not_check_notional_conservation(self):
         plan = execution_plan(
@@ -355,35 +359,39 @@ class TestPreflightContract:
         )
         assert preflight_plan(plan, capabilities=PAPER_CAPABILITIES).ok
 
-    def test_it_does_not_check_venue_reachability(self):
+    def test_it_checks_venue_reachability_when_the_allowed_set_is_supplied(self):
         plan = execution_plan(
             planned_order(venue="VENUE_NOWHERE"), created_at=T0
         )
-        assert preflight_plan(plan, capabilities=PAPER_CAPABILITIES).ok
+        result = preflight_plan(
+            plan,
+            capabilities=PAPER_CAPABILITIES,
+            allowed_venues=frozenset({VENUE_A, VENUE_B}),
+        )
+        assert result.blocked
+        assert "UNKNOWN_VENUE" in result.reason_codes
 
-    def test_execute_does_not_consult_preflight(self):
-        """The claim Phase 6 makes about itself, verified rather than trusted."""
+    def test_execute_consults_the_canonical_preflight_gate(self):
         from execution.veska.engine import Veska
 
         source = inspect.getsource(Veska.execute)
-        assert "preflight" not in source, (
-            "execute now consults preflight; the plan-submission gate has "
-            "changed and every finding downstream of it needs re-deriving"
-        )
+        assert "self.preflight(plan, now_ms)" in source
+        assert "if preflight.blocked" in source
 
-    async def test_a_plan_preflight_rejects_is_still_submitted(self):
-        """The behavioural consequence of the seam being unwired."""
+    async def test_a_plan_preflight_rejects_never_reaches_the_oms(self):
         harness = build_harness()
         harness.update_market(two_venue_market())
         plan = execution_plan(
             planned_order(time_in_force=TimeInForce.FOK, limit_price=101.0),
             created_at=T0,
         )
-        assert preflight_plan(plan, capabilities=PAPER_CAPABILITIES).blocked
 
         report = await harness.veska.execute(plan, T0)
 
-        assert report.orders, "the audit's premise is wrong: nothing was submitted"
-        assert report.orders[0].status is not OrderStatus.REJECTED, (
-            "the plan was rejected after all; preflight may now be wired in"
+        assert report.orders == []
+        assert harness.orders_of(plan.plan_id) == []
+        assert harness.oms.orders_created == 0
+        assert harness.executor._pending == {}
+        assert any(
+            "UNSUPPORTED_TIME_IN_FORCE" in note for note in report.notes
         )

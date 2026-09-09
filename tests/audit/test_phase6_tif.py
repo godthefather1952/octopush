@@ -38,10 +38,12 @@ Three consequences follow, and each is a hypothesis below:
 
 from __future__ import annotations
 
+import pytest
+
 from core.models.common import Liquidity, OrderType, Side, TimeInForce
 from core.models.execution import OrderStatus
 from execution.paper.executor import PAPER_CAPABILITIES
-from execution.paper.simulator import is_marketable
+from execution.paper.simulator import BookView, is_marketable, would_cross
 from execution.veska import policy
 from execution.veska.preflight import preflight_plan
 from tests.audit.veska_fixtures import (
@@ -124,19 +126,15 @@ class TestMarketabilityClassification:
     def test_post_only_takes_the_passive_path(self):
         assert not is_marketable(_order_with(TimeInForce.POST_ONLY))
 
-    def test_a_crossing_gtc_limit_is_classified_passive(self):
-        """The classification ignores price entirely.
-
-        A GTC limit priced through the book is an aggressive order in every
-        venue that exists. Here it is routed to ``fill_passive``, which prices
-        it at its own limit and stamps it ``Liquidity.MAKER``.
-        """
+    def test_a_crossing_gtc_limit_is_detected_from_the_book(self):
+        """GTC is not intrinsically aggressive, but a crossed limit is."""
         order = _order_with(TimeInForce.GTC)
-        assert not is_marketable(order), (
-            "a GTC limit is classified passive regardless of whether its "
-            "price crosses; the audit's premise for the maker-fee finding "
-            "below has changed"
+        view = BookView(
+            opposing=[price_levels((100.0, 10.0))[0]],
+            own_touch=99.5,
         )
+        assert not is_marketable(order)
+        assert would_cross(order, view)
 
 
 def _order_with(tif: TimeInForce):
@@ -311,17 +309,13 @@ class TestFOK:
             created_at=T0,
         )
         report = await harness.veska.execute(plan, T0)
-        order = harness.orders_of(plan.plan_id)[0]
 
-        refused = (
-            order.status is OrderStatus.REJECTED
-            or bool(report.notes)
-            or not report.orders
-        )
-        assert refused, (
-            "the executor advertises supports_fok=False and accepted an FOK "
-            f"order anyway: status {order.status.value}, notes {report.notes}"
-        )
+        assert report.orders == []
+        assert harness.orders_of(plan.plan_id) == []
+        assert harness.oms.orders_created == 0
+        assert any(
+            "UNSUPPORTED_TIME_IN_FORCE" in note for note in report.notes
+        ), report.notes
 
     async def test_an_fok_order_never_fills_partially(self):
         """If it is worked at all, the all-or-nothing rule must hold."""
@@ -344,16 +338,13 @@ class TestFOK:
             ),
             created_at=T0,
         )
-        await harness.veska.execute(plan, T0)
-        order = harness.orders_of(plan.plan_id)[0]
+        report = await harness.veska.execute(plan, T0)
+        fills = await harness.veska.poll(T0 + latency)
 
-        await harness.veska.poll(T0 + latency)
-
-        assert order.filled_quantity in (0.0, order.quantity), (
-            f"an FOK order filled {order.filled_quantity} of "
-            f"{order.quantity}; policy.requires_full_fill(FOK) is "
-            f"{policy.requires_full_fill(TimeInForce.FOK)}"
-        )
+        assert report.orders == []
+        assert harness.orders_of(plan.plan_id) == []
+        assert fills == []
+        assert harness.oms.orders_created == 0
 
 
 class TestPostOnly:
@@ -518,11 +509,19 @@ class TestGTCMakerFee:
         await harness.veska.execute(plan, T0)
         fills = await harness.veska.poll(T0 + latency)
 
+        assert fills, "the crossed GTC did not exercise the taking path"
         maker = [f for f in fills if f.liquidity is Liquidity.MAKER]
         assert not maker, (
             "a GTC limit priced through the book was filled and billed as a "
             f"maker: {[(f.price, f.fee) for f in maker]}"
         )
+        venue = harness.settings.venue(VENUE_A)
+        for fill in fills:
+            assert fill.liquidity is Liquidity.TAKER
+            expected_fee = (
+                fill.quantity * fill.price * venue.fees.taker_bps / 10_000
+            )
+            assert fill.fee == pytest.approx(expected_fee)
 
 
 class TestCapabilityClaims:
