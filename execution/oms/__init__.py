@@ -1,9 +1,15 @@
 """Order management.
 
-Owns every order's identity, state and fills.  The state machine is enforced
-here, once, so that no executor can invent a transition.
+Owns every order's identity, state and fills. The state machine is enforced
+here, once, so no executor can invent a transition.
 
-``UNKNOWN`` is a first-class state.  When an operation times out the order goes
+Execution/replay callers may supply an explicit logical ``now_ms`` to every
+mutation path. The wired clock remains only as a compatibility fallback for
+direct non-execution callers. PaperExecutor supplies logical time on every
+economic mutation, so order creation, expiry and history are reconstructible
+from the recorded action instant rather than from wall-clock scheduling.
+
+``UNKNOWN`` is a first-class state. When an operation times out the order goes
 to UNKNOWN and stays there until something authoritative resolves it; it is
 never assumed to have failed, because assuming a timed-out order failed is how
 a platform ends up with a position it does not know about.
@@ -102,8 +108,14 @@ class OrderManager:
         strategy: str | None = None,
         client_order_id: str | None = None,
         ttl_ms: int | None = None,
+        now_ms: Millis | None = None,
     ) -> PaperOrder:
-        now = self.clock.now_ms()
+        if client_order_id is not None and client_order_id in self.orders:
+            raise ValueError(
+                f"order {client_order_id} already exists; client_order_id is immutable"
+            )
+
+        now = self.clock.now_ms() if now_ms is None else now_ms
         order = PaperOrder(
             created_at=now,
             venue=venue,
@@ -121,13 +133,23 @@ class OrderManager:
         )
         if client_order_id:
             order.client_order_id = client_order_id
+        if order.client_order_id in self.orders:
+            raise ValueError(
+                f"order {order.client_order_id} already exists; client_order_id is immutable"
+            )
         order.history = [(now, OrderStatus.CREATED)]
         self.orders[order.client_order_id] = order
         self.orders_created += 1
         return order
 
     def from_plan(
-        self, planned: PlannedOrder, *, plan_id: str, intent_id: str, strategy: str
+        self,
+        planned: PlannedOrder,
+        *,
+        plan_id: str,
+        intent_id: str,
+        strategy: str,
+        now_ms: Millis | None = None,
     ) -> PaperOrder:
         return self.create(
             venue=planned.venue,
@@ -143,20 +165,34 @@ class OrderManager:
             strategy=strategy,
             client_order_id=planned.client_order_id,
             ttl_ms=planned.ttl_ms,
+            now_ms=now_ms,
         )
 
     # -- transitions -------------------------------------------------------
 
-    def transition(self, client_order_id: str, status: OrderStatus) -> PaperOrder:
+    def transition(
+        self,
+        client_order_id: str,
+        status: OrderStatus,
+        *,
+        now_ms: Millis | None = None,
+    ) -> PaperOrder:
         order = self.orders[client_order_id]
+        stamp = self.clock.now_ms() if now_ms is None else now_ms
         try:
-            order.transition(status, self.clock.now_ms())
+            order.transition(status, stamp)
         except IllegalTransition:
             self.illegal_transitions += 1
             raise
         return order
 
-    def mark_unknown(self, client_order_id: str, reason: str = "") -> PaperOrder:
+    def mark_unknown(
+        self,
+        client_order_id: str,
+        reason: str = "",
+        *,
+        now_ms: Millis | None = None,
+    ) -> PaperOrder:
         """Move an order to UNKNOWN after a timeout.
 
         The order is neither filled nor cancelled as far as the platform is
@@ -165,29 +201,54 @@ class OrderManager:
         order = self.orders[client_order_id]
         if order.is_terminal:
             return order
-        order.transition(OrderStatus.UNKNOWN, self.clock.now_ms())
+        stamp = self.clock.now_ms() if now_ms is None else now_ms
+        order.transition(OrderStatus.UNKNOWN, stamp)
         order.reject_reason = reason or "operation timed out"
         return order
 
-    def resolve_unknown(self, client_order_id: str, status: OrderStatus) -> PaperOrder:
+    def resolve_unknown(
+        self,
+        client_order_id: str,
+        status: OrderStatus,
+        *,
+        now_ms: Millis | None = None,
+    ) -> PaperOrder:
         order = self.orders[client_order_id]
         if order.status is not OrderStatus.UNKNOWN:
             raise ValueError(f"order {client_order_id} is not UNKNOWN")
-        order.transition(status, self.clock.now_ms())
+        stamp = self.clock.now_ms() if now_ms is None else now_ms
+        order.transition(status, stamp)
         return order
 
-    def reject(self, client_order_id: str, reason: str) -> PaperOrder:
+    def reject(
+        self,
+        client_order_id: str,
+        reason: str,
+        *,
+        now_ms: Millis | None = None,
+    ) -> PaperOrder:
         order = self.orders[client_order_id]
         order.reject_reason = reason
-        order.transition(OrderStatus.REJECTED, self.clock.now_ms())
+        stamp = self.clock.now_ms() if now_ms is None else now_ms
+        order.transition(OrderStatus.REJECTED, stamp)
         return order
 
     # -- fills -------------------------------------------------------------
 
-    def apply_fill(self, fill: FillEvent) -> bool:
-        """Apply a fill idempotently. Returns False for a duplicate."""
+    def validate_fill(
+        self,
+        fill: FillEvent,
+        *,
+        count_duplicate: bool = False,
+    ) -> bool:
+        """Validate a fill without changing order or dedupe state.
+
+        Returns False for an already-applied fill. Structural/quantity
+        violations raise exactly as :meth:`apply_fill` does.
+        """
         if fill.fill_id in self._applied_fills:
-            self.duplicate_fills += 1
+            if count_duplicate:
+                self.duplicate_fills += 1
             return False
         order = self.orders.get(fill.client_order_id)
         if order is None:
@@ -197,6 +258,15 @@ class OrderManager:
                 f"overfill on {order.client_order_id}: "
                 f"{fill.quantity} > {order.remaining_quantity} remaining"
             )
+        return True
+
+    def apply_fill(
+        self, fill: FillEvent, *, now_ms: Millis | None = None
+    ) -> bool:
+        """Apply a fill idempotently. Returns False for a duplicate."""
+        if not self.validate_fill(fill, count_duplicate=True):
+            return False
+        order = self.orders[fill.client_order_id]
         self._applied_fills.add(fill.fill_id)
         self._dedupe_order.append(fill.fill_id)
         self._trim_dedupe()
@@ -208,7 +278,8 @@ class OrderManager:
             else OrderStatus.PARTIALLY_FILLED
         )
         if order.status is not target or target is OrderStatus.PARTIALLY_FILLED:
-            order.transition(target, self.clock.now_ms())
+            stamp = self.clock.now_ms() if now_ms is None else now_ms
+            order.transition(target, stamp)
         return True
 
     # -- queries -----------------------------------------------------------
@@ -270,6 +341,15 @@ class OrderManager:
         for _ in range(max(0, excess)):
             self._applied_fills.discard(self._dedupe_order.popleft())
 
+    def compactable_order_ids(self, unsealed_fills: set[str]) -> list[str]:
+        """Order ids safe to release from both OMS and executor bookkeeping."""
+        return [
+            order.client_order_id
+            for order in self.orders.values()
+            if order.is_terminal
+            and not any(fill.fill_id in unsealed_fills for fill in order.fills)
+        ]
+
     def compact(self, unsealed_fills: set[str]) -> int:
         """Archive terminal orders the ledger has finished with.
 
@@ -283,10 +363,8 @@ class OrderManager:
         Returns the number of orders archived.
         """
         doomed = [
-            order
-            for order in self.orders.values()
-            if order.is_terminal
-            and not any(fill.fill_id in unsealed_fills for fill in order.fills)
+            self.orders[client_order_id]
+            for client_order_id in self.compactable_order_ids(unsealed_fills)
         ]
         for order in doomed:
             self.archived.absorb(order)

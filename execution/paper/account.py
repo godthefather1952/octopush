@@ -104,6 +104,17 @@ class PaperAccount:
             self.positions[key] = PositionState(venue=venue, symbol=symbol)
         return self.positions[key]
 
+    def preview_fill_realized_pnl(self, fill: FillEvent) -> float:
+        """Return this fill's realized-PnL contribution without mutation."""
+        key = f"{fill.venue}:{fill.symbol}"
+        resident = self.positions.get(key)
+        position = (
+            resident.model_copy(deep=True)
+            if resident is not None
+            else PositionState(venue=fill.venue, symbol=fill.symbol)
+        )
+        return position.apply(fill.side, fill.quantity, fill.price, fill.fee)
+
     def apply_fill(self, fill: FillEvent) -> bool:
         """Apply a fill to cash and positions. Idempotent by fill id."""
         if fill.fill_id in self._applied:
@@ -117,11 +128,9 @@ class PaperAccount:
         position = self.position(fill.venue, fill.symbol)
         realized = position.apply(fill.side, fill.quantity, fill.price, fill.fee)
         position.updated_at = fill.created_at
-        # Captured here, at the one moment this fill's own contribution to
-        # the position's cumulative realized_pnl is known in isolation --
-        # not left for a PAPER_FILL subscriber to reconstruct later from
-        # live account state, which the bus's queue-then-dispatch semantics
-        # can let several other fills mutate first (see FillEvent docstring).
+        # PaperExecutor previews this value before PAPER_FILL publication.
+        # Direct account callers still receive the same canonical value here;
+        # assigning it again is idempotent with that write-ahead preview.
         fill.realized_pnl_delta = realized
 
         self.cash += fill.cash_delta

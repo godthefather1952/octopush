@@ -175,15 +175,15 @@ class PlannedOrder(Base):
     venue: str
     symbol: str
     side: Side
-    quantity: float = Field(gt=0)
+    quantity: float = Field(gt=0, allow_inf_nan=False)
     order_type: OrderType
     time_in_force: TimeInForce
-    limit_price: float | None = None
+    limit_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     #: Price VESKA expects to achieve, including modelled slippage.
-    expected_price: float
-    expected_fee_bps: float
+    expected_price: float = Field(gt=0, allow_inf_nan=False)
+    expected_fee_bps: float = Field(allow_inf_nan=False)
     #: Milliseconds after submission at which an unfilled order is cancelled.
-    ttl_ms: int = 5_000
+    ttl_ms: int = Field(default=5_000, ge=0)
 
 
 class ExecutionPlan(Envelope):
@@ -204,14 +204,14 @@ class ExecutionPlan(Envelope):
     symbol: str
     orders: list[PlannedOrder]
     deadline_ms: Millis
-    max_slippage_bps: float
+    max_slippage_bps: float = Field(allow_inf_nan=False)
     #: Per-leg approved notional. Canonical meaning, unchanged.
-    notional: float
+    notional: float = Field(allow_inf_nan=False)
     #: What the orchestrator asked for, before risk sizing. Per-leg.
-    requested_notional: float = 0.0
+    requested_notional: float = Field(default=0.0, allow_inf_nan=False)
     #: What RUNE authorised. Per-leg, and equal to ``notional``; carried
     #: separately so the pair reads unambiguously beside ``requested_notional``.
-    approved_notional: float = 0.0
+    approved_notional: float = Field(default=0.0, allow_inf_nan=False)
     #: Why this plan exists, in risk terms. Copied from the intent.
     execution_role: ExecutionRole = ExecutionRole.ENTRY
 

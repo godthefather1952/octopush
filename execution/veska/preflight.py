@@ -1,31 +1,25 @@
-"""Plan preflight — the construction-time check seam.
+"""Plan preflight — the canonical fail-closed submission gate.
 
-WHERE THE HARD CHECKS WILL GO
-=============================
-A plan is the last artefact between an authorised intent and orders at a venue.
-This module is the place a later pass puts the checks that must pass before any
-of it is submitted.
+A plan is the final artefact between an authorised intent and venue-side
+execution. Batch B wires this pure checker into `Veska.execute` before any new
+OMS order is created.
 
-This pass deliberately implements only what is *unquestionably* required: a
-plan must have orders, every order must name a venue, a symbol and an id, and
-the executor must claim to support the order type and time-in-force it is being
-asked for. Every one of those is structurally necessary for the plan to be
-workable at all — none is a judgement about whether it *should* be worked.
+The checker owns only validated submission boundaries: structural plan shape,
+executor capability claims, duplicate order identity, configured/enabled venue
+reachability, and the absolute submission deadline when logical time is
+supplied. It deliberately does not invent economic conservation rules that the
+frozen Phase 6 audit did not establish.
 
-Anything that requires a decision — deadline enforcement, per-role size rules,
-notional conservation, venue reachability — is deliberately absent. Adding a
-speculative rule here would create a safety boundary nobody has validated, and
-a boundary that has not been measured is a boundary nobody can trust.
-
-The result is returned, not raised. A structurally impossible plan is a fact
-about the plan, and the caller decides what to do with it; the check itself has
-no business ending a tick.
+The result remains data rather than an exception: VESKA records a blocked plan
+as FAILED, preserves reason codes in the submission report, and creates no
+economic exposure.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from core.models.common import Millis
 from core.models.execution import ExecutorCapabilities
 from core.models.opportunity import ExecutionPlan, PlannedOrder
 
@@ -65,6 +59,7 @@ def _check_order(
     order: PlannedOrder,
     index: int,
     capabilities: ExecutorCapabilities | None,
+    allowed_venues: frozenset[str] | None,
     findings: _Findings,
 ) -> None:
     where = f"order[{index}]"
@@ -74,6 +69,11 @@ def _check_order(
         findings.add("MISSING_VENUE", f"{where} names no venue")
     if not order.symbol:
         findings.add("MISSING_SYMBOL", f"{where} names no symbol")
+    if allowed_venues is not None and order.venue not in allowed_venues:
+        findings.add(
+            "UNKNOWN_VENUE",
+            f"{where} names venue {order.venue!r}, which is not configured and enabled",
+        )
 
     # Quantity and price positivity are enforced by ``PlannedOrder``'s own
     # field constraints, so reaching here means they already hold. Restated as
@@ -107,6 +107,8 @@ def preflight_plan(
     plan: ExecutionPlan,
     *,
     capabilities: ExecutorCapabilities | None = None,
+    now_ms: Millis | None = None,
+    allowed_venues: frozenset[str] | None = None,
 ) -> PlanPreflight:
     """Check a plan's structural workability.
 
@@ -120,10 +122,21 @@ def preflight_plan(
 
     if not plan.orders:
         findings.add("EMPTY_PLAN", "the plan carries no orders")
+    if now_ms is not None and now_ms > plan.deadline_ms:
+        findings.add(
+            "EXPIRED_DEADLINE",
+            f"plan deadline {plan.deadline_ms} expired before submission at {now_ms}",
+        )
 
     seen: set[str] = set()
     for index, order in enumerate(plan.orders):
-        _check_order(order, index, capabilities, findings)
+        _check_order(
+            order,
+            index,
+            capabilities,
+            allowed_venues,
+            findings,
+        )
         if order.client_order_id in seen:
             findings.add(
                 "DUPLICATE_CLIENT_ORDER_ID",

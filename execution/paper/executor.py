@@ -36,7 +36,7 @@ from core.bus import EventBus
 from core.clock import Clock
 from core.config import Settings
 from core.events import Event, EventType
-from core.models.common import QTY_EPSILON, Millis
+from core.models.common import QTY_EPSILON, Millis, TimeInForce
 from core.models.execution import (
     ExecutionCommandResult,
     ExecutionReport,
@@ -51,7 +51,12 @@ from core.models.market import MarketState, PriceLevel
 from core.models.opportunity import ExecutionPlan
 from execution.oms import OrderManager
 from execution.paper.account import PaperAccount
-from execution.paper.simulator import BookView, FillSimulator, is_marketable
+from execution.paper.simulator import (
+    BookView,
+    FillSimulator,
+    is_marketable,
+    would_cross,
+)
 from execution.veska.executor import Executor
 
 log = logging.getLogger(__name__)
@@ -99,6 +104,17 @@ class _Pending:
     traded_through: float = 0.0
     #: Set by failure injection: the order's true state becomes unknowable.
     force_unknown: bool = False
+    #: IOC has exactly one venue execution attempt, even if a later derived
+    #: event publication fails and the next poll is used for recovery.
+    ioc_attempted: bool = False
+
+
+@dataclass
+class _DeferredOrderUpdate:
+    """A derived order snapshot whose canonical fill is already accepted."""
+
+    snapshot: PaperOrder
+    ts_ms: Millis
 
 
 @dataclass
@@ -114,6 +130,15 @@ class PaperExecutor(Executor):
     market: MarketState | None = None
     is_paper: bool = True
     _pending: dict[str, _Pending] = field(default_factory=dict)
+    #: Last observed rolling-volume stock per venue/symbol. Queue progress is
+    #: credited from positive deltas only, never from repeated observations of
+    #: the same rolling window.
+    _last_rolling_volume: dict[tuple[str, str], float] = field(default_factory=dict)
+    #: Derived order updates that failed after a PAPER_FILL was already
+    #: accepted. They are retried before the affected order can advance again.
+    _pending_order_updates: dict[str, _DeferredOrderUpdate] = field(
+        default_factory=dict
+    )
     #: Set by the kill switch. Blocks new submissions without touching
     #: outstanding orders, which still need to be cancelled or resolved.
     execution_disabled: bool = False
@@ -146,24 +171,76 @@ class PaperExecutor(Executor):
         )
 
     def _accrue_trade_flow(self) -> None:
-        """Credit resting orders with volume that traded at their price."""
+        """Credit resting orders only for newly observed rolling-volume flow."""
         if self.market is None:
             return
+
+        deltas: dict[tuple[str, str], float] = {}
+        for state in self.market.venues.values():
+            key = (state.venue, state.symbol)
+            current = state.metrics.buy_volume + state.metrics.sell_volume
+            previous = self._last_rolling_volume.get(key)
+            self._last_rolling_volume[key] = current
+            deltas[key] = (
+                0.0 if previous is None else max(0.0, current - previous)
+            )
+
         for order in self.oms.live_orders():
             pending = self._pending.get(order.client_order_id)
             if pending is None or order.limit_price is None:
                 continue
-            state = self.market.venue_state(order.venue, order.symbol)
-            if state is None:
-                continue
-            volume = state.metrics.buy_volume + state.metrics.sell_volume
-            pending.traded_through += volume * 0.01
+            delta = deltas.get((order.venue, order.symbol), 0.0)
+            if delta > 0:
+                pending.traded_through += delta * 0.01
 
     def _latency(self, venue: str) -> int:
-        try:
-            return self.settings.venue(venue).latency_ms
-        except KeyError:
-            return 40
+        """Configured venue latency; unknown venues never receive defaults."""
+        return self.settings.venue(venue).latency_ms
+
+    async def _publish_then_commit_order(
+        self,
+        order: PaperOrder,
+        statuses: tuple[OrderStatus, ...],
+        now_ms: Millis,
+        *,
+        event_type: EventType = EventType.PAPER_ORDER_UPDATED,
+        submitted_at: Millis | None = None,
+        acknowledged_at: Millis | None = None,
+        reject_reason: str | None = None,
+    ) -> PaperOrder:
+        """Publish a projected order state before committing it to the OMS."""
+        projected = order.model_copy(deep=True)
+        if submitted_at is not None:
+            projected.submitted_at = submitted_at
+        if acknowledged_at is not None:
+            projected.acknowledged_at = acknowledged_at
+        if reject_reason is not None:
+            projected.reject_reason = reject_reason
+        for status in statuses:
+            projected.transition(status, now_ms)
+
+        await self._publish_order(projected, event_type, now_ms)
+
+        if submitted_at is not None:
+            order.submitted_at = submitted_at
+        if acknowledged_at is not None:
+            order.acknowledged_at = acknowledged_at
+        if reject_reason is not None:
+            order.reject_reason = reject_reason
+        for status in statuses:
+            self.oms.transition(order.client_order_id, status, now_ms=now_ms)
+        return order
+
+    async def _retry_deferred_order_update(self, client_order_id: str) -> None:
+        deferred = self._pending_order_updates.get(client_order_id)
+        if deferred is None:
+            return
+        await self._publish_order(
+            deferred.snapshot,
+            EventType.PAPER_ORDER_UPDATED,
+            deferred.ts_ms,
+        )
+        self._pending_order_updates.pop(client_order_id, None)
 
     # -- submission --------------------------------------------------------
 
@@ -178,25 +255,64 @@ class PaperExecutor(Executor):
         orders: list[PaperOrder] = []
         notes: list[str] = []
 
+        seen_ids: set[str] = set()
+        duplicate_ids: set[str] = set()
+        enabled_venues = {venue.name for venue in self.settings.enabled_venues}
+        for planned in plan.orders:
+            if planned.client_order_id in seen_ids:
+                duplicate_ids.add(planned.client_order_id)
+            seen_ids.add(planned.client_order_id)
+            if planned.venue not in enabled_venues:
+                raise ValueError(
+                    f"venue {planned.venue!r} is not configured and enabled"
+                )
+            if not PAPER_CAPABILITIES.supports_order_type(planned.order_type):
+                raise ValueError(
+                    f"unsupported order type: {planned.order_type.value}"
+                )
+            if not PAPER_CAPABILITIES.supports_time_in_force(
+                planned.time_in_force
+            ):
+                raise ValueError(
+                    f"unsupported time in force: {planned.time_in_force.value}"
+                )
+        if duplicate_ids:
+            duplicates = ", ".join(sorted(duplicate_ids))
+            raise ValueError(
+                f"duplicate client_order_id(s) in plan {plan.plan_id}: {duplicates}"
+            )
+
         for planned in plan.orders:
             order = self.oms.from_plan(
-                planned, plan_id=plan.plan_id, intent_id=plan.intent_id, strategy=plan.strategy
+                planned,
+                plan_id=plan.plan_id,
+                intent_id=plan.intent_id,
+                strategy=plan.strategy,
+                now_ms=now,
             )
             order.correlation_id = plan.correlation_id
             if self.execution_disabled:
+                await self._publish_then_commit_order(
+                    order,
+                    (OrderStatus.REJECTED,),
+                    now,
+                    reject_reason="execution disabled",
+                )
                 self.rejected_submissions += 1
-                self.oms.reject(order.client_order_id, "execution disabled")
                 notes.append(f"{order.client_order_id}: execution disabled")
-                await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now)
                 orders.append(order)
                 continue
 
-            self.oms.transition(order.client_order_id, OrderStatus.SUBMITTING)
-            order.submitted_at = now
+            await self._publish_then_commit_order(
+                order,
+                (OrderStatus.SUBMITTING,),
+                now,
+                event_type=EventType.PAPER_ORDER_CREATED,
+                submitted_at=now,
+            )
             self._pending[order.client_order_id] = _Pending(
                 ack_at=now + self._latency(order.venue)
             )
-            await self._publish_order(order, EventType.PAPER_ORDER_CREATED, now)
             orders.append(order)
 
         return ExecutionReport(
@@ -216,16 +332,25 @@ class PaperExecutor(Executor):
         if order is None or not order.is_live:
             return
         if order.status in (OrderStatus.CREATED, OrderStatus.SUBMITTING):
-            # Not yet acknowledged; the venue has nothing to cancel, so the
-            # order resolves once it arrives.
-            self._pending.setdefault(
+            # A pre-ack cancel is explicit state, not a timing side-channel.
+            # Preserve the original arrival instant and consume the request
+            # deterministically on arrival before the order can work.
+            await self._publish_then_commit_order(
+                order, (OrderStatus.CANCEL_PENDING,), now_ms
+            )
+            pending = self._pending.setdefault(
                 client_order_id, _Pending(ack_at=now_ms)
-            ).cancel_at = now_ms
+            )
+            pending.cancel_at = now_ms
             return
-        self.oms.transition(client_order_id, OrderStatus.CANCEL_PENDING)
+
+        await self._publish_then_commit_order(
+            order, (OrderStatus.CANCEL_PENDING,), now_ms
+        )
         pending = self._pending.setdefault(client_order_id, _Pending(ack_at=now_ms))
-        pending.cancel_at = now_ms + self.settings.venue(order.venue).cancel_latency_ms
-        await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
+        pending.cancel_at = (
+            now_ms + self.settings.venue(order.venue).cancel_latency_ms
+        )
 
     async def cancel_all(self, now_ms: Millis) -> int:
         live = self.oms.live_orders()
@@ -245,6 +370,7 @@ class PaperExecutor(Executor):
         """Advance every live order to ``now_ms``."""
         fills: list[FillEvent] = []
         for order in list(self.oms.orders.values()):
+            await self._retry_deferred_order_update(order.client_order_id)
             if order.is_terminal or order.status is OrderStatus.UNKNOWN:
                 continue
             pending = self._pending.get(order.client_order_id)
@@ -252,18 +378,50 @@ class PaperExecutor(Executor):
                 continue
 
             if pending.force_unknown:
-                self.oms.mark_unknown(order.client_order_id, "simulated venue timeout")
-                await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
+                await self._publish_then_commit_order(
+                    order,
+                    (OrderStatus.UNKNOWN,),
+                    now_ms,
+                    reject_reason="simulated venue timeout",
+                )
                 continue
 
             if now_ms < pending.ack_at:
                 continue
 
+            # A cancellation requested before acknowledgement is cancel-on-
+            # arrival. It never enters the working/fill path and therefore
+            # cannot lose the ordinary post-ack cancel/fill race.
+            if (
+                order.status is OrderStatus.CANCEL_PENDING
+                and pending.cancel_at is not None
+                and pending.cancel_at <= pending.ack_at
+            ):
+                await self._publish_then_commit_order(
+                    order, (OrderStatus.CANCELLED,), now_ms
+                )
+                continue
+
             if order.status is OrderStatus.SUBMITTING:
-                self.oms.transition(order.client_order_id, OrderStatus.ACKNOWLEDGED)
-                order.acknowledged_at = now_ms
-                self.oms.transition(order.client_order_id, OrderStatus.OPEN)
-                await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
+                arrival_view = self._book_view(order)
+                if (
+                    order.time_in_force is TimeInForce.POST_ONLY
+                    and would_cross(order, arrival_view)
+                ):
+                    await self._publish_then_commit_order(
+                        order,
+                        (OrderStatus.ACKNOWLEDGED, OrderStatus.REJECTED),
+                        now_ms,
+                        acknowledged_at=now_ms,
+                        reject_reason="post-only order would take liquidity",
+                    )
+                    continue
+                await self._publish_then_commit_order(
+                    order,
+                    (OrderStatus.ACKNOWLEDGED, OrderStatus.OPEN),
+                    now_ms,
+                    acknowledged_at=now_ms,
+                )
 
             view = self._book_view(order)
 
@@ -271,11 +429,24 @@ class PaperExecutor(Executor):
             if order.status is OrderStatus.CANCEL_PENDING:
                 if pending.cancel_at is not None and now_ms >= pending.cancel_at:
                     if self.simulator.cancel_wins_race(order, view):
-                        self.oms.transition(order.client_order_id, OrderStatus.CANCELLED)
-                        await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
+                        await self._publish_then_commit_order(
+                            order, (OrderStatus.CANCELLED,), now_ms
+                        )
                         continue
                 else:
                     continue
+
+            if (
+                order.time_in_force is TimeInForce.IOC
+                and pending.ioc_attempted
+            ):
+                await self._publish_then_commit_order(
+                    order, (OrderStatus.CANCELLED,), now_ms
+                )
+                continue
+
+            if order.time_in_force is TimeInForce.IOC:
+                pending.ioc_attempted = True
 
             fill = self._attempt_fill(order, view, now_ms)
             if fill is not None:
@@ -285,16 +456,46 @@ class PaperExecutor(Executor):
             if order.is_terminal:
                 continue
 
+            if order.time_in_force is TimeInForce.IOC:
+                await self._publish_then_commit_order(
+                    order, (OrderStatus.CANCELLED,), now_ms
+                )
+                continue
+
             if order.expires_at is not None and now_ms >= order.expires_at:
                 target = (
                     OrderStatus.EXPIRED
                     if order.filled_quantity <= 0
                     else OrderStatus.CANCELLED
                 )
-                self.oms.transition(order.client_order_id, target)
-                await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
+                await self._publish_then_commit_order(
+                    order, (target,), now_ms
+                )
 
         return fills
+
+    def _source_timestamp(self, order: PaperOrder) -> Millis | None:
+        """Authoritative exchange timestamp for exactly this order's leg."""
+        if self.market is None:
+            return None
+        return self.market.source_data_timestamp_for(
+            [(order.venue, order.symbol)]
+        )
+
+    def _synthetic_latency_ms(
+        self,
+        order: PaperOrder,
+        pending: _Pending | None,
+        source_ts: Millis | None,
+    ) -> float:
+        """Latency not already represented by the observed leg snapshot."""
+        configured = float(self._latency(order.venue))
+        if pending is None or source_ts is None:
+            return configured
+        return min(
+            configured,
+            float(max(0, pending.ack_at - source_ts)),
+        )
 
     def _attempt_fill(
         self, order: PaperOrder, view: BookView, now_ms: Millis
@@ -308,7 +509,13 @@ class PaperExecutor(Executor):
         if not view.opposing:
             return None
 
-        latency = float(self._latency(order.venue))
+        source_ts = self._source_timestamp(order)
+        pending = self._pending.get(order.client_order_id)
+        latency = self._synthetic_latency_ms(order, pending, source_ts)
+        taking = is_marketable(order) or (
+            order.time_in_force is not TimeInForce.POST_ONLY
+            and would_cross(order, view)
+        )
         simulated = (
             self.simulator.fill_marketable(
                 order,
@@ -316,22 +523,22 @@ class PaperExecutor(Executor):
                 self.settings.venue(order.venue).fees,
                 latency,
             )
-            if is_marketable(order)
+            if taking
             else self.simulator.fill_passive(
                 order, view, self.settings.venue(order.venue).fees
             )
         )
         if simulated is None or simulated.quantity <= QTY_EPSILON:
             return None
-        source_ts = self.market.source_data_timestamp if self.market else None
         return self.simulator.build_fill(order, simulated, now_ms, source_ts)
 
     async def _record_fill(
         self, order: PaperOrder, fill: FillEvent, now_ms: Millis
     ) -> None:
-        if not self.oms.apply_fill(fill):
+        if not self.oms.validate_fill(fill, count_duplicate=True):
             return
-        self.account.apply_fill(fill)
+
+        fill.realized_pnl_delta = self.account.preview_fill_realized_pnl(fill)
         await self.bus.publish(
             Event(
                 type=EventType.PAPER_FILL,
@@ -342,7 +549,21 @@ class PaperExecutor(Executor):
                 payload=fill.to_json_dict(),
             )
         )
-        await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
+
+        if not self.oms.apply_fill(fill, now_ms=now_ms):
+            return
+        self.account.apply_fill(fill)
+
+        snapshot = order.model_copy(deep=True)
+        try:
+            await self._publish_order(
+                snapshot, EventType.PAPER_ORDER_UPDATED, now_ms
+            )
+        except Exception:
+            self._pending_order_updates[order.client_order_id] = (
+                _DeferredOrderUpdate(snapshot=snapshot, ts_ms=now_ms)
+            )
+            raise
 
     # -- identity ----------------------------------------------------------
 
@@ -397,8 +618,9 @@ class PaperExecutor(Executor):
                 at_ms=now_ms,
             )
 
-        self.oms.resolve_unknown(client_order_id, authoritative_status)
-        await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
+        await self._publish_then_commit_order(
+            order, (authoritative_status,), now_ms
+        )
         return ExecutionCommandResult(
             accepted=True,
             client_order_id=client_order_id,
@@ -465,22 +687,24 @@ class PaperExecutor(Executor):
     # -- retention ---------------------------------------------------------
 
     def compact_terminal_state(self, *, unsealed_fills: set[str]) -> int:
-        """Release per-order bookkeeping the platform has finished with.
+        """Release OMS and venue-timing state under one compaction decision.
 
-        Delegates the order-side decision to ``OrderManager.compact``, which
-        already refuses anything that is not terminal or whose fills are still
-        awaiting reconciliation — and therefore never touches an UNKNOWN order,
-        because UNKNOWN is not terminal.
-
-        This executor's own ``_pending`` records are deliberately left alone in
-        this construction pass. Deciding when a venue-side timing record stops
-        being needed is a retention question with a safety edge (an UNKNOWN
-        order's arrival and cancel schedule are still needed if it ever
-        resolves), and answering it by deleting things now would be exactly the
-        kind of unmeasured change this phase is meant to avoid. The hook is
-        here; the policy is not.
+        Only terminal orders with no unsealed fills are compactable. UNKNOWN is
+        non-terminal, so its timing state survives automatically.
         """
-        return self.oms.compact(unsealed_fills)
+        protected_fill_ids = {
+            fill.fill_id
+            for client_order_id in self._pending_order_updates
+            for order in [self.oms.get(client_order_id)]
+            if order is not None
+            for fill in order.fills
+        }
+        effective_unsealed = set(unsealed_fills) | protected_fill_ids
+        compactable = self.oms.compactable_order_ids(effective_unsealed)
+        released = self.oms.compact(effective_unsealed)
+        for client_order_id in compactable:
+            self._pending.pop(client_order_id, None)
+        return released
 
     async def _publish_order(
         self, order: PaperOrder, event_type: EventType, now_ms: Millis
