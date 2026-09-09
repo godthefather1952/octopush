@@ -104,8 +104,8 @@ class TestEntrySizingIsBoundedByAuthorisation:
         assert planned_notional <= approved * 1.01, (
             f"an ENTRY plan was built for {planned_notional:.0f} notional "
             f"against an approved_notional of {approved:.0f} — "
-            f"{planned_notional / approved:.0f}x the authorisation — because "
-            "the explicit leg quantity bypassed the sizing branch"
+            f"{planned_notional / approved:.0f}x the authorisation — ENTRY "
+            "sizing is no longer bounded by the approved-notional rule"
         )
 
     def test_the_sizing_branch_explicitly_protects_entry_authorisation(self):
