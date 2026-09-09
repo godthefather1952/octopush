@@ -1,6 +1,6 @@
 # Phase 6 — VESKA / paper-execution validation audit
 
-**Status: CODESPACES CLASSIFIED / FINAL AUDIT-ONLY RERUN REQUIRED.**
+**Status: PHASE 6 AUDIT SURFACE FROZEN / PRODUCTION REMEDIATION NEXT.**
 
 **PRODUCTION CHANGES: NONE.**
 
@@ -204,6 +204,59 @@ that the original report remains fill-empty after actual fills occur.
 **P6-20 remains PROPOSED FINDING / EXTERNALLY CONFIRMED / NOT REMEDIATED.**
 The Codespaces run again reproduced acceptance of a hand-built unconfigured
 venue plan rather than fail-closed rejection.
+
+## Final audit-only rerun
+
+Command:
+
+`./test.sh tests/audit`
+
+Result on audit head `15a61a667fe6edffa523e54a05a3c787ef72e29f`:
+
+- **1557 passed**
+- **70 failed**
+- **1 skipped**
+- **0 known audit/harness failures**
+- **0 Phase 11/12 baseline failures in this audit-only run**
+
+Classification of the 70 failures:
+
+- **69** confirmed production-behaviour invariant failures;
+- **0** audit/harness failures;
+- **0** baseline/out-of-phase failures;
+- **1** inconclusive policy classification: H14 / P6-15 latency double counting.
+
+The three assignment-form `PAPER_FILL` capture defects from the previous
+Codespaces run are absent from the final short test summary. No
+`test_phase6_event_integrity.py` test fails.
+
+The remaining red tests map to the frozen production finding inventory. They
+include partial multi-leg atomicity, cancel-before-ack, deadline enforcement,
+idempotency, logical-time/replay divergence, passive-fill behaviour, entry
+sizing, unknown-venue execution, resource retention, numeric safety,
+IOC/FOK/POST_ONLY/GTC semantics, UNKNOWN capacity, and supplied-instant
+resolution semantics.
+
+H14/P6-15 remains intentionally **INCONCLUSIVE** as to policy intent: the audit
+externally measured 0.2800 bps realised slippage when the book had already
+moved by the configured 0.1400 bps latency drift, proving double application,
+but the repository does not establish whether that extra pessimism is an
+intentional stress model or an execution-model defect.
+
+**PHASE 6 AUDIT SURFACE FROZEN.**
+
+This freezes the validation surface, not Phase 6 production. Confirmed
+production findings remain intentionally failing and unremediated.
+
+Next:
+
+**PHASE 6 BATCH A — EXPOSURE INTEGRITY**
+
+- P6-1 — cancel-before-ACK
+- P6-2 — partial multi-leg execution / stranded accepted leg
+- P6-3 — idempotency / resubmission overwrite
+- P6-4 — UNKNOWN capacity/risk accounting
+- P6-10 — explicit ENTRY sizing authorization bypass
 
 ## Audit surface
 
@@ -1069,7 +1122,7 @@ inspection; the constructed test proves it under execution.
 `TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED` means the invariant is asserted
 and the outcome is not knowable without running it.
 
-**No hypothesis is marked PASS.** Historical static/external verdicts are preserved below; later Codespaces evidence is recorded above. A final audit-only rerun remains required before freezing the audit surface.
+Final audit-only validation is complete. Verdicts below incorporate the frozen external result; passing audit hypotheses are stated as refuted defect concerns rather than silently dropped.
 
 | # | Hypothesis | Verdict | Finding | Test module |
 | --- | --- | --- | --- | --- |
@@ -1084,32 +1137,32 @@ and the outcome is not knowable without running it.
 | H9 | Plan submission idempotency | **STATICALLY CONFIRMED** | P6-3 | `test_phase6_idempotency.py` |
 | H10 | Absolute deadline | **STATICALLY CONFIRMED** | P6-11 | `test_phase6_deadlines.py` |
 | H11 | Approved size conservation | **STATICALLY CONFIRMED** (latent) | P6-10 | `test_phase6_planning.py` |
-| H12 | Plan conservation | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED | — | `test_phase6_planning.py` |
-| H13 | Slippage hard bound | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED | — | `test_phase6_slippage.py` |
-| H14 | Latency double counting | **INCONCLUSIVE** — classification requested | P6-15 | `test_phase6_slippage.py` |
-| H15 | Passive trade-flow accrual | **STATICALLY CONFIRMED** | P6-12 | `test_phase6_passive_fills.py` |
-| H16 | `max_partial_fraction` | **STATICALLY CONFIRMED** | P6-13 | `test_phase6_passive_fills.py` |
+| H12 | Plan conservation | **EXTERNALLY REFUTED AS A DEFECT CONCERN — tested conservation invariants held** | — | `test_phase6_planning.py` |
+| H13 | Slippage hard bound | **EXTERNALLY REFUTED FOR THE TESTED SUPPORTED BOUND — no hard-bound failure remained** | — | `test_phase6_slippage.py` |
+| H14 | Latency double counting | **INCONCLUSIVE — externally measured double application; policy intent unresolved** | P6-15 | `test_phase6_slippage.py` |
+| H15 | Passive trade-flow accrual | **EXTERNALLY CONFIRMED** | P6-12 | `test_phase6_passive_fills.py` |
+| H16 | `max_partial_fraction` | **EXTERNALLY CONFIRMED** | P6-13 | `test_phase6_passive_fills.py` |
 | H17 | Event/state atomicity | **EXTERNALLY CONFIRMED — corrected exact-Nth failure injection reproduced state/event divergence** | P6-17 | `test_phase6_atomicity.py` |
-| H18 | Fill source timestamp | **STATICALLY CONFIRMED** | P6-14 | `test_phase6_passive_fills.py` |
-| H19 | Resource retention | **STATICALLY CONFIRMED** (`_pending`) | P6-16 | `test_phase6_resource_bounds.py` |
+| H18 | Fill source timestamp | **EXTERNALLY CONFIRMED** | P6-14 | `test_phase6_passive_fills.py` |
+| H19 | Resource retention | **EXTERNALLY CONFIRMED** (`_pending`) | P6-16 | `test_phase6_resource_bounds.py` |
 | H20 | UNKNOWN retention | **STATICALLY REFUTED** — compaction refuses non-terminal orders, and UNKNOWN is not terminal | — | `test_phase6_resource_bounds.py`, `test_phase6_unknown.py` |
 | H21 | Execution report semantics | **EXTERNALLY CONFIRMED — submission-only lifecycle semantics reproduced after capture correction** | P6-18 | `test_phase6_registry.py` |
 | H22 | Numeric / schema safety | **EXTERNALLY CONFIRMED BY CI #53** | P6-19 | `test_phase6_slippage.py` |
 | H23 | Unknown venue | **PARTIAL — router path refuted; hand-built/replayed path externally confirmed** | P6-20 | `test_phase6_planning.py` |
-| H24 | Same-timestamp precedence | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED (behaviour pinned, not judged) | — | `test_phase6_cancel.py` |
-| H25 | Production-like probe | **CI #54 BLOCKED BY TWO AUDIT-INVARIANT DEFECTS — corrected external rerun required** | — | `test_phase6_production_probe.py` |
-| H26 | Execution registry truth | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED | — | `test_phase6_registry.py` |
-| H27 | Registry identity | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED | — | `test_phase6_registry.py` |
-| H28 | Execution snapshot consistency | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED | — | `test_phase6_snapshots.py` |
-| H29 | Query vocabulary | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED | — | `test_phase6_snapshots.py` |
-| H30 | `resolve_unknown` contract | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED | — | `test_phase6_unknown.py` |
+| H24 | Same-timestamp precedence | **EXTERNALLY REFUTED AS A DEFECT CONCERN — tested precedence remained deterministic** | — | `test_phase6_cancel.py` |
+| H25 | Production-like probe | **EXTERNALLY REFUTED AS AN AUDIT BLOCKER — corrected probe completed without failure** | — | `test_phase6_production_probe.py` |
+| H26 | Execution registry truth | **EXTERNALLY REFUTED AS A DEFECT CONCERN — registry truth invariants held** | — | `test_phase6_registry.py` |
+| H27 | Registry identity | **EXTERNALLY REFUTED AS A DEFECT CONCERN — identity invariants held** | — | `test_phase6_registry.py` |
+| H28 | Execution snapshot consistency | **EXTERNALLY REFUTED AS A DEFECT CONCERN — snapshot consistency held** | — | `test_phase6_snapshots.py` |
+| H29 | Query vocabulary | **EXTERNALLY REFUTED AS A DEFECT CONCERN — query vocabulary held** | — | `test_phase6_snapshots.py` |
+| H30 | `resolve_unknown` contract | **PARTIAL — resolution works, but supplied `now_ms` is not used for OMS terminal history** | P6-8 | `test_phase6_unknown.py` |
 | H31 | Executor capability claims | **STATICALLY CONFIRMED** (FOK, MARKET) | P6-7 | `test_phase6_tif.py` |
 | H32 | Preflight contract | **STATICALLY CONFIRMED** (unwired) | P6-9 | `test_phase6_planning.py` |
 | H33 | Gateway / paper boundary | **STATICALLY REFUTED** — no implementation, no construction site, no transport import, no credential | — | `test_phase6_paper_boundary.py` |
 | H34 | Later phases must not change Phase 6 | **STATICALLY REFUTED** — `PaperExecutor` construction is unguarded by profile or feed | — | `test_phase6_paper_boundary.py` |
 | H35 | Shadow creates no second execution path | **STATICALLY REFUTED** — the observer holds only a bus and a registry and publishes nothing | — | `test_phase6_paper_boundary.py` |
-| H36 | Determinism | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED | — | `test_phase6_replay.py` |
-| H37 | Replay execution equivalence | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED (see P6-8) | P6-8 | `test_phase6_replay.py` |
+| H36 | Determinism | **EXTERNALLY CONFIRMED AS A DEFECT — wall-clock skew changes execution truth** | P6-8 | `test_phase6_replay.py` |
+| H37 | Replay execution equivalence | **EXTERNALLY CONFIRMED — nine scenarios plus multi-venue diverge under wall-clock skew** | P6-8 | `test_phase6_replay.py` |
 
 **Refuted hypotheses, stated positively.** H20, H33, H34 and H35 were tested
 adversarially and the implementation held. H6 is refuted for RUNE's
