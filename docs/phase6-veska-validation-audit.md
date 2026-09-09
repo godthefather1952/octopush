@@ -1,6 +1,6 @@
 # Phase 6 — VESKA / paper-execution validation audit
 
-**Status: CI #54 CLASSIFIED / AUDIT HARNESS CORRECTED / EXTERNAL RERUN REQUIRED.**
+**Status: CODESPACES CLASSIFIED / FINAL AUDIT-ONLY RERUN REQUIRED.**
 
 **PRODUCTION CHANGES: NONE.**
 
@@ -141,19 +141,69 @@ commit following this classification:
 These are audit defects, not VESKA defects. Correcting them does not weaken any
 valid Phase 6 invariant and changes no production module.
 
-**P6-17 remains STATIC ONLY** until its corrected event/state atomicity
-reproduction is executed externally. The static mutation-before-publication
-ordering remains evidence, but CI #54 did not provide an authoritative
-behavioural reproduction because the failure injection was mis-targeted.
+At CI #54, **P6-17 remained STATIC ONLY** because the event/state atomicity
+failure injection was mis-targeted. That historical CI #54 classification is
+preserved here; the subsequent Codespaces run supersedes it below.
 
-**P6-18 is PARTIALLY CONFIRMED.** The submission-report semantics are
-established, but its event-count test in CI #54 was blocked by the undrained
-capture harness.
+At CI #54, **P6-18 was PARTIALLY CONFIRMED** because the submission-report
+semantics were established while the event-count reproduction was blocked by
+the undrained capture harness. The subsequent Codespaces run supersedes that
+classification below.
 
 The known baseline remains separate: the Phase 11/12 `TF_FEED` compose
 contract failure plus Ruff `I001` in `agents/marin/agent.py` and
 `agents/marin/source.py`, and `SIM102` in `agents/okapi/registry.py`.
 None is changed here.
+
+## External validation — Codespaces after audit-harness correction
+
+The corrected audit commit
+`9c6f92dc8173042e53b27510a1da370f3c6bd6c5`
+was exercised in Codespaces on `validate-phase6-veska`.
+
+The full-suite run from that command bundle ended with:
+
+- **3241 passed**
+- **101 failed**
+- **98 errors**
+- **1 skipped**
+- **1 warning**
+
+That full-suite headline is not the Phase 6 result. Redis-backed tests failed
+because `127.0.0.1:6379` refused connections and PostgreSQL-backed tests failed
+because `127.0.0.1:5432` refused connections. The pre-existing Phase 11/12
+`TF_FEED` packaging failure also remained.
+
+The short test summary contains **73 Phase 6 audit failures**. Classification:
+
+- **70** are attributable to production behaviour;
+- **3** remain attributable to the audit event-capture lifecycle.
+
+The three remaining audit-side failures are:
+
+- `TestEveryStateChangeIsPublished::test_a_fill_publishes_both_the_fill_and_the_order_update`;
+- `TestEventTimestamps::test_a_fill_event_carries_the_fills_own_instant`;
+- `TestPayloadIntegrity::test_a_fill_payload_reconstructs_the_fill`.
+
+All three return a real fill from `Veska.poll()` and then inspect subscriber-
+captured `PAPER_FILL` events without draining the real `InMemoryEventBus`
+after that assignment-form poll. They require one final audit-only correction.
+
+**P6-17 is EXTERNALLY CONFIRMED.** The corrected exact-Nth `ExplodingBus`
+reproductions reached the intended publications. A failed `PAPER_FILL`
+publication left the paper account mutated without a successfully published
+fill event, and a failed `PAPER_ORDER_UPDATED` publication left the order moved
+from SUBMITTING while the corresponding update was absent.
+
+**P6-18 is EXTERNALLY CONFIRMED.** The corrected event capture removed the
+previous blocker: `TestExecutionReportSemantics` no longer fails. Its three
+tests establish that submit returns an incomplete, fill-empty report, that no
+second `EXECUTION_REPORT` is produced as the order lifecycle advances, and
+that the original report remains fill-empty after actual fills occur.
+
+**P6-20 remains PROPOSED FINDING / EXTERNALLY CONFIRMED / NOT REMEDIATED.**
+The Codespaces run again reproduced acceptance of a hand-built unconfigured
+venue plan rather than fail-closed rejection.
 
 ## Audit surface
 
@@ -856,9 +906,17 @@ so this finding cannot be "solved" by deleting unresolved truth.
 | **Severity** | **HIGH** |
 | **Area** | `execution/paper/executor.py::_record_fill` |
 | **Blocks Phase 6 validation** | Yes |
+| **Status** | **EXTERNALLY CONFIRMED — NOT REMEDIATED** |
+| **Priority** | **P1** |
 
 **Invariant.** Economic truth and durable, replayable truth do not diverge
 without a recovery mechanism.
+
+**External reproduction.** The post-CI-#54 Codespaces run exercised the
+corrected exact-Nth failure injection. It reproduced both account/OMS mutation
+before failed `PAPER_FILL` publication and order-status mutation before failed
+`PAPER_ORDER_UPDATED` publication. The behavioural evidence now agrees with
+the original static ordering evidence.
 
 **Evidence.** `_record_fill` applies the fill to the OMS and to the
 `PaperAccount`, and *then* publishes `PAPER_FILL`. The `Recorder` is bus
@@ -888,8 +946,15 @@ and it is the only thing separating this from P6-2.
 | **Severity** | **LOW** |
 | **Area** | `core/models/execution.py::ExecutionReport` |
 | **Blocks Phase 6 validation** | No |
+| **Status** | **EXTERNALLY CONFIRMED — NOT REMEDIATED** |
+| **Priority** | **P3** |
 
 **Invariant.** A model's fields describe what it can carry.
+
+**External reproduction.** After correcting the capture lifecycle,
+`TestExecutionReportSemantics` completed without a failure in the Codespaces
+run. The audit therefore externally establishes the submission-only report
+semantics rather than merely inferring them from source.
 
 **Evidence.** `ExecutionReport` has `fills: list[FillEvent]` and
 `complete: bool`. `submit` returns it with `complete=False` and no fills,
@@ -963,7 +1028,8 @@ execution-domain Pydantic models in a later production-remediation pass.
 | **Severity** | **HIGH** |
 | **Area** | `execution/paper/executor.py::_latency`, `execution/veska/preflight.py`, `execution/veska/engine.py::execute` |
 | **Blocks Phase 6 validation** | Yes |
-| **Status** | **PROPOSED / EXTERNALLY OBSERVED — NOT REMEDIATED** |
+| **Status** | **PROPOSED FINDING / EXTERNALLY CONFIRMED — NOT REMEDIATED** |
+| **Priority** | **P1** |
 
 **Invariant.** A hand-built, persisted or replayed plan naming a venue that is
 not present in configuration must not be executed using fabricated venue
@@ -1003,7 +1069,7 @@ inspection; the constructed test proves it under execution.
 `TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED` means the invariant is asserted
 and the outcome is not knowable without running it.
 
-**No hypothesis is marked PASS.** Tests were not run.
+**No hypothesis is marked PASS.** Historical static/external verdicts are preserved below; later Codespaces evidence is recorded above. A final audit-only rerun remains required before freezing the audit surface.
 
 | # | Hypothesis | Verdict | Finding | Test module |
 | --- | --- | --- | --- | --- |
@@ -1023,11 +1089,11 @@ and the outcome is not knowable without running it.
 | H14 | Latency double counting | **INCONCLUSIVE** — classification requested | P6-15 | `test_phase6_slippage.py` |
 | H15 | Passive trade-flow accrual | **STATICALLY CONFIRMED** | P6-12 | `test_phase6_passive_fills.py` |
 | H16 | `max_partial_fraction` | **STATICALLY CONFIRMED** | P6-13 | `test_phase6_passive_fills.py` |
-| H17 | Event/state atomicity | **STATIC ONLY — CI #54 behavioural reproduction blocked by audit injection defect** | P6-17 | `test_phase6_atomicity.py` |
+| H17 | Event/state atomicity | **EXTERNALLY CONFIRMED — corrected exact-Nth failure injection reproduced state/event divergence** | P6-17 | `test_phase6_atomicity.py` |
 | H18 | Fill source timestamp | **STATICALLY CONFIRMED** | P6-14 | `test_phase6_passive_fills.py` |
 | H19 | Resource retention | **STATICALLY CONFIRMED** (`_pending`) | P6-16 | `test_phase6_resource_bounds.py` |
 | H20 | UNKNOWN retention | **STATICALLY REFUTED** — compaction refuses non-terminal orders, and UNKNOWN is not terminal | — | `test_phase6_resource_bounds.py`, `test_phase6_unknown.py` |
-| H21 | Execution report semantics | **PARTIALLY CONFIRMED — semantics established; event-count reproduction blocked by capture defect** | P6-18 | `test_phase6_registry.py` |
+| H21 | Execution report semantics | **EXTERNALLY CONFIRMED — submission-only lifecycle semantics reproduced after capture correction** | P6-18 | `test_phase6_registry.py` |
 | H22 | Numeric / schema safety | **EXTERNALLY CONFIRMED BY CI #53** | P6-19 | `test_phase6_slippage.py` |
 | H23 | Unknown venue | **PARTIAL — router path refuted; hand-built/replayed path externally confirmed** | P6-20 | `test_phase6_planning.py` |
 | H24 | Same-timestamp precedence | TEST CONSTRUCTED — EXTERNAL RESULT REQUIRED (behaviour pinned, not judged) | — | `test_phase6_cancel.py` |
@@ -1113,22 +1179,25 @@ never patches execution internals, and declares no skip or xfail.
 
 ## External validation requirements
 
-Run, in this order:
+For the final audit-harness cleanup, run exactly:
 
-1. `pytest tests/audit/test_phase6_*.py` — the Phase 6 suite.
-2. `pytest tests/` — the whole suite, to confirm the audit introduced no
-   collateral failure.
-3. `ruff check .` and `mypy --ignore-missing-imports core`.
+```bash
+./test.sh tests/audit
+```
 
-**Expected outcome.** Failures in the modules covering P6-1 through P6-8,
-P6-10, P6-12, P6-13, P6-14 and P6-17. Those failures are the deliverable.
+Do not use a full-suite run as the authoritative validation for this cleanup.
+The previous Codespaces full run was contaminated by unavailable Redis and
+PostgreSQL services and by the separately tracked Phase 11/12 packaging
+baseline.
 
-Report per hypothesis: which assertions failed, with the message text — every
-failing assertion carries the observed value, so a result is evidence rather
-than a red mark.
+The expected shape after adding the three missing event drains is approximately
+**70 failing Phase 6 product invariants and zero known audit-harness failures**.
+That count is an expectation, not a target: do not change an assertion merely
+to make the result equal 70.
 
-The five hypotheses marked INCONCLUSIVE or requiring classification (H14
-especially) need a judgement, not just a result.
+Classify every remaining failure as production behaviour, audit/harness defect,
+known baseline/out-of-phase, or inconclusive. Freeze the audit surface only if
+no credible audit/harness defect remains.
 
 ---
 
