@@ -150,15 +150,11 @@ class TestCancelBeforeAcknowledgement:
             f"{len(fills)} of them filled afterwards anyway"
         )
 
-    async def test_cancel_at_is_recorded_but_never_consulted(self):
-        """Pins the mechanism, so the finding's evidence is not an inference.
-
-        ``cancel_at`` is written on the pending record and the order's status
-        is left untouched, which is precisely why ``poll``'s CANCEL_PENDING
-        branch never reads it.
-        """
+    async def test_pre_ack_cancel_is_consumed_on_arrival(self):
+        """A pre-ack request is explicit state and resolves before work begins."""
         harness = build_harness()
         harness.update_market(two_venue_market())
+        latency = _ack_at(harness)
         plan = execution_plan(planned_order(), created_at=T0)
         await harness.veska.execute(plan, T0)
         order_id = harness.orders_of(plan.plan_id)[0].client_order_id
@@ -166,10 +162,17 @@ class TestCancelBeforeAcknowledgement:
         await harness.veska.cancel(order_id, T0 + 1)
 
         pending = harness.executor._pending[order_id]
+        order = harness.oms.get(order_id)
         assert pending.cancel_at == T0 + 1, "the cancel time was not recorded"
-        assert harness.oms.get(order_id).status is OrderStatus.SUBMITTING, (
-            "status changed, which would mean poll's cancel branch can see it"
-        )
+        assert order is not None
+        assert order.status is OrderStatus.CANCEL_PENDING
+        assert OrderStatus.CANCEL_PENDING in {status for _, status in order.history}
+
+        fills = await harness.veska.poll(T0 + latency + 1)
+
+        assert not fills
+        assert order.status is OrderStatus.CANCELLED
+        assert order.filled_quantity == 0.0
 
 
 class TestCancelAfterAcknowledgement:

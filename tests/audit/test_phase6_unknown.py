@@ -167,20 +167,13 @@ class TestExecutorQuerySurfaces:
 class TestOpenOrderCapacity:
     """H7 — the capacity a risk limit counts against."""
 
-    def test_the_orchestrator_feeds_open_orders_into_the_capacity_gate(self):
-        """Static evidence for the finding: which predicate reaches RUNE.
-
-        ``gate_open_orders`` projects ``open_orders + incoming_orders`` against
-        ``max_open_orders``. If ``open_orders`` excludes UNKNOWN, an order that
-        may still be resting at the venue consumes no capacity.
-        """
+    def test_the_orchestrator_feeds_outstanding_orders_into_the_capacity_gate(self):
+        """Risk capacity counts every order the venue may still hold."""
         from apps.orchestrator import orchestrator as orch_module
 
         source = inspect.getsource(orch_module.Orchestrator)
-        assert "open_orders=len(self.veska.open_orders())" in source, (
-            "the capacity gate's input has changed; this finding's evidence "
-            "needs re-deriving"
-        )
+        assert "open_orders=len(self.veska.outstanding_orders())" in source
+        assert "open_orders=len(self.veska.open_orders())" not in source
 
     async def test_an_unknown_order_consumes_open_order_capacity(self):
         """The invariant: capacity must reflect what the venue may hold.
@@ -193,18 +186,18 @@ class TestOpenOrderCapacity:
         harness.update_market(_quiet_book())
         await _make_unknown(harness)
 
-        counted = len(harness.veska.open_orders())
+        assert len(harness.veska.open_orders()) == 0
+        counted = len(harness.veska.outstanding_orders())
         assert counted == 1, (
-            "an UNKNOWN order that may still be resting at the venue counts "
-            f"as {counted} against the open-order limit; the venue could hold "
-            "max_open_orders + (number of UNKNOWN orders) real orders"
+            "an UNKNOWN order that may still be resting at the venue must "
+            f"count as {counted} against the capacity-facing outstanding set"
         )
 
 
 class TestOrchestratorConsumers:
     """H6 — the three sites that read liveness as though it were truth."""
 
-    def _sites_reading_is_live(self) -> set[str]:
+    def _sites_reading_is_outstanding(self) -> set[str]:
         from apps.orchestrator import orchestrator as orch_module
 
         tree = ast.parse(inspect.getsource(orch_module.Orchestrator))
@@ -212,45 +205,39 @@ class TestOrchestratorConsumers:
         for node in ast.walk(tree):
             if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
                 continue
-            if "is_live" in ast.dump(node):
+            if "is_outstanding" in ast.dump(node):
                 sites.add(node.name)
         return sites
 
-    def test_the_sites_reading_is_live_are_the_ones_the_audit_names(self):
-        """Pins the evidence, so a new call site is a new finding not a silent one."""
-        assert self._sites_reading_is_live() == {
+    def test_the_finality_sites_read_outstanding_truth(self):
+        """The three exposure decisions must wait through UNKNOWN."""
+        assert {
             "_advance_execution",
             "_hedge_in_flight",
             "_advance_exit",
-        }
+        }.issubset(self._sites_reading_is_outstanding())
 
-    def test_advance_execution_treats_a_non_live_order_as_settled(self):
-        """The entry case: UNKNOWN reads as 'nothing traded, close it'."""
+    def test_advance_execution_waits_for_outstanding_truth(self):
         from apps.orchestrator import orchestrator as orch_module
 
         source = inspect.getsource(orch_module.Orchestrator._advance_execution)
-        assert "is_live" in source
-        assert "is_outstanding" not in source, (
-            "_advance_execution now consults outstanding-ness; this finding "
-            "may be resolved and its evidence needs re-deriving"
-        )
+        assert "is_outstanding" in source
+        assert "is_live" not in source
         assert "Nothing traded" in source
 
-    def test_hedge_in_flight_treats_a_non_live_hedge_as_finished(self):
-        """The hedge case: an UNKNOWN hedge admits a duplicate."""
+    def test_hedge_in_flight_waits_for_outstanding_truth(self):
         from apps.orchestrator import orchestrator as orch_module
 
         source = inspect.getsource(orch_module.Orchestrator._hedge_in_flight)
-        assert "is_live" in source
-        assert "is_outstanding" not in source
+        assert "is_outstanding" in source
+        assert "is_live" not in source
 
-    def test_advance_exit_treats_a_non_live_exit_as_finished(self):
-        """The exit case: an UNKNOWN exit admits a retry."""
+    def test_advance_exit_waits_for_outstanding_truth(self):
         from apps.orchestrator import orchestrator as orch_module
 
         source = inspect.getsource(orch_module.Orchestrator._advance_exit)
-        assert "is_live" in source
-        assert "is_outstanding" not in source
+        assert "is_outstanding" in source
+        assert "is_live" not in source
 
 
 class TestRiskReservationIsCorrect:

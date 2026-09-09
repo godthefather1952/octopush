@@ -193,15 +193,37 @@ class TestDuplicateClientOrderIdWithinOnePlan:
             plan_id="plan-dupe",
         )
 
-        report = await harness.veska.execute(plan, T0)
+        with pytest.raises(ValueError, match="duplicate client_order_id"):
+            await harness.veska.execute(plan, T0)
 
         resident = harness.orders_of("plan-dupe")
-        refused = any(o.status is OrderStatus.REJECTED for o in report.orders)
-        assert refused or len(resident) == 2, (
-            "a plan carrying the same client_order_id twice produced "
-            f"{len(resident)} resident order(s) and refused none: one leg "
-            "silently replaced the other"
+        assert resident == [], (
+            "duplicate order identity was detected only after mutating the OMS"
         )
+        assert harness.oms.orders_created == 0
+
+    def test_the_oms_refuses_a_direct_identity_overwrite(self):
+        """Defense in depth: bypassing VESKA still cannot replace an order."""
+        harness = build_harness()
+        planned = planned_order(client_order_id="resident-id")
+        first = harness.oms.from_plan(
+            planned,
+            plan_id="plan-a",
+            intent_id="intent-a",
+            strategy="cross_venue",
+        )
+        assert first.client_order_id == "resident-id"
+
+        with pytest.raises(ValueError, match="already exists"):
+            harness.oms.from_plan(
+                planned,
+                plan_id="plan-b",
+                intent_id="intent-b",
+                strategy="cross_venue",
+            )
+
+        assert harness.oms.orders_created == 1
+        assert harness.oms.get("resident-id") is first
 
     def test_preflight_detects_the_duplicate(self):
         """The check exists — which is what makes not wiring it a choice."""

@@ -122,20 +122,14 @@ class TestEntrySizingIsBoundedByAuthorisation:
             "the explicit leg quantity bypassed the sizing branch"
         )
 
-    def test_the_sizing_branch_does_not_consult_the_execution_role(self):
-        """Static evidence: nothing distinguishes entry from exit here."""
+    def test_the_sizing_branch_explicitly_protects_entry_authorisation(self):
+        """ENTRY uses approved notional; exact quantities remain risk-reducing only."""
         from execution.veska.engine import Veska
 
         source = inspect.getsource(Veska.build_plan)
+        assert "intent.execution_role is ExecutionRole.ENTRY" in source
+        assert "quantity = notional / routing.expected_price" in source
         assert "leg.quantity" in source
-        assert "notional / routing.expected_price" in source
-        assert "execution_role" in source, "the role is copied onto the plan"
-        # ...but never branched on while sizing.
-        sizing = source[source.index("quantity = (") : source.index("if quantity <= 0")]
-        assert "execution_role" not in sizing, (
-            "the sizing branch now consults execution_role; this finding may "
-            "be resolved and its evidence needs re-deriving"
-        )
 
     def test_the_shipped_detector_leaves_entry_quantities_unset(self):
         """Reachability evidence, which bounds the severity honestly."""

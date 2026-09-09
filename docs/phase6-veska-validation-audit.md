@@ -1,6 +1,6 @@
 # Phase 6 — VESKA / paper-execution validation audit
 
-**Status: PHASE 6 AUDIT SURFACE FROZEN / PRODUCTION REMEDIATION NEXT.**
+**Status: PHASE 6 BATCH A PATCHED / EXTERNAL VALIDATION REQUIRED.**
 
 **PRODUCTION CHANGES: NONE.**
 
@@ -245,18 +245,36 @@ intentional stress model or an execution-model defect.
 
 **PHASE 6 AUDIT SURFACE FROZEN.**
 
-This freezes the validation surface, not Phase 6 production. Confirmed
-production findings remain intentionally failing and unremediated.
+This freezes the validation surface, not Phase 6 production.
 
-Next:
+## Phase 6 Batch A remediation checkpoint
 
-**PHASE 6 BATCH A — EXPOSURE INTEGRITY**
+Production remediation commit:
 
-- P6-1 — cancel-before-ACK
-- P6-2 — partial multi-leg execution / stranded accepted leg
-- P6-3 — idempotency / resubmission overwrite
-- P6-4 — UNKNOWN capacity/risk accounting
-- P6-10 — explicit ENTRY sizing authorization bypass
+`0b6b9c8bc7874eaa90442f7ff2afa4aadfd58c60`
+
+Batch A addresses exposure-integrity findings only:
+
+- **P6-1 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  Pre-ack cancellation is explicit `CANCEL_PENDING` state and resolves
+  cancel-on-arrival before acknowledgement or fill.
+- **P6-2 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  If executor submission raises after creating orders, VESKA synchronises the
+  actual OMS orders into the plan registry before re-raising the exception.
+- **P6-3 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  Exact successful-plan retries return existing order truth without recreation;
+  interrupted submissions fail closed on retry; duplicate client-order ids are
+  rejected before mutation; the OMS refuses resident identity overwrite.
+- **P6-4 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  UNKNOWN remains non-live but outstanding. Entry/hedge/exit finality and the
+  risk-capacity input now use outstanding truth.
+- **P6-10 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  ENTRY sizing is always derived from approved notional, while EXIT/HEDGE retain
+  exact-quantity semantics.
+
+Batch B/C/D findings remain intentionally unremediated. Phase 6 is not production
+frozen until Batch A is externally revalidated and the remaining batches are
+completed.
 
 ## Audit surface
 
@@ -318,6 +336,8 @@ Ranked by demonstrated consequence, highest first.
 | **Severity** | **CRITICAL** |
 | **Area** | `execution/paper/executor.py` — `cancel`, `poll` |
 | **Blocks Phase 6 validation** | Yes |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P0** |
 
 **Invariant.** A cancellation requested before a venue acknowledges an order
 cannot vanish. The outcome may be "cancel on arrival" or an explicitly
@@ -379,6 +399,8 @@ implement either design.
 | **Severity** | **CRITICAL** |
 | **Area** | `execution/paper/executor.py::submit`, `execution/veska/engine.py::execute`, `apps/orchestrator/orchestrator.py::_decide` |
 | **Blocks Phase 6 validation** | Yes |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P0** |
 
 **Invariant.** A plan that fails partway through submission may not leave a
 live order that no plan record, no opportunity record and no cancellation path
@@ -424,6 +446,8 @@ even if it were reachable, because a pre-ack cancel is lost.
 | **Severity** | **CRITICAL** |
 | **Area** | `execution/oms/__init__.py::create`, `execution/veska/engine.py::execute` |
 | **Blocks Phase 6 validation** | Yes |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P0** |
 
 **Invariant.** One `client_order_id` names one order identity. A retry must be
 idempotent or refused — never a silent overwrite.
@@ -478,6 +502,8 @@ here.
 | **Severity** | **CRITICAL** |
 | **Area** | `apps/orchestrator/orchestrator.py` — `_advance_execution`, `_hedge_in_flight`, `_advance_exit` |
 | **Blocks Phase 6 validation** | Yes |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P0** |
 
 **Invariant.** `is_live` answers "is this known to be working?";
 `is_outstanding` answers "could this still have traded?". A caller deciding
@@ -733,6 +759,8 @@ remediation.
 | **Severity** | **HIGH** |
 | **Area** | `execution/veska/engine.py::build_plan` |
 | **Blocks Phase 6 validation** | Yes |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P0** |
 
 **Invariant.** Risk-increasing activity is bounded by what RUNE authorised.
 
