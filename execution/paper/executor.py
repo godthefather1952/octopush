@@ -104,6 +104,9 @@ class _Pending:
     traded_through: float = 0.0
     #: Set by failure injection: the order's true state becomes unknowable.
     force_unknown: bool = False
+    #: IOC has exactly one venue execution attempt, even if a later derived
+    #: event publication fails and the next poll is used for recovery.
+    ioc_attempted: bool = False
 
 
 @dataclass
@@ -432,6 +435,18 @@ class PaperExecutor(Executor):
                         continue
                 else:
                     continue
+
+            if (
+                order.time_in_force is TimeInForce.IOC
+                and pending.ioc_attempted
+            ):
+                await self._publish_then_commit_order(
+                    order, (OrderStatus.CANCELLED,), now_ms
+                )
+                continue
+
+            if order.time_in_force is TimeInForce.IOC:
+                pending.ioc_attempted = True
 
             fill = self._attempt_fill(order, view, now_ms)
             if fill is not None:
