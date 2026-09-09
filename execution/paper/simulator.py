@@ -166,9 +166,12 @@ class FillSimulator:
         if self.rng.random() > probability:
             return None
 
-        # Only the part of our order beyond the queue ahead of us trades.
+        # Both queue position and the global one-evaluation partial cap apply.
         share = max(0.0, 1.0 - self.config.queue_ahead_fraction * self.rng.random())
         quantity = order.remaining_quantity * share
+        cap = self.config.max_partial_fraction
+        if cap < 1.0:
+            quantity = min(quantity, order.remaining_quantity * cap)
         if quantity <= QTY_EPSILON:
             return None
         price = order.limit_price
