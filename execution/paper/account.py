@@ -104,6 +104,17 @@ class PaperAccount:
             self.positions[key] = PositionState(venue=venue, symbol=symbol)
         return self.positions[key]
 
+    def preview_fill_realized_pnl(self, fill: FillEvent) -> float:
+        """Return this fill's realized-PnL contribution without mutation."""
+        key = f"{fill.venue}:{fill.symbol}"
+        resident = self.positions.get(key)
+        position = (
+            resident.model_copy(deep=True)
+            if resident is not None
+            else PositionState(venue=fill.venue, symbol=fill.symbol)
+        )
+        return position.apply(fill.side, fill.quantity, fill.price, fill.fee)
+
     def apply_fill(self, fill: FillEvent) -> bool:
         """Apply a fill to cash and positions. Idempotent by fill id."""
         if fill.fill_id in self._applied:

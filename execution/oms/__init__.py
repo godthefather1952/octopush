@@ -235,12 +235,20 @@ class OrderManager:
 
     # -- fills -------------------------------------------------------------
 
-    def apply_fill(
-        self, fill: FillEvent, *, now_ms: Millis | None = None
+    def validate_fill(
+        self,
+        fill: FillEvent,
+        *,
+        count_duplicate: bool = False,
     ) -> bool:
-        """Apply a fill idempotently. Returns False for a duplicate."""
+        """Validate a fill without changing order or dedupe state.
+
+        Returns False for an already-applied fill. Structural/quantity
+        violations raise exactly as :meth:`apply_fill` does.
+        """
         if fill.fill_id in self._applied_fills:
-            self.duplicate_fills += 1
+            if count_duplicate:
+                self.duplicate_fills += 1
             return False
         order = self.orders.get(fill.client_order_id)
         if order is None:
@@ -250,6 +258,15 @@ class OrderManager:
                 f"overfill on {order.client_order_id}: "
                 f"{fill.quantity} > {order.remaining_quantity} remaining"
             )
+        return True
+
+    def apply_fill(
+        self, fill: FillEvent, *, now_ms: Millis | None = None
+    ) -> bool:
+        """Apply a fill idempotently. Returns False for a duplicate."""
+        if not self.validate_fill(fill, count_duplicate=True):
+            return False
+        order = self.orders[fill.client_order_id]
         self._applied_fills.add(fill.fill_id)
         self._dedupe_order.append(fill.fill_id)
         self._trim_dedupe()
