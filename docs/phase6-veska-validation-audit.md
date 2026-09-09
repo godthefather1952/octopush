@@ -1,13 +1,13 @@
 # Phase 6 — VESKA / paper-execution validation audit
 
-**Status: PHASE 6 BATCH A+B+C PATCHED / EXTERNAL VALIDATION REQUIRED.**
+**Status: PHASE 6 BATCH A+B+C EXTERNALLY REVALIDATED / BATCH D PATCHED / EXTERNAL VALIDATION REQUIRED.**
 
-**CURRENT PRODUCTION CHANGES: PHASE 6 BATCH A+B+C ONLY.**
+**CURRENT PRODUCTION CHANGES: PHASE 6 BATCH A+B+C+D ONLY.**
 
 This document preserves the original Phase 6 validation history and now records
-the first three production-remediation batches. The frozen audit surface remains
-the source of truth for what each batch is intended to change and what later
-batches must leave red.
+all four production-remediation batches. The frozen audit surface remains the
+source of truth for what each batch changed and what external validation has
+actually established.
 
 No valid invariant has been weakened, skipped or xfailed. Historical audit
 checkpoints remain intact; current remediation status is recorded explicitly.
@@ -20,7 +20,8 @@ checkpoints remain intact; current remediation status is recorded explicitly.
 > fully-accounted paper-order lifecycle without silently creating more risk
 > than RUNE authorised, or treating unresolved venue truth as resolved?
 
-Current finding inventory: **no, not yet.** Four findings are CRITICAL, nine HIGH.
+Frozen pre-remediation answer: **no**. Current status: Batch A+B+C is externally
+revalidated and the final Batch D findings are patched pending external CI.
 
 ## Baseline
 
@@ -272,9 +273,8 @@ Batch A addresses exposure-integrity findings only:
   ENTRY sizing is always derived from approved notional, while EXIT/HEDGE retain
   exact-quantity semantics.
 
-Batch C/D findings remain intentionally unremediated. Phase 6 is not production
-frozen until the patched batches are externally revalidated and the remaining
-batches are completed.
+Batch A was subsequently externally revalidated together with B and C by CI
+#74. Batch D remained the final production-remediation scope at that checkpoint.
 
 ## Phase 6 Batch B remediation checkpoint
 
@@ -309,8 +309,8 @@ Batch B addresses submission and instruction-contract findings only:
   Unknown venues are blocked by preflight, PaperExecutor validates venue truth
   before mutation, and the fabricated 40ms fallback has been removed.
 
-Batch A remains patched and awaiting the same external revalidation. Batch D
-remains intentionally unremediated.
+Batch A+B were subsequently externally revalidated together with C by CI #74.
+Batch D remained intentionally unremediated at this historical checkpoint.
 
 ## Phase 6 Batch C remediation checkpoint
 
@@ -344,8 +344,81 @@ Batch C addresses determinism and execution-fidelity findings only:
   executor `_pending` records under the same decision; UNKNOWN remains
   non-terminal and retains its pending state.
 
-Batch A+B remain patched and await the same external revalidation. Batch D
-(P6-17/P6-18) remains intentionally unremediated.
+Batch A+B+C were externally revalidated by CI #74 below. Batch D
+(P6-17/P6-18) remained intentionally unremediated at that validated checkpoint.
+
+## External revalidation — CI #74 (Batch A+B+C)
+
+Draft PR CI run **#74** (run id `34416720095`) executed
+`039da0992aa740a0d6a6088f489f4ef422827e29`.
+
+Python 3.12 full-suite result:
+
+- **3438 passed**
+- **3 failed**
+- **2 skipped**
+- **1 warning**
+
+The three failures classify exactly as:
+
+1. P6-17 fill/account atomicity;
+2. P6-17 order-update atomicity;
+3. the known Phase 11/12 `${TF_FEED:-simulated}` packaging baseline.
+
+No Batch A, B or C production finding remained red.
+
+Python 3.11 floor:
+
+- **1381 passed**
+- **1 failed**
+- **126 skipped**
+
+The only failure was the same known packaging baseline.
+
+Additional gates:
+
+- paper boundary: **PASS**;
+- mypy(core): **PASS**;
+- PostgreSQL/Redis backend contract gate: **PASS**;
+- Ruff: exactly the three known baseline findings
+  (`agents/marin/agent.py` I001, `agents/marin/source.py` I001,
+  `agents/okapi/registry.py` SIM102).
+
+**BATCH A+B+C EXTERNALLY REVALIDATED.**
+
+## Phase 6 Batch D remediation checkpoint
+
+P6-17 production remediation commit:
+
+`3cdddcd4edc28041efbe641d0f67d3055d547ef2`
+
+P6-18 production remediation commit:
+
+`52448af18ca964f932ed5e01c4e8d2dc6e94e3cd`
+
+Regression-audit alignment commits:
+
+`a263b6ef0caa28fa35c000be71da147b09be18ec`
+
+`dcfb5019a44015fccadfd200eff0b52799aa235c`
+
+Batch D addresses the final two Phase 6 findings:
+
+- **P6-17 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  Generic order transitions publish a projected detached order before the real
+  OMS transition commits. PAPER_FILL is validated and enriched with a
+  non-mutating realized-PnL preview, then published before OMS/account fill
+  mutation. A fill-derived order update that fails after the canonical fill is
+  retained for deterministic retry without double-applying economics.
+- **P6-18 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  ExecutionReport remains a snapshot schema. VESKA now builds detached current
+  lifecycle reports from registry + OMS truth and publishes a new report only
+  when report-visible execution state changes. Later reports carry actual
+  fills, filled_notional and terminal completion while previously returned
+  reports remain unchanged.
+
+Phase 6 is not frozen until this Batch D head completes external CI with no
+new Phase 6 failures.
 
 ## Audit surface
 
@@ -407,7 +480,7 @@ Ranked by demonstrated consequence, highest first.
 | **Severity** | **CRITICAL** |
 | **Area** | `execution/paper/executor.py` — `cancel`, `poll` |
 | **Blocks Phase 6 validation** | Yes |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P0** |
 
 **Invariant.** A cancellation requested before a venue acknowledges an order
@@ -470,7 +543,7 @@ implement either design.
 | **Severity** | **CRITICAL** |
 | **Area** | `execution/paper/executor.py::submit`, `execution/veska/engine.py::execute`, `apps/orchestrator/orchestrator.py::_decide` |
 | **Blocks Phase 6 validation** | Yes |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P0** |
 
 **Invariant.** A plan that fails partway through submission may not leave a
@@ -517,7 +590,7 @@ even if it were reachable, because a pre-ack cancel is lost.
 | **Severity** | **CRITICAL** |
 | **Area** | `execution/oms/__init__.py::create`, `execution/veska/engine.py::execute` |
 | **Blocks Phase 6 validation** | Yes |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P0** |
 
 **Invariant.** One `client_order_id` names one order identity. A retry must be
@@ -573,7 +646,7 @@ here.
 | **Severity** | **CRITICAL** |
 | **Area** | `apps/orchestrator/orchestrator.py` — `_advance_execution`, `_hedge_in_flight`, `_advance_exit` |
 | **Blocks Phase 6 validation** | Yes |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P0** |
 
 **Invariant.** `is_live` answers "is this known to be working?";
@@ -626,7 +699,7 @@ behaviour and belong to remediation.
 | **Severity** | **HIGH** |
 | **Area** | `execution/paper/simulator.py::is_marketable`, `execution/paper/executor.py::poll` |
 | **Blocks Phase 6 validation** | Yes |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P1** |
 
 **Invariant.** `policy.can_rest(TimeInForce.IOC)` is `False`. An IOC order gets
@@ -669,7 +742,7 @@ classifies by instruction, and nothing enforces what the instruction means.
 | **Severity** | **HIGH** |
 | **Area** | `execution/paper/simulator.py::fill_passive`, `is_marketable` |
 | **Blocks Phase 6 validation** | Yes |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P1** |
 
 **Invariant.** `policy.must_not_take(TimeInForce.POST_ONLY)` is `True`. A real
@@ -717,7 +790,7 @@ or reprice a crossing POST_ONLY order using `policy.must_not_take`.
 | **Severity** | **HIGH** |
 | **Area** | `execution/paper/executor.py::PAPER_CAPABILITIES`, `execution/paper/simulator.py` |
 | **Blocks Phase 6 validation** | Yes |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P1** |
 
 **Invariant.** `PAPER_CAPABILITIES.supports_fok` is `False`, and
@@ -756,7 +829,7 @@ capabilities disclaim, at submission.
 | **Severity** | **HIGH** |
 | **Area** | `execution/oms/__init__.py` (clock reads) against `execution/paper/executor.py` (explicit `now_ms`) |
 | **Blocks Phase 6 validation** | Yes |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P1** |
 
 **Invariant.** An execution performed at logical instant T must be
@@ -804,7 +877,7 @@ paths, as the executor already does.
 | **Severity** | **HIGH** |
 | **Area** | `execution/veska/preflight.py`, `execution/veska/engine.py::execute` |
 | **Blocks Phase 6 validation** | No — it blocks nothing, which is the finding |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P1** |
 
 **Invariant.** A check that exists must either be called or be documented as
@@ -840,7 +913,7 @@ remediation.
 | **Severity** | **HIGH** |
 | **Area** | `execution/veska/engine.py::build_plan` |
 | **Blocks Phase 6 validation** | Yes |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P0** |
 
 **Invariant.** Risk-increasing activity is bounded by what RUNE authorised.
@@ -888,7 +961,7 @@ leaving EXIT and HEDGE exact.
 | **Severity** | **MEDIUM** |
 | **Area** | `execution/**` (no reader), `apps/orchestrator/orchestrator.py::_advance_execution` (cleanup only) |
 | **Blocks Phase 6 validation** | No |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P2** |
 
 **Invariant.** No new risk may begin after an expired deadline.
@@ -919,7 +992,7 @@ tick, so the window is small in the shipped path.
 | **Severity** | **MEDIUM** |
 | **Area** | `execution/paper/executor.py::_accrue_trade_flow` |
 | **Blocks Phase 6 validation** | No |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P2** |
 
 **Invariant.** No new prints means no new queue progress.
@@ -957,7 +1030,7 @@ parameter rather than anything economic.
 | **Severity** | **MEDIUM** |
 | **Area** | `execution/paper/simulator.py` — `fill_marketable` vs `fill_passive` |
 | **Blocks Phase 6 validation** | No |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P2** |
 
 **Invariant.** One partial-fill policy, or two policies each documented as
@@ -985,7 +1058,7 @@ Whether that is deliberate is exactly the classification this finding asks for.
 | **Severity** | **MEDIUM** |
 | **Area** | `execution/paper/executor.py::_attempt_fill` |
 | **Blocks Phase 6 validation** | No |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P2** |
 
 **Invariant.** A fill's provenance is its own venue's and symbol's.
@@ -1014,7 +1087,7 @@ number that describes different data.
 | **Severity** | **MEDIUM** |
 | **Area** | `execution/paper/executor.py::poll` and `_attempt_fill` |
 | **Blocks Phase 6 validation** | No — classification required |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P2** |
 
 **Invariant.** Latency is modelled once.
@@ -1045,7 +1118,7 @@ receives the residual interval, capped at configured latency.
 | **Severity** | **MEDIUM** |
 | **Area** | `execution/paper/executor.py` — `_pending`, `poll`, `_accrue_trade_flow` |
 | **Blocks Phase 6 validation** | No |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P2** |
 
 **Invariant.** "The resident set is bounded by concurrent activity rather than
@@ -1080,7 +1153,7 @@ so this finding cannot be "solved" by deleting unresolved truth.
 | **Severity** | **HIGH** |
 | **Area** | `execution/paper/executor.py::_record_fill` |
 | **Blocks Phase 6 validation** | Yes |
-| **Status** | **EXTERNALLY CONFIRMED — NOT REMEDIATED** |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
 | **Priority** | **P1** |
 
 **Invariant.** Economic truth and durable, replayable truth do not diverge
@@ -1092,11 +1165,15 @@ before failed `PAPER_FILL` publication and order-status mutation before failed
 `PAPER_ORDER_UPDATED` publication. The behavioural evidence now agrees with
 the original static ordering evidence.
 
-**Evidence.** `_record_fill` applies the fill to the OMS and to the
-`PaperAccount`, and *then* publishes `PAPER_FILL`. The `Recorder` is bus
-middleware, so an event that never reaches `publish` is never recorded. If the
-publication raises — a transport failure, or `CascadeCapacityExceeded` from the
-in-memory bus's hard ceiling — the account has moved and the history has not.
+**Pre-remediation evidence.** `_record_fill` applied the fill to OMS/account
+before `PAPER_FILL`, and generic order transitions mutated before
+`PAPER_ORDER_UPDATED`. CI #74 reproduced both divergences.
+
+**Remediation.** Batch D moves publication to the commit boundary. Generic
+order changes are projected and published before resident OMS mutation.
+PAPER_FILL is non-mutatingly validated/enriched, published, then committed to
+OMS/account. A later derived order-update failure is retained for retry rather
+than rolling back the already accepted canonical fill.
 
 **Expected audit test.** `test_phase6_atomicity.py::TestFillStateVersusEventTruth`
 — three tests, using a duck-typed `ExplodingBus` because `InMemoryEventBus`
@@ -1120,7 +1197,7 @@ and it is the only thing separating this from P6-2.
 | **Severity** | **LOW** |
 | **Area** | `core/models/execution.py::ExecutionReport` |
 | **Blocks Phase 6 validation** | No |
-| **Status** | **EXTERNALLY CONFIRMED — NOT REMEDIATED** |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
 | **Priority** | **P3** |
 
 **Invariant.** A model's fields describe what it can carry.
@@ -1130,10 +1207,13 @@ and it is the only thing separating this from P6-2.
 run. The audit therefore externally establishes the submission-only report
 semantics rather than merely inferring them from source.
 
-**Evidence.** `ExecutionReport` has `fills: list[FillEvent]` and
-`complete: bool`. `submit` returns it with `complete=False` and no fills,
-always, and nothing ever produces a later report — exactly one
-`EXECUTION_REPORT` event is published per plan.
+**Pre-remediation evidence.** `ExecutionReport` carried lifecycle-shaped
+fields but only a submission-time snapshot was ever emitted.
+
+**Remediation.** VESKA now has one canonical `current_report` builder deriving
+orders, fills and completion from registry + OMS truth. Report fingerprints
+suppress unchanged snapshots; material lifecycle changes publish later detached
+`EXECUTION_REPORT` events without mutating previously returned reports.
 
 **Expected audit test.**
 `test_phase6_registry.py::TestExecutionReportSemantics` — three tests,
@@ -1156,7 +1236,7 @@ report. Either is cosmetic relative to everything above.
 | **Severity** | **HIGH** |
 | **Area** | `core/models/opportunity.py`, `core/models/execution.py` |
 | **Blocks Phase 6 validation** | Yes |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P1** |
 
 **Invariant.** Execution-domain values that participate in sizing, price,
@@ -1204,7 +1284,7 @@ execution-domain Pydantic models in a later production-remediation pass.
 | **Severity** | **HIGH** |
 | **Area** | `execution/paper/executor.py::_latency`, `execution/veska/preflight.py`, `execution/veska/engine.py::execute` |
 | **Blocks Phase 6 validation** | Yes |
-| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Status** | **EXTERNALLY REVALIDATED — REMEDIATED** |
 | **Priority** | **P1** |
 
 **Invariant.** A hand-built, persisted or replayed plan naming a venue that is
@@ -1265,11 +1345,11 @@ Final audit-only validation is complete. Verdicts below incorporate the frozen e
 | H14 | Latency double counting | **REMEDIATED IN CODE — residual-only synthetic latency policy; external revalidation required** | P6-15 | `test_phase6_slippage.py` |
 | H15 | Passive trade-flow accrual | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** | P6-12 | `test_phase6_passive_fills.py` |
 | H16 | `max_partial_fraction` | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** | P6-13 | `test_phase6_passive_fills.py` |
-| H17 | Event/state atomicity | **EXTERNALLY CONFIRMED — corrected exact-Nth failure injection reproduced state/event divergence** | P6-17 | `test_phase6_atomicity.py` |
+| H17 | Event/state atomicity | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** | P6-17 | `test_phase6_atomicity.py` |
 | H18 | Fill source timestamp | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** | P6-14 | `test_phase6_passive_fills.py` |
 | H19 | Resource retention | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** (`_pending`) | P6-16 | `test_phase6_resource_bounds.py` |
 | H20 | UNKNOWN retention | **STATICALLY REFUTED** — compaction refuses non-terminal orders, and UNKNOWN is not terminal | — | `test_phase6_resource_bounds.py`, `test_phase6_unknown.py` |
-| H21 | Execution report semantics | **EXTERNALLY CONFIRMED — submission-only lifecycle semantics reproduced after capture correction** | P6-18 | `test_phase6_registry.py` |
+| H21 | Execution report semantics | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** | P6-18 | `test_phase6_registry.py` |
 | H22 | Numeric / schema safety | **EXTERNALLY CONFIRMED BY CI #53** | P6-19 | `test_phase6_slippage.py` |
 | H23 | Unknown venue | **PARTIAL — router path refuted; hand-built/replayed path externally confirmed** | P6-20 | `test_phase6_planning.py` |
 | H24 | Same-timestamp precedence | **EXTERNALLY REFUTED AS A DEFECT CONCERN — tested precedence remained deterministic** | — | `test_phase6_cancel.py` |

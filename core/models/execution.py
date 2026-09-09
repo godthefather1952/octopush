@@ -207,14 +207,12 @@ class FillEvent(Envelope):
     #: worse than expected).
     slippage_bps: float = Field(default=0.0, allow_inf_nan=False)
     strategy: str | None = None
-    #: This fill's own realized-P&L contribution (pre-fee), captured by
-    #: ``PaperAccount.apply_fill`` at the exact moment it applies this fill to
-    #: the position -- not re-derived later from live account state, which
-    #: can already reflect fills applied after this one but dispatched
-    #: before it (PAPER_FILL is queued, not delivered, at publish time; the
-    #: account can accumulate several fills before any of their handlers
-    #: run). Set once, before this event is ever published, so it stays
-    #: within "immutable once emitted".
+    #: This fill's own realized-P&L contribution (pre-fee), previewed from a
+    #: detached position before PAPER_FILL publication. The same accounting
+    #: arithmetic is then committed after the event is accepted, so durable
+    #: fill truth already carries the value replay needs without consulting
+    #: later live account state. Set before publication and unchanged in
+    #: meaning after commit.
     realized_pnl_delta: float = Field(default=0.0, allow_inf_nan=False)
 
     @property
