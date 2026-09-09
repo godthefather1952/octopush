@@ -2,22 +2,16 @@
 
 H8: MULTI-LEG SUBMISSION FAILURE
 ================================
-``PaperExecutor.submit`` loops over the plan's orders, and for each one it
-creates the order in the OMS, marks it SUBMITTING, records its pending
-timing and **awaits a bus publication**. A failure in that publication — a
-transport error, a cascade-capacity refusal — propagates out of ``submit``.
+Batch A made interrupted submission recoverable: if a per-leg publication
+raises, ``Veska.execute`` inspects the executor's actual resident orders and
+attaches every created identity to the plan before re-raising. ``cancel_plan``
+therefore retains a route to every outstanding leg.
 
-What has already happened when it does: leg one exists in the OMS, is
-SUBMITTING, has an ``ack_at``, and will fill on the next poll.
-
-What has not happened: ``Veska.execute``'s ``registry.attach_orders`` call,
-which is downstream of the ``await self.executor.submit(...)`` that raised. The
-plan record's ``order_ids`` stays empty. And in the orchestrator,
-``record.order_ids = [...]`` is likewise downstream, so the opportunity record
-does not name it either.
-
-The result is a live order that no plan record, no opportunity record and
-therefore no cancellation path can reach.
+Batch D preserves that reachability while changing the per-order event
+boundary: a projected creation/update is published before the corresponding
+working-state transition commits. An order whose creation publication is
+rejected can remain resident as inert CREATED state, but it is still named by
+the plan and can be cancelled or reconciled rather than becoming unmanaged.
 
 H17: EVENT AND STATE ATOMICITY
 ==============================
@@ -86,20 +80,22 @@ class TestSubmissionOrdering:
 
         source = inspect.getsource(PaperExecutor.submit)
         loop_at = source.index("for planned in plan.orders:")
-        publish_at = source.index("_publish_order(order, EventType.PAPER_ORDER_CREATED")
+        publish_at = source.index("event_type=EventType.PAPER_ORDER_CREATED")
         assert publish_at > loop_at, (
-            "the creation publication is no longer inside the per-order loop; "
-            "the H8 reproduction below needs rebuilding"
+            "the projected creation publication is no longer inside the "
+            "per-order loop; the H8 reproduction below needs rebuilding"
         )
 
-    def test_veska_attaches_orders_after_submit_returns(self):
-        """So a raising submit leaves the plan record with no order ids."""
+    def test_veska_recovers_actual_orders_when_submit_raises(self):
+        """The exception path attaches resident identities before re-raising."""
         from execution.veska.engine import Veska
 
         source = inspect.getsource(Veska.execute)
         submit_at = source.index("await self.executor.submit(plan, now_ms)")
-        attach_at = source.index("self.registry.attach_orders(")
-        assert attach_at > submit_at
+        except_at = source.index("except Exception:")
+        actual_at = source.index("actual_orders = self.executor.orders_for_plan")
+        attach_at = source.index("self.registry.attach_orders(", except_at)
+        assert submit_at < except_at < actual_at < attach_at
 
     def test_the_orchestrator_records_order_ids_after_execute_returns(self):
         from apps.orchestrator import orchestrator as orch_module
@@ -141,8 +137,7 @@ class TestPartialMultiLegSubmission:
         assert record is not None
         assert "leg-a" in record.order_ids, (
             "the first leg of a partially submitted plan is working at the "
-            f"venue and its plan record names {record.order_ids}: nothing can "
-            "cancel it through cancel_plan"
+            f"venue but its plan record names only {record.order_ids}"
         )
 
     async def test_cancel_plan_can_reach_the_accepted_leg(self):
@@ -207,7 +202,7 @@ class TestFillStateVersusEventTruth:
         """A rejected canonical fill publication must commit no economics."""
         # #1 EXECUTION_PLAN, #2 PAPER_ORDER_CREATED, #3 EXECUTION_REPORT,
         # #4 acknowledgement/open PAPER_ORDER_UPDATED, #5 PAPER_FILL.
-        # Fail on #5 so OMS/account mutation precedes the injected failure.
+        # Fail on #5 so the canonical fill is rejected before economic commit.
         bus = ExplodingBus(fail_on_publish=5)
         harness = build_harness(bus=bus)
         harness.update_market(two_venue_market())
@@ -257,7 +252,6 @@ class TestFillStateVersusEventTruth:
         assert order.status is OrderStatus.SUBMITTING
         assert order.history[-1][1] is OrderStatus.SUBMITTING
         assert published_updates == []
-
 
     async def test_a_failed_fill_derived_update_is_retried_without_double_apply(self):
         """PAPER_FILL is canonical; its derived order update may retry safely."""

@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 from core.models.common import Side, TimeInForce
 from core.models.execution import (
     ExecutionPlanRecord,
