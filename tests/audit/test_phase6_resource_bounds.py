@@ -1,28 +1,13 @@
-"""H19, H20 — what grows with session history, and what must never be dropped.
+"""H19, H20 — resident execution state must be bounded without forgetting UNKNOWN.
 
-THE CLAIM
-=========
-``OrderManager``'s docstring says the resident set is "bounded by concurrent
-activity rather than by session length", achieved by compacting terminal orders
-into ``ArchivedOrders`` aggregates once reconciliation has sealed their fills.
+Batch C releases PaperExecutor timing records under the same compaction decision
+that archives terminal OMS orders. A terminal order with no unsealed fills
+loses both resident OMS state and its ``_pending`` timing record.
 
-THE STRUCTURES THIS MODULE MEASURES
-===================================
-* ``OrderManager.orders``          — compacted, on the terms above
-* ``OrderManager._applied_fills``  — explicitly bounded to ``dedupe_fills``
-* ``ExecutionRegistry.records``    — hook present, releases nothing by default
-* ``ExecutionRegistry.plans``      — the plans themselves, same
-* ``PaperExecutor._pending``       — **not compacted at all**, and the
-  executor's own docstring says so: "This executor's own ``_pending`` records
-  are deliberately left alone in this construction pass."
-* ``PaperAccount.fill_log``        — bounded by ``DEFAULT_RETAINED_FILLS``
-
-THE LINE THIS MODULE WILL NOT CROSS
-===================================
-H20 exists so that H19 cannot be "solved" by deleting unresolved state. Every
-growth test below is paired with a retention test proving that UNKNOWN orders,
-their pending records and unresolved plans survive whatever compaction is
-asked for.
+UNKNOWN remains deliberately different: it is non-terminal, so its order,
+pending timing and unresolved plan all survive compaction. The retention fix
+therefore bounds completed-session history without turning memory cleanup into
+a route for forgetting unresolved venue truth.
 """
 
 from __future__ import annotations
@@ -93,12 +78,12 @@ class TestWhatTheCodeClaims:
         doc = inspect.getdoc(OrderManager) or ""
         assert "bounded by concurrent activity" in doc
 
-    def test_the_executor_states_that_pending_is_not_compacted(self):
+    def test_the_executor_compacts_pending_under_the_oms_decision(self):
         from execution.paper.executor import PaperExecutor
 
-        doc = inspect.getdoc(PaperExecutor.compact_terminal_state) or ""
-        assert "_pending" in doc
-        assert "left alone" in doc
+        source = inspect.getsource(PaperExecutor.compact_terminal_state)
+        assert "compactable_order_ids" in source
+        assert "self._pending.pop" in source
 
     def test_the_dedupe_window_is_explicitly_bounded(self):
         from execution.oms import DEFAULT_DEDUPE_FILLS, OrderManager
@@ -132,14 +117,8 @@ class TestGrowthAfterManyTerminalOrders:
         assert harness.oms.archived.count == 200
         assert sum(harness.oms.archived.by_status.values()) == 200
 
-    async def test_the_pending_map_is_not_released_with_the_orders(self):
-        """The one structure the executor names as unaddressed.
-
-        Its size after compaction is the measurement. A ``_pending`` record is
-        small, but it is per-order and it is never released, so it scales with
-        orders placed rather than with orders working — which is what
-        "bounded by concurrent activity" is supposed to rule out.
-        """
+    async def test_the_pending_map_is_released_with_compacted_terminal_orders(self):
+        """Fast-loop timing state must scale with outstanding work, not history."""
         harness = build_harness()
         await _churn(harness, MANY)
         harness.executor.compact_terminal_state(unsealed_fills=set())
@@ -296,6 +275,7 @@ class TestUnknownSurvivesEverything:
 
         assert released == 0
         assert harness.oms.get("o-sealed") is not None
+        assert "o-sealed" in harness.executor._pending
 
     async def test_the_same_order_is_released_once_its_fill_is_sealed(self):
         harness = build_harness()
@@ -323,6 +303,7 @@ class TestUnknownSurvivesEverything:
 
         assert released == 1
         assert harness.oms.get("o-sealed-2") is None
+        assert "o-sealed-2" not in harness.executor._pending
         assert harness.oms.archived.fills == 1
 
 

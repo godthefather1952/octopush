@@ -343,99 +343,32 @@ class TestWalkBookArithmetic:
 
 
 class TestLatencyModel:
-    """H14 — is the latency counted once or twice?"""
+    """H14/P6-15 — synthetic drift covers only unobserved venue latency."""
 
-    def test_the_wait_and_the_drift_share_one_latency_value(self):
-        """Static evidence: both come from ``_latency(order.venue)``."""
+    def test_the_executor_computes_residual_latency_from_leg_provenance(self):
         from execution.paper.executor import PaperExecutor
 
-        submit = inspect.getsource(PaperExecutor.submit)
+        helper = inspect.getsource(PaperExecutor._synthetic_latency_ms)
         attempt = inspect.getsource(PaperExecutor._attempt_fill)
-        assert "ack_at=now + self._latency(order.venue)" in submit
-        assert "latency = float(self._latency(order.venue))" in attempt
-        assert "latency," in attempt
+        assert "pending.ack_at - source_ts" in helper
+        assert "min(" in helper
+        assert "self._source_timestamp(order)" in attempt
+        assert "self._synthetic_latency_ms" in attempt
 
-    def test_the_drift_is_applied_to_the_book_at_arrival(self):
-        """The book handed to the simulator is already the post-wait one.
-
-        ``poll`` runs at ``now_ms >= ack_at``, and ``_book_view`` reads
-        ``self.market`` — whatever the caller last supplied. So the drift is
-        applied on top of however far the market actually moved during the
-        wait.
-        """
-        from execution.paper.executor import PaperExecutor
-
-        source = inspect.getsource(PaperExecutor.poll)
-        assert "if now_ms < pending.ack_at:" in source
-        assert "view = self._book_view(order)" in source
-
-    async def test_a_static_book_still_produces_adverse_slippage(self):
-        """Isolation A: the market did not move, and the fill is still worse.
-
-        With a static book the only source of an adverse price is the
-        synthetic drift. This measures it.
-        """
+    async def test_a_static_submission_time_book_keeps_the_full_synthetic_drift(self):
         harness = build_harness()
         touch = 100.0
+        latency = _latency(harness)
         harness.update_market(
             market_state(
                 venue_state(
                     venue=VENUE_A,
                     bids=price_levels((99.0, 100.0)),
                     asks=price_levels((touch, 100.0)),
-                )
-            )
-        )
-        plan = execution_plan(
-            planned_order(
-                quantity=1.0,
-                time_in_force=TimeInForce.IOC,
-                limit_price=touch * 1.05,
-                expected_price=touch,
-            ),
-            created_at=T0,
-            max_slippage_bps=500.0,
-        )
-        await harness.veska.execute(plan, T0)
-        fills = await harness.veska.poll(T0 + _latency(harness))
-
-        assert fills, "no fill; the comparison below is untested"
-        drift_bps = (
-            harness.settings.execution.latency_drift_bps_per_100ms
-            * _latency(harness)
-            / 100.0
-        )
-        assert fills[0].slippage_bps == pytest.approx(drift_bps, abs=1e-6), (
-            "on a book that did not move, the realised slippage is "
-            f"{fills[0].slippage_bps:.4f} bps, which is exactly the "
-            f"{drift_bps:.4f} bps of synthetic latency drift"
-        )
-
-    async def test_an_already_moved_book_adds_the_drift_on_top(self):
-        """Isolation B: the market moved, and the drift is applied again.
-
-        This is the double-count question stated as a measurement. If the
-        drift were compensating for a wait during which the book is assumed
-        static, applying it to a book that has already moved counts the same
-        latency twice.
-        """
-        harness = build_harness()
-        touch = 100.0
-        latency = _latency(harness)
-        drift_bps = (
-            harness.settings.execution.latency_drift_bps_per_100ms * latency / 100.0
-        )
-        moved_touch = touch * (1 + drift_bps / 10_000)
-
-        harness.update_market(
-            market_state(
-                venue_state(
-                    venue=VENUE_A,
-                    bids=price_levels((99.0, 100.0)),
-                    asks=price_levels((moved_touch, 100.0)),
-                    as_of=T0 + latency,
+                    as_of=T0,
+                    exchange_ts=T0,
                 ),
-                created_at=T0 + latency,
+                created_at=T0,
             )
         )
         plan = execution_plan(
@@ -451,13 +384,115 @@ class TestLatencyModel:
         await harness.veska.execute(plan, T0)
         fills = await harness.veska.poll(T0 + latency)
 
-        assert fills, "no fill; the comparison below is untested"
-        realised = fills[0].slippage_bps
-        assert realised == pytest.approx(drift_bps, abs=1e-6), (
-            "the book had already moved by the full latency drift "
-            f"({drift_bps:.4f} bps) and the fill realised {realised:.4f} bps: "
-            "the same latency was charged twice"
+        assert fills
+        drift_bps = (
+            harness.settings.execution.latency_drift_bps_per_100ms
+            * latency
+            / 100.0
         )
+        assert fills[0].slippage_bps == pytest.approx(drift_bps, abs=1e-6)
+
+    async def test_a_book_observed_at_arrival_is_not_charged_the_same_latency_twice(self):
+        harness = build_harness()
+        touch = 100.0
+        latency = _latency(harness)
+        drift_bps = (
+            harness.settings.execution.latency_drift_bps_per_100ms
+            * latency
+            / 100.0
+        )
+        moved_touch = touch * (1 + drift_bps / 10_000)
+
+        harness.update_market(
+            market_state(
+                venue_state(
+                    venue=VENUE_A,
+                    bids=price_levels((99.0, 100.0)),
+                    asks=price_levels((touch, 100.0)),
+                    as_of=T0,
+                    exchange_ts=T0,
+                ),
+                created_at=T0,
+            )
+        )
+        plan = execution_plan(
+            planned_order(
+                quantity=1.0,
+                time_in_force=TimeInForce.IOC,
+                limit_price=touch * 1.05,
+                expected_price=touch,
+            ),
+            created_at=T0,
+            max_slippage_bps=500.0,
+        )
+        await harness.veska.execute(plan, T0)
+        harness.update_market(
+            market_state(
+                venue_state(
+                    venue=VENUE_A,
+                    bids=price_levels((99.0, 100.0)),
+                    asks=price_levels((moved_touch, 100.0)),
+                    as_of=T0 + latency,
+                    exchange_ts=T0 + latency,
+                ),
+                created_at=T0 + latency,
+            )
+        )
+        fills = await harness.veska.poll(T0 + latency)
+
+        assert fills
+        assert fills[0].slippage_bps == pytest.approx(drift_bps, abs=1e-6)
+
+    async def test_a_partially_observed_latency_window_only_synthesizes_the_remainder(self):
+        harness = build_harness()
+        touch = 100.0
+        latency = _latency(harness)
+        observed = latency // 2
+        harness.update_market(
+            market_state(
+                venue_state(
+                    venue=VENUE_A,
+                    bids=price_levels((99.0, 100.0)),
+                    asks=price_levels((touch, 100.0)),
+                    as_of=T0,
+                    exchange_ts=T0,
+                ),
+                created_at=T0,
+            )
+        )
+        plan = execution_plan(
+            planned_order(
+                quantity=1.0,
+                time_in_force=TimeInForce.IOC,
+                limit_price=touch * 1.05,
+                expected_price=touch,
+            ),
+            created_at=T0,
+            max_slippage_bps=500.0,
+        )
+        await harness.veska.execute(plan, T0)
+        harness.update_market(
+            market_state(
+                venue_state(
+                    venue=VENUE_A,
+                    bids=price_levels((99.0, 100.0)),
+                    asks=price_levels((touch, 100.0)),
+                    as_of=T0 + observed,
+                    exchange_ts=T0 + observed,
+                ),
+                created_at=T0 + observed,
+            )
+        )
+        fills = await harness.veska.poll(T0 + latency)
+
+        assert fills
+        residual = latency - observed
+        expected_bps = (
+            harness.settings.execution.latency_drift_bps_per_100ms
+            * residual
+            / 100.0
+        )
+        assert fills[0].slippage_bps == pytest.approx(expected_bps, abs=1e-6)
 
 
 class TestNumericSafety:

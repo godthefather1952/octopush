@@ -1,43 +1,18 @@
-"""H1 — one economic action must not carry two timelines.
+"""H1 — one economic action must carry one logical timeline.
 
-THE CLAIM UNDER TEST
-====================
-``PaperExecutor``'s module docstring states, at length, that it never reads a
-clock: every time-dependent decision uses the logical instant its caller
-supplied, because a recorded session preserves one timestamp per tick and a
-clock read is not that instant (P2-14).
+PaperExecutor has always promised to make execution decisions from caller-
+supplied logical time. Batch C now carries that instant through the OMS write
+boundary as well: creation, transitions, UNKNOWN state, rejection and fill-
+driven transitions all accept explicit ``now_ms``.
 
-That claim is about the *executor*. The ``OrderManager`` it writes through
-makes no such claim and reads ``self.clock.now_ms()`` on every ``create``,
-``transition``, ``mark_unknown``, ``resolve_unknown``, ``reject`` and
-``apply_fill``.
-
-So one submission at logical instant T produces:
-
-* ``submitted_at`` = T                        (executor, explicit)
-* ``_pending.ack_at`` = T + venue latency     (executor, explicit)
-* ``created_at`` = clock                      (OMS, read)
-* ``expires_at`` = clock + ttl_ms             (OMS, read)
-* every ``history`` entry = clock             (OMS, read)
-
-In production the orchestrator passes ``tick_time`` and the clock is usually
-close to it, so the divergence is small and invisible. Under a live feed it is
-not: the clock advances while the tick runs, which is the exact scenario
-P2-14 was raised for.
-
-WHY THIS MATTERS ECONOMICALLY
-=============================
-``expires_at`` is the one that costs money. It is computed from a clock read
-and then compared against ``now_ms`` in ``poll``. Two different clocks decide
-one deadline, so an order's real lifetime is ``ttl_ms + (clock - T)`` — longer
-or shorter than the TTL that was asked for, by however far the two have
-drifted. Replay, which drives ``now_ms`` from the recorded tick marker but
-constructs the OMS clock separately, cannot reconstruct it.
+OrderManager keeps a wired-clock fallback for compatibility with direct
+non-execution callers, but every PaperExecutor economic mutation supplies the
+logical action instant. The tests below therefore assert behavior and the
+handoff itself rather than requiring the OMS to be clock-free globally.
 """
 
 from __future__ import annotations
 
-import ast
 import inspect
 from pathlib import Path
 
@@ -57,47 +32,35 @@ from tests.audit.veska_fixtures import (
 SKEW_MS = 5_000
 
 
-class TestExecutorReadsNoClock:
-    """The claim the executor's docstring actually makes."""
+class TestLogicalTimeHandoff:
+    """Execution owns its time and supplies it to the OMS."""
 
     def test_the_executor_source_contains_no_clock_read(self):
-        """``PaperExecutor`` must not call ``now_ms()`` anywhere.
-
-        Asserted over the source rather than by observing timestamps, because
-        a timestamp that happens to match proves nothing about where it came
-        from.
-        """
         source = inspect.getsource(executor_module.PaperExecutor)
         assert "now_ms()" not in source
         assert "self.clock" not in source.replace("clock: Clock", "")
 
-    def test_the_order_manager_does_read_a_clock(self):
-        """Stated as a fact, not a complaint — it is what makes H1 reachable.
-
-        If this ever stops being true the divergence below closes on its own,
-        and this test is what will say so.
-        """
-        source = inspect.getsource(oms_module.OrderManager)
-        assert "self.clock.now_ms()" in source
-
-    def test_every_order_manager_write_path_reads_the_clock(self):
-        """Enumerate the read sites, so a partial fix is visible as a partial fix."""
-        tree = ast.parse(inspect.getsource(oms_module.OrderManager))
-        reading: set[str] = set()
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.FunctionDef):
-                continue
-            body = ast.dump(node)
-            if "now_ms" in body and "clock" in body:
-                reading.add(node.name)
-        assert reading == {
+    def test_every_oms_execution_write_path_accepts_explicit_time(self):
+        methods = (
             "create",
+            "from_plan",
             "transition",
             "mark_unknown",
             "resolve_unknown",
             "reject",
             "apply_fill",
-        }
+        )
+        for name in methods:
+            signature = inspect.signature(getattr(oms_module.OrderManager, name))
+            assert "now_ms" in signature.parameters, name
+
+    def test_the_executor_passes_time_into_every_oms_mutation_family(self):
+        source = inspect.getsource(executor_module.PaperExecutor)
+        assert "now_ms=now" in source
+        assert "now_ms=now_ms" in source
+        assert "self.oms.from_plan(" in source
+        assert "self.oms.apply_fill(fill, now_ms=now_ms)" in source
+        assert "self.oms.resolve_unknown(" in source
 
 
 class TestOneActionOneTimeline:
@@ -270,7 +233,6 @@ class TestSourceInventory:
         assert "NO CLOCK READS" in text
         assert "P2-14" in text
 
-    def test_the_oms_module_makes_no_such_claim(self):
-        """Stated so the asymmetry is on the record rather than inferred."""
+    def test_the_oms_source_exposes_explicit_time_compatibility(self):
         text = Path(oms_module.__file__).read_text()
-        assert "NO CLOCK READS" not in text
+        assert "now_ms: Millis | None = None" in text

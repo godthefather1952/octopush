@@ -1,42 +1,17 @@
-"""H15, H16, H18 — passive-fill realism, the partial cap, and fill provenance.
+"""H15, H16, H18 — passive-fill realism, partial caps and provenance.
 
-H15: TRADE-FLOW ACCRUAL
-=======================
-``PaperExecutor._accrue_trade_flow`` runs on **every** ``update_market`` call::
+Batch C changes three execution-fidelity boundaries:
 
-    volume = state.metrics.buy_volume + state.metrics.sell_volume
-    pending.traded_through += volume * 0.01
+* rolling-window trade volume is treated as a stock and only positive deltas
+  advance a resting order's queue;
+* ``max_partial_fraction`` constrains both marketable and passive one-step
+  fills;
+* fill provenance comes from the exact order venue/symbol via
+  ``MarketState.source_data_timestamp_for``, never from unrelated freshness.
 
-``buy_volume`` and ``sell_volume`` are TIDAL's *rolling-window* volumes — a
-stock, not a flow. They describe how much has traded in the window, not how
-much has traded since the last update. Adding them on each update credits the
-same prints repeatedly, so an order's queue progress grows with the number of
-market-state updates rather than with the volume that actually traded through
-its price.
-
-The consequence is optimistic: ``fill_passive`` scales its fill probability by
-``traded_through``, so a resting order becomes more and more likely to fill the
-longer the platform simply *looks* at a quiet market.
-
-H16: THE PARTIAL CAP
-====================
-``max_partial_fraction`` is applied in ``fill_marketable``::
-
-    cap = self.config.max_partial_fraction
-    if cap < 1.0:
-        wanted_quantity *= cap
-
-and nowhere in ``fill_passive``, which instead fills
-``remaining * (1 - queue_ahead_fraction * random())`` — up to 100% of the
-order in a single evaluation. Whether that asymmetry is deliberate is the
-question; that it exists is not.
-
-H18: FILL PROVENANCE
-====================
-``_attempt_fill`` stamps every fill with ``self.market.source_data_timestamp``
-— the market-wide value — regardless of which venue and symbol the order
-belongs to. A fill on a venue whose own data is minutes stale inherits the
-freshness of the newest venue in the snapshot.
+Batch B's POST_ONLY rule remains in force, so passive-fill tests use genuinely
+resting orders plus explicit new trade-flow deltas rather than an already
+crossing order.
 """
 
 from __future__ import annotations
@@ -73,17 +48,13 @@ class TestTradeFlowAccrual:
         source = inspect.getsource(PaperExecutor.update_market)
         assert "self._accrue_trade_flow()" in source
 
-    def test_accrual_reads_a_rolling_window_stock(self):
-        """Static evidence: the quantity added is a window total, not a delta."""
+    def test_accrual_uses_positive_deltas_of_the_rolling_stock(self):
         from execution.paper.executor import PaperExecutor
 
         source = inspect.getsource(PaperExecutor._accrue_trade_flow)
-        assert "state.metrics.buy_volume + state.metrics.sell_volume" in source
-        assert "pending.traded_through += volume" in source
-        assert "last_volume" not in source, (
-            "the accrual now tracks a previous value; it may compute a delta "
-            "and this finding's evidence needs re-deriving"
-        )
+        assert "_last_rolling_volume" in source
+        assert "max(0.0, current - previous)" in source
+        assert "pending.traded_through += delta * 0.01" in source
 
     async def test_no_new_prints_produces_no_new_queue_progress(self):
         """The invariant, stated as plainly as it can be.
@@ -183,19 +154,55 @@ class TestTradeFlowAccrual:
         )
 
 
+    async def test_a_real_increase_is_credited_once_and_a_decrease_does_not_reverse_it(self):
+        harness = build_harness()
+        def book(ts: int, volume: float):
+            return market_state(
+                venue_state(
+                    venue=VENUE_A,
+                    bids=price_levels((98.5, 100.0)),
+                    asks=price_levels((100.0, 100.0)),
+                    as_of=ts,
+                    buy_volume=volume,
+                ),
+                created_at=ts,
+            )
+
+        harness.update_market(book(T0, 100.0))
+        plan = execution_plan(
+            planned_order(
+                time_in_force=TimeInForce.GTC,
+                limit_price=99.0,
+                expected_price=99.0,
+                ttl_ms=600_000,
+            ),
+            created_at=T0,
+        )
+        await harness.veska.execute(plan, T0)
+        oid = harness.orders_of(plan.plan_id)[0].client_order_id
+        await harness.veska.poll(T0 + _latency(harness))
+
+        harness.update_market(book(T0 + 100, 300.0))
+        credited = harness.executor._pending[oid].traded_through
+        assert credited == pytest.approx(2.0)
+
+        harness.update_market(book(T0 + 200, 300.0))
+        assert harness.executor._pending[oid].traded_through == pytest.approx(credited)
+
+        harness.update_market(book(T0 + 300, 50.0))
+        assert harness.executor._pending[oid].traded_through == pytest.approx(credited)
+
+
 class TestPartialFillCap:
     """H16 — does ``max_partial_fraction`` govern both fill paths?"""
 
-    def test_the_cap_is_applied_only_on_the_marketable_path(self):
+    def test_the_cap_is_applied_on_both_fill_paths(self):
         from execution.paper.simulator import FillSimulator
 
         marketable = inspect.getsource(FillSimulator.fill_marketable)
         passive = inspect.getsource(FillSimulator.fill_passive)
         assert "max_partial_fraction" in marketable
-        assert "max_partial_fraction" not in passive, (
-            "the cap now applies to passive fills; this finding may be "
-            "resolved and its evidence needs re-deriving"
-        )
+        assert "max_partial_fraction" in passive
 
     async def test_a_marketable_fill_respects_the_cap(self):
         """Baseline, so the passive comparison below means something."""
@@ -238,27 +245,41 @@ class TestPartialFillCap:
             execution={"max_partial_fraction": cap, "queue_ahead_fraction": 0.0}
         )
         harness = build_harness(settings=settings)
-        harness.update_market(
-            market_state(
-                venue_state(
-                    venue=VENUE_A,
-                    bids=price_levels((99.5, 100.0)),
-                    asks=price_levels((100.0, 100.0)),
-                )
+        resting = market_state(
+            venue_state(
+                venue=VENUE_A,
+                bids=price_levels((98.5, 100.0)),
+                asks=price_levels((100.0, 100.0)),
+                buy_volume=0.0,
             )
         )
+        harness.update_market(resting)
         plan = execution_plan(
             planned_order(
                 quantity=10.0,
                 time_in_force=TimeInForce.POST_ONLY,
-                limit_price=100.5,
-                expected_price=100.5,
+                limit_price=99.0,
+                expected_price=99.0,
                 ttl_ms=600_000,
             ),
             created_at=T0,
         )
         await harness.veska.execute(plan, T0)
-        await harness.veska.poll(T0 + _latency(harness))
+        latency = _latency(harness)
+        await harness.veska.poll(T0 + latency)
+        harness.update_market(
+            market_state(
+                venue_state(
+                    venue=VENUE_A,
+                    bids=price_levels((98.5, 100.0)),
+                    asks=price_levels((100.0, 100.0)),
+                    as_of=T0 + latency + 1,
+                    buy_volume=100_000.0,
+                ),
+                created_at=T0 + latency + 1,
+            )
+        )
+        await harness.veska.poll(T0 + latency + 2)
 
         order = harness.orders_of(plan.plan_id)[0]
         assert order.filled_quantity <= 10.0 * cap + 1e-9, (
@@ -267,8 +288,7 @@ class TestPartialFillCap:
             f"a configured max_partial_fraction of {cap}"
         )
 
-    async def test_queue_ahead_is_the_only_thing_limiting_a_passive_fill(self):
-        """Pins the mechanism the finding names."""
+    async def test_zero_queue_ahead_still_cannot_override_the_partial_cap(self):
         settings = deterministic_settings(
             execution={"queue_ahead_fraction": 0.0, "max_partial_fraction": 0.10}
         )
@@ -277,8 +297,9 @@ class TestPartialFillCap:
             market_state(
                 venue_state(
                     venue=VENUE_A,
-                    bids=price_levels((99.5, 100.0)),
+                    bids=price_levels((98.5, 100.0)),
                     asks=price_levels((100.0, 100.0)),
+                    buy_volume=0.0,
                 )
             )
         )
@@ -286,35 +307,44 @@ class TestPartialFillCap:
             planned_order(
                 quantity=4.0,
                 time_in_force=TimeInForce.POST_ONLY,
-                limit_price=100.5,
-                expected_price=100.5,
+                limit_price=99.0,
+                expected_price=99.0,
                 ttl_ms=600_000,
             ),
             created_at=T0,
         )
         await harness.veska.execute(plan, T0)
-        await harness.veska.poll(T0 + _latency(harness))
+        latency = _latency(harness)
+        await harness.veska.poll(T0 + latency)
+        harness.update_market(
+            market_state(
+                venue_state(
+                    venue=VENUE_A,
+                    bids=price_levels((98.5, 100.0)),
+                    asks=price_levels((100.0, 100.0)),
+                    as_of=T0 + latency + 1,
+                    buy_volume=100_000.0,
+                ),
+                created_at=T0 + latency + 1,
+            )
+        )
+        await harness.veska.poll(T0 + latency + 2)
         order = harness.orders_of(plan.plan_id)[0]
 
-        # With no queue ahead, the passive path fills the whole remainder.
-        assert order.filled_quantity == pytest.approx(4.0), (
-            "with queue_ahead_fraction at zero the passive path no longer "
-            "fills the full remainder; the mechanism has changed"
-        )
+        assert order.filled_quantity == pytest.approx(0.4)
 
 
 class TestFillProvenance:
     """H18 — a fill's source timestamp must belong to its own venue."""
 
-    def test_the_executor_stamps_the_market_wide_timestamp(self):
+    def test_the_executor_stamps_the_order_leg_timestamp(self):
         from execution.paper.executor import PaperExecutor
 
-        source = inspect.getsource(PaperExecutor._attempt_fill)
-        assert "self.market.source_data_timestamp" in source
-        assert "source_data_timestamp_for" not in source, (
-            "the executor now derives a per-leg timestamp; this finding may "
-            "be resolved and its evidence needs re-deriving"
-        )
+        helper = inspect.getsource(PaperExecutor._source_timestamp)
+        attempt = inspect.getsource(PaperExecutor._attempt_fill)
+        assert "source_data_timestamp_for" in helper
+        assert "source_ts = self._source_timestamp(order)" in attempt
+        assert "self.market.source_data_timestamp" not in attempt
 
     def test_the_per_leg_helper_exists_and_is_used_elsewhere(self):
         """The platform already knows how to do this correctly.
@@ -450,17 +480,13 @@ class TestLiquidityLabelling:
         assert fills
         assert all(f.liquidity is Liquidity.TAKER for f in fills)
 
-    async def test_a_passive_fill_charges_the_maker_fee_unconditionally(self):
-        """Pins the mechanism behind the POST_ONLY and GTC fee findings."""
+    async def test_passive_fills_are_maker_only_after_crossing_is_excluded(self):
         from execution.paper.simulator import FillSimulator
 
         source = inspect.getsource(FillSimulator.fill_passive)
-        assert "Liquidity.MAKER" in source
-        assert "crossed" in source
-        # The liquidity flag is set from the path, never from ``crossed``.
-        tail = source[source.index("price = order.limit_price") :]
-        assert "liquidity=Liquidity.MAKER" in tail
-        assert "if crossed" not in tail
+        assert "if would_cross(order, view):" in source
+        assert "return None" in source
+        assert "liquidity=Liquidity.MAKER" in source
 
     async def test_the_maker_and_taker_fee_tiers_actually_differ(self):
         """So a mislabel has a real cost, not a nominal one."""
