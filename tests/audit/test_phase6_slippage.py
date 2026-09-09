@@ -24,18 +24,16 @@ Batch B hardens the execution schemas themselves so non-finite quantities,
 prices, notionals, fees and slippage values, plus negative TTLs, fail during
 Pydantic validation before arithmetic or event emission.
 
-H14: LATENCY, POSSIBLY TWICE
-============================
-``poll`` will not act on an order until ``now_ms >= pending.ack_at``, where
-``ack_at = submitted_at + venue.latency_ms``. Then ``_attempt_fill`` passes the
-*same* ``latency_ms`` into ``latency_adjusted_levels``, which moves the book
-adversely by ``latency_drift_bps_per_100ms * latency/100``.
+H14: RESIDUAL-ONLY LATENCY DRIFT
+================================
+Batch C makes the policy explicit: observed market data covers the part of
+venue latency already seen, and synthetic adverse drift covers only the
+remaining unobserved interval.
 
-So the order both waits out the latency — during which the real book has
-already moved by whatever the market did — and then has a synthetic adverse
-drift applied on top. Whether that is a double count or a deliberate stress
-model is a design question; the tests below isolate the two effects so the
-answer is evidence rather than argument.
+A submission-time snapshot still receives the full configured latency drift.
+A snapshot whose order-leg exchange timestamp is at arrival receives no second
+drift. A partially updated snapshot receives only the residual interval,
+clamped to the configured venue latency.
 """
 
 from __future__ import annotations

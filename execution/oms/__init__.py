@@ -1,9 +1,15 @@
 """Order management.
 
-Owns every order's identity, state and fills.  The state machine is enforced
-here, once, so that no executor can invent a transition.
+Owns every order's identity, state and fills. The state machine is enforced
+here, once, so no executor can invent a transition.
 
-``UNKNOWN`` is a first-class state.  When an operation times out the order goes
+Execution/replay callers may supply an explicit logical ``now_ms`` to every
+mutation path. The wired clock remains only as a compatibility fallback for
+direct non-execution callers. PaperExecutor supplies logical time on every
+economic mutation, so order creation, expiry and history are reconstructible
+from the recorded action instant rather than from wall-clock scheduling.
+
+``UNKNOWN`` is a first-class state. When an operation times out the order goes
 to UNKNOWN and stays there until something authoritative resolves it; it is
 never assumed to have failed, because assuming a timed-out order failed is how
 a platform ends up with a position it does not know about.

@@ -111,8 +111,8 @@ class TestTradeFlowAccrual:
             "window volume was credited eleven times"
         )
 
-    async def test_progress_scales_with_update_count_not_volume(self):
-        """Twice the updates, twice the credited flow, identical market."""
+    async def test_progress_does_not_scale_with_update_count_when_volume_is_unchanged(self):
+        """Identical rolling stock produces identical progress at any update count."""
         def book(ts: int):
             return market_state(
                 venue_state(
@@ -194,7 +194,7 @@ class TestTradeFlowAccrual:
 
 
 class TestPartialFillCap:
-    """H16 — does ``max_partial_fraction`` govern both fill paths?"""
+    """H16 — ``max_partial_fraction`` governs both fill paths."""
 
     def test_the_cap_is_applied_on_both_fill_paths(self):
         from execution.paper.simulator import FillSimulator
@@ -347,11 +347,10 @@ class TestFillProvenance:
         assert "self.market.source_data_timestamp" not in attempt
 
     def test_the_per_leg_helper_exists_and_is_used_elsewhere(self):
-        """The platform already knows how to do this correctly.
+        """The execution path reuses the platform's canonical freshness helper.
 
         ``MarketState.source_data_timestamp_for`` was added for TIDAL-H4 and
-        is used by the orchestrator when building intents. The execution path
-        does not use it.
+        is also used by the orchestrator when building intents.
         """
         from core.models.market import MarketState
 

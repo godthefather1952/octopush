@@ -1,13 +1,13 @@
 # Phase 6 — VESKA / paper-execution validation audit
 
-**Status: PHASE 6 BATCH A+B PATCHED / EXTERNAL VALIDATION REQUIRED.**
+**Status: PHASE 6 BATCH A+B+C PATCHED / EXTERNAL VALIDATION REQUIRED.**
 
-**CURRENT PRODUCTION CHANGES: PHASE 6 BATCH A+B ONLY.**
+**CURRENT PRODUCTION CHANGES: PHASE 6 BATCH A+B+C ONLY.**
 
 This document preserves the original Phase 6 validation history and now records
-the first production-remediation batch. The frozen audit surface remains the
-source of truth for what Batch A is intended to change and what later batches
-must leave red.
+the first three production-remediation batches. The frozen audit surface remains
+the source of truth for what each batch is intended to change and what later
+batches must leave red.
 
 No valid invariant has been weakened, skipped or xfailed. Historical audit
 checkpoints remain intact; current remediation status is recorded explicitly.
@@ -309,8 +309,43 @@ Batch B addresses submission and instruction-contract findings only:
   Unknown venues are blocked by preflight, PaperExecutor validates venue truth
   before mutation, and the fabricated 40ms fallback has been removed.
 
-Batch A remains patched and awaiting the same external revalidation. Batch C/D
-remain intentionally unremediated.
+Batch A remains patched and awaiting the same external revalidation. Batch D
+remains intentionally unremediated.
+
+## Phase 6 Batch C remediation checkpoint
+
+Production remediation commit:
+
+`5a8144d50ccca0383d9992f2371802ff4df6fd14`
+
+Regression-audit alignment commit:
+
+`2c9301d2564a193d9eb6d70686280e8f16281728`
+
+Batch C addresses determinism and execution-fidelity findings only:
+
+- **P6-8 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  OMS mutation paths accept explicit logical time, and PaperExecutor supplies
+  it for creation, transitions, UNKNOWN, rejection, fills and resolution.
+- **P6-12 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  Rolling-window volume is baselined per venue/symbol and only positive deltas
+  advance passive queue progress.
+- **P6-13 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  Passive one-step fills now obey the same `max_partial_fraction` ceiling as
+  marketable fills while retaining queue-ahead modeling.
+- **P6-14 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  Fill provenance now comes from
+  `MarketState.source_data_timestamp_for([(venue, symbol)])`.
+- **P6-15 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  Policy is now explicit: synthetic adverse drift covers only the unobserved
+  part of configured venue latency. Observed movement is not charged twice.
+- **P6-16 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  Terminal orders that are safe for OMS compaction release their corresponding
+  executor `_pending` records under the same decision; UNKNOWN remains
+  non-terminal and retains its pending state.
+
+Batch A+B remain patched and await the same external revalidation. Batch D
+(P6-17/P6-18) remains intentionally unremediated.
 
 ## Audit surface
 
@@ -721,6 +756,8 @@ capabilities disclaim, at submission.
 | **Severity** | **HIGH** |
 | **Area** | `execution/oms/__init__.py` (clock reads) against `execution/paper/executor.py` (explicit `now_ms`) |
 | **Blocks Phase 6 validation** | Yes |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P1** |
 
 **Invariant.** An execution performed at logical instant T must be
 reconstructible from T. This is the P2-14 property, which `PaperExecutor`'s
@@ -882,6 +919,8 @@ tick, so the window is small in the shipped path.
 | **Severity** | **MEDIUM** |
 | **Area** | `execution/paper/executor.py::_accrue_trade_flow` |
 | **Blocks Phase 6 validation** | No |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P2** |
 
 **Invariant.** No new prints means no new queue progress.
 
@@ -918,6 +957,8 @@ parameter rather than anything economic.
 | **Severity** | **MEDIUM** |
 | **Area** | `execution/paper/simulator.py` — `fill_marketable` vs `fill_passive` |
 | **Blocks Phase 6 validation** | No |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P2** |
 
 **Invariant.** One partial-fill policy, or two policies each documented as
 such.
@@ -944,6 +985,8 @@ Whether that is deliberate is exactly the classification this finding asks for.
 | **Severity** | **MEDIUM** |
 | **Area** | `execution/paper/executor.py::_attempt_fill` |
 | **Blocks Phase 6 validation** | No |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P2** |
 
 **Invariant.** A fill's provenance is its own venue's and symbol's.
 
@@ -971,6 +1014,8 @@ number that describes different data.
 | **Severity** | **MEDIUM** |
 | **Area** | `execution/paper/executor.py::poll` and `_attempt_fill` |
 | **Blocks Phase 6 validation** | No — classification required |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P2** |
 
 **Invariant.** Latency is modelled once.
 
@@ -985,11 +1030,11 @@ tests. Two isolate the effects: a static book (measuring the synthetic drift
 alone) and a book that has *already* moved by exactly the drift (measuring
 whether it is charged again).
 
-**Classification requested.** CONFIRMED DOUBLE COUNT / INTENTIONAL STRESS MODEL
-/ INCONCLUSIVE. The audit does not decide: the simulator's stated purpose is to
-be "pessimistic in the right places", and deliberate double pessimism is a
-legitimate choice — but an undocumented one is indistinguishable from a defect,
-and the drift is applied unconditionally rather than as a stated conservatism.
+**Remediation policy.** Synthetic adverse drift is retained, but only for the
+portion of configured venue latency not already represented by the order-leg
+exchange timestamp. A submission-time snapshot receives the full configured
+drift; a snapshot observed at arrival receives none; partial observation
+receives the residual interval, capped at configured latency.
 
 ---
 
@@ -1000,6 +1045,8 @@ and the drift is applied unconditionally rather than as a stated conservatism.
 | **Severity** | **MEDIUM** |
 | **Area** | `execution/paper/executor.py` — `_pending`, `poll`, `_accrue_trade_flow` |
 | **Blocks Phase 6 validation** | No |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P2** |
 
 **Invariant.** "The resident set is bounded by concurrent activity rather than
 by session length" — `OrderManager`'s own claim.
@@ -1202,7 +1249,7 @@ Final audit-only validation is complete. Verdicts below incorporate the frozen e
 
 | # | Hypothesis | Verdict | Finding | Test module |
 | --- | --- | --- | --- | --- |
-| H1 | OMS logical-time consistency | **STATICALLY CONFIRMED** | P6-8 | `test_phase6_logical_time.py` |
+| H1 | OMS logical-time consistency | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** | P6-8 | `test_phase6_logical_time.py` |
 | H2 | Cancel before ack | **STATICALLY CONFIRMED** | P6-1 | `test_phase6_cancel.py` |
 | H3 | IOC semantics | **STATICALLY CONFIRMED** | P6-5 | `test_phase6_tif.py` |
 | H4 | FOK semantics | **STATICALLY CONFIRMED** | P6-7 | `test_phase6_tif.py` |
@@ -1215,12 +1262,12 @@ Final audit-only validation is complete. Verdicts below incorporate the frozen e
 | H11 | Approved size conservation | **STATICALLY CONFIRMED** (latent) | P6-10 | `test_phase6_planning.py` |
 | H12 | Plan conservation | **EXTERNALLY REFUTED AS A DEFECT CONCERN — tested conservation invariants held** | — | `test_phase6_planning.py` |
 | H13 | Slippage hard bound | **EXTERNALLY REFUTED FOR THE TESTED SUPPORTED BOUND — no hard-bound failure remained** | — | `test_phase6_slippage.py` |
-| H14 | Latency double counting | **INCONCLUSIVE — externally measured double application; policy intent unresolved** | P6-15 | `test_phase6_slippage.py` |
-| H15 | Passive trade-flow accrual | **EXTERNALLY CONFIRMED** | P6-12 | `test_phase6_passive_fills.py` |
-| H16 | `max_partial_fraction` | **EXTERNALLY CONFIRMED** | P6-13 | `test_phase6_passive_fills.py` |
+| H14 | Latency double counting | **REMEDIATED IN CODE — residual-only synthetic latency policy; external revalidation required** | P6-15 | `test_phase6_slippage.py` |
+| H15 | Passive trade-flow accrual | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** | P6-12 | `test_phase6_passive_fills.py` |
+| H16 | `max_partial_fraction` | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** | P6-13 | `test_phase6_passive_fills.py` |
 | H17 | Event/state atomicity | **EXTERNALLY CONFIRMED — corrected exact-Nth failure injection reproduced state/event divergence** | P6-17 | `test_phase6_atomicity.py` |
-| H18 | Fill source timestamp | **EXTERNALLY CONFIRMED** | P6-14 | `test_phase6_passive_fills.py` |
-| H19 | Resource retention | **EXTERNALLY CONFIRMED** (`_pending`) | P6-16 | `test_phase6_resource_bounds.py` |
+| H18 | Fill source timestamp | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** | P6-14 | `test_phase6_passive_fills.py` |
+| H19 | Resource retention | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** (`_pending`) | P6-16 | `test_phase6_resource_bounds.py` |
 | H20 | UNKNOWN retention | **STATICALLY REFUTED** — compaction refuses non-terminal orders, and UNKNOWN is not terminal | — | `test_phase6_resource_bounds.py`, `test_phase6_unknown.py` |
 | H21 | Execution report semantics | **EXTERNALLY CONFIRMED — submission-only lifecycle semantics reproduced after capture correction** | P6-18 | `test_phase6_registry.py` |
 | H22 | Numeric / schema safety | **EXTERNALLY CONFIRMED BY CI #53** | P6-19 | `test_phase6_slippage.py` |
@@ -1231,14 +1278,14 @@ Final audit-only validation is complete. Verdicts below incorporate the frozen e
 | H27 | Registry identity | **EXTERNALLY REFUTED AS A DEFECT CONCERN — identity invariants held** | — | `test_phase6_registry.py` |
 | H28 | Execution snapshot consistency | **EXTERNALLY REFUTED AS A DEFECT CONCERN — snapshot consistency held** | — | `test_phase6_snapshots.py` |
 | H29 | Query vocabulary | **EXTERNALLY REFUTED AS A DEFECT CONCERN — query vocabulary held** | — | `test_phase6_snapshots.py` |
-| H30 | `resolve_unknown` contract | **PARTIAL — resolution works, but supplied `now_ms` is not used for OMS terminal history** | P6-8 | `test_phase6_unknown.py` |
+| H30 | `resolve_unknown` contract | **REMEDIATED IN CODE — supplied `now_ms` now reaches OMS history; external revalidation required** | P6-8 | `test_phase6_unknown.py` |
 | H31 | Executor capability claims | **STATICALLY CONFIRMED** (FOK, MARKET) | P6-7 | `test_phase6_tif.py` |
 | H32 | Preflight contract | **STATICALLY CONFIRMED** (unwired) | P6-9 | `test_phase6_planning.py` |
 | H33 | Gateway / paper boundary | **STATICALLY REFUTED** — no implementation, no construction site, no transport import, no credential | — | `test_phase6_paper_boundary.py` |
 | H34 | Later phases must not change Phase 6 | **STATICALLY REFUTED** — `PaperExecutor` construction is unguarded by profile or feed | — | `test_phase6_paper_boundary.py` |
 | H35 | Shadow creates no second execution path | **STATICALLY REFUTED** — the observer holds only a bus and a registry and publishes nothing | — | `test_phase6_paper_boundary.py` |
-| H36 | Determinism | **EXTERNALLY CONFIRMED AS A DEFECT — wall-clock skew changes execution truth** | P6-8 | `test_phase6_replay.py` |
-| H37 | Replay execution equivalence | **EXTERNALLY CONFIRMED — nine scenarios plus multi-venue diverge under wall-clock skew** | P6-8 | `test_phase6_replay.py` |
+| H36 | Determinism | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** | P6-8 | `test_phase6_replay.py` |
+| H37 | Replay execution equivalence | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** | P6-8 | `test_phase6_replay.py` |
 
 **Refuted hypotheses, stated positively.** H20, H33, H34 and H35 were tested
 adversarially and the implementation held. H6 is refuted for RUNE's
