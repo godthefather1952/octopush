@@ -19,11 +19,12 @@ registration attached.
 
 H21: EXECUTION REPORT SEMANTICS
 ===============================
-``ExecutionReport`` carries ``fills`` and ``complete`` fields. ``submit``
-returns it with ``complete=False`` and an empty ``fills`` list, always, and
-nothing ever produces a later report. It is a *submission* report wearing the
-name of a lifecycle one — an observability and naming defect rather than a
-safety one, and rated accordingly.
+The report returned at submission remains a detached snapshot of that instant:
+working orders can legitimately have no fills and ``complete=False``. Batch D
+adds lifecycle reports derived from registry + OMS truth. VESKA fingerprints
+report-visible state and publishes a new ``EXECUTION_REPORT`` only when that
+truth changes, so later snapshots carry actual fills and terminal completion
+without mutating previously returned report objects.
 """
 
 from __future__ import annotations
@@ -455,52 +456,66 @@ class TestRegistryRetention:
 
 
 class TestExecutionReportSemantics:
-    """H21 — what the report is, against what its fields imply."""
+    """H21 — reports are detached snapshots across the execution lifecycle."""
 
-    def test_submit_always_returns_an_incomplete_report_with_no_fills(self):
-        from execution.paper.executor import PaperExecutor
+    def test_veska_has_one_canonical_current_report_builder(self):
+        from execution.veska.engine import Veska
 
-        source = inspect.getsource(PaperExecutor.submit)
-        assert "complete=False" in source
-        assert "fills=" not in source
+        source = inspect.getsource(Veska.current_report)
+        assert "orders_for_plan" in source
+        assert "for fill in order.fills" in source
+        assert "complete=record.is_terminal" in source
 
-    async def test_no_later_report_is_ever_produced(self):
-        """Nothing publishes a second EXECUTION_REPORT for the same plan."""
+    async def test_a_later_report_is_published_when_execution_truth_changes(self):
         from core.events import EventType
 
         harness = build_harness()
         harness.update_market(two_venue_market())
         plan = execution_plan(
-            planned_order(quantity=0.5, limit_price=101.0), created_at=T0
+            planned_order(
+                quantity=0.5,
+                time_in_force=TimeInForce.IOC,
+                limit_price=101.0,
+            ),
+            created_at=T0,
         )
         await harness.veska.execute(plan, T0)
-        for step in range(1, 5):
-            await harness.veska.poll(T0 + step * _latency(harness))
+        await harness.veska.poll(T0 + _latency(harness))
         await harness.drain_events()
 
         reports = harness.events_of(EventType.EXECUTION_REPORT)
-        assert len(reports) == 1, (
-            f"{len(reports)} execution reports were published for one plan; "
-            "the model may have gained a lifecycle after all"
-        )
+        assert len(reports) >= 2
+        latest = reports[-1].payload
+        assert latest["plan_id"] == plan.plan_id
+        assert latest["fills"]
+        assert latest["complete"] is True
 
-    async def test_the_report_never_reflects_fills_that_followed(self):
-        """The observability consequence, stated as a measurement."""
+    async def test_submission_report_stays_a_snapshot_while_current_report_advances(self):
         harness = build_harness()
         harness.update_market(two_venue_market())
         plan = execution_plan(
             planned_order(
-                quantity=0.5, time_in_force=TimeInForce.IOC, limit_price=101.0
+                quantity=0.5,
+                time_in_force=TimeInForce.IOC,
+                limit_price=101.0,
             ),
             created_at=T0,
         )
-        report = await harness.veska.execute(plan, T0)
+        submission = await harness.veska.execute(plan, T0)
+        submission_status = submission.orders[0].status
         fills = await harness.veska.poll(T0 + _latency(harness))
+        latest = harness.veska.current_report(
+            plan.plan_id, T0 + _latency(harness)
+        )
 
-        assert fills, "no fill; the comparison below is untested"
-        assert report.fills == []
-        assert report.complete is False
-        assert report.filled_notional == 0.0, (
-            "the report's filled_notional reads 0.0 while "
-            f"{sum(f.notional for f in fills):.2f} actually traded"
+        assert fills, "no fill; lifecycle report semantics are untested"
+        assert submission.fills == []
+        assert submission.complete is False
+        assert submission.filled_notional == 0.0
+        assert submission.orders[0].status is submission_status
+
+        assert latest.fills
+        assert latest.complete is True
+        assert latest.filled_notional == pytest.approx(
+            sum(fill.notional for fill in fills)
         )

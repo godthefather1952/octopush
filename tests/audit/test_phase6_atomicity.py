@@ -21,16 +21,17 @@ therefore no cancellation path can reach.
 
 H17: EVENT AND STATE ATOMICITY
 ==============================
-``_record_fill`` applies the fill to the OMS and to the paper account, and
-*then* publishes ``PAPER_FILL``. The recorder is bus middleware, so an event
-that never reaches ``publish`` is never recorded. The account has moved; the
-durable history has not.
+Batch D makes publication the commit boundary.
 
-The exception does propagate, which makes this loud rather than silent — and
-that distinction is the difference between HIGH and CRITICAL. It is recorded
-either way, because a replayed session reconstructs the ledger from recorded
-fills, and a fill that changed the account without being recorded is a
-divergence replay cannot close.
+Generic order-state changes are first projected onto a detached order, the
+projected ``PAPER_ORDER_UPDATED`` is published, and only then is the identical
+transition committed to the resident OMS order. A rejected publication
+therefore leaves the real order unchanged.
+
+For fills, OMS validation and account realized-PnL preview are non-mutating.
+The canonical ``PAPER_FILL`` is published before OMS/account mutation. A
+derived order update that fails after that durable fill is retained for retry
+rather than rolling the already-recorded economic fact back.
 """
 
 from __future__ import annotations
@@ -188,27 +189,22 @@ class TestPartialMultiLegSubmission:
 
 
 class TestFillStateVersusEventTruth:
-    """H17 — the account moves before the event is durable."""
+    """H17 — accepted event truth and live state move in the same direction."""
 
-    def test_record_fill_mutates_before_it_publishes(self):
+    def test_record_fill_publishes_before_it_mutates_economic_state(self):
         from execution.paper.executor import PaperExecutor
 
         source = inspect.getsource(PaperExecutor._record_fill)
+        publish_at = source.index("await self.bus.publish(")
         oms_at = source.index("self.oms.apply_fill(")
         account_at = source.index("self.account.apply_fill(fill)")
-        publish_at = source.index("await self.bus.publish(")
-        assert oms_at < publish_at
-        assert account_at < publish_at
+        assert publish_at < oms_at
+        assert publish_at < account_at
 
     async def test_a_failed_fill_publication_leaves_no_unrecorded_ledger_move(
         self,
     ):
-        """The invariant: economic truth and recorded truth must not diverge.
-
-        If the publication fails, either the account must not have moved or
-        some recovery must exist. Neither holds today: the account has the
-        fill, the bus never saw it, and the exception simply propagates.
-        """
+        """A rejected canonical fill publication must commit no economics."""
         # #1 EXECUTION_PLAN, #2 PAPER_ORDER_CREATED, #3 EXECUTION_REPORT,
         # #4 acknowledgement/open PAPER_ORDER_UPDATED, #5 PAPER_FILL.
         # Fail on #5 so OMS/account mutation precedes the injected failure.
@@ -229,23 +225,15 @@ class TestFillStateVersusEventTruth:
         with pytest.raises(RuntimeError, match="audit-injected"):
             await harness.veska.poll(T0 + latency)
 
-        moved = (
-            harness.account.fills_applied != fills_before
-            or harness.account.cash != cash_before
-        )
-        recorded = any(
+        assert harness.account.fills_applied == fills_before
+        assert harness.account.cash == cash_before
+        assert harness.oms.fills_applied == 0
+        assert not any(
             e.type is EventType.PAPER_FILL for e in bus.published
-        )
-        assert not (moved and not recorded), (
-            "the paper account applied a fill "
-            f"({fills_before} -> {harness.account.fills_applied} fills, cash "
-            f"{cash_before} -> {harness.account.cash}) that was never "
-            "published, so no recorder could persist it and no replay can "
-            "reconstruct it"
         )
 
     async def test_an_order_transition_is_not_lost_when_its_event_fails(self):
-        """The same question for a status change rather than a fill."""
+        """A rejected projected update must leave the resident order untouched."""
         # #1 EXECUTION_PLAN, #2 PAPER_ORDER_CREATED, #3 EXECUTION_REPORT,
         # #4 is the acknowledgement/open PAPER_ORDER_UPDATED under test.
         bus = ExplodingBus(fail_on_publish=4)
@@ -266,11 +254,49 @@ class TestFillStateVersusEventTruth:
         published_updates = [
             e for e in bus.published if e.type is EventType.PAPER_ORDER_UPDATED
         ]
-        assert not (order.status is not OrderStatus.SUBMITTING and not published_updates), (
-            f"the order moved to {order.status.value} and no "
-            "PAPER_ORDER_UPDATED reached the bus, so the durable history "
-            "still says SUBMITTING"
+        assert order.status is OrderStatus.SUBMITTING
+        assert order.history[-1][1] is OrderStatus.SUBMITTING
+        assert published_updates == []
+
+
+    async def test_a_failed_fill_derived_update_is_retried_without_double_apply(self):
+        """PAPER_FILL is canonical; its derived order update may retry safely."""
+        # #1 EXECUTION_PLAN, #2 PAPER_ORDER_CREATED, #3 EXECUTION_REPORT,
+        # #4 OPEN update, #5 PAPER_FILL succeeds, #6 derived order update fails.
+        bus = ExplodingBus(fail_on_publish=6)
+        harness = build_harness(bus=bus)
+        harness.update_market(two_venue_market())
+        latency = harness.settings.venue(VENUE_A).latency_ms
+        plan = execution_plan(
+            planned_order(
+                quantity=0.5,
+                time_in_force=TimeInForce.IOC,
+                limit_price=101.0,
+            ),
+            created_at=T0,
         )
+        await harness.veska.execute(plan, T0)
+
+        with pytest.raises(RuntimeError, match="audit-injected"):
+            await harness.veska.poll(T0 + latency)
+
+        order = harness.orders_of(plan.plan_id)[0]
+        assert harness.account.fills_applied == 1
+        assert harness.oms.fills_applied == 1
+        assert order.filled_quantity > 0
+        assert order.client_order_id in harness.executor._pending_order_updates
+        assert len([e for e in bus.published if e.type is EventType.PAPER_FILL]) == 1
+
+        await harness.veska.poll(T0 + latency + 1)
+
+        assert order.client_order_id not in harness.executor._pending_order_updates
+        assert harness.account.fills_applied == 1
+        assert harness.oms.fills_applied == 1
+        assert len([e for e in bus.published if e.type is EventType.PAPER_FILL]) == 1
+        updates = [
+            e for e in bus.published if e.type is EventType.PAPER_ORDER_UPDATED
+        ]
+        assert updates
 
 
 class TestNoSilentAbsorption:
