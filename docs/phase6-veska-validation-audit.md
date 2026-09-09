@@ -1,8 +1,8 @@
 # Phase 6 — VESKA / paper-execution validation audit
 
-**Status: PHASE 6 BATCH A PATCHED / EXTERNAL VALIDATION REQUIRED.**
+**Status: PHASE 6 BATCH A+B PATCHED / EXTERNAL VALIDATION REQUIRED.**
 
-**CURRENT PRODUCTION CHANGES: PHASE 6 BATCH A ONLY.**
+**CURRENT PRODUCTION CHANGES: PHASE 6 BATCH A+B ONLY.**
 
 This document preserves the original Phase 6 validation history and now records
 the first production-remediation batch. The frozen audit surface remains the
@@ -272,9 +272,45 @@ Batch A addresses exposure-integrity findings only:
   ENTRY sizing is always derived from approved notional, while EXIT/HEDGE retain
   exact-quantity semantics.
 
-Batch B/C/D findings remain intentionally unremediated. Phase 6 is not production
-frozen until Batch A is externally revalidated and the remaining batches are
-completed.
+Batch C/D findings remain intentionally unremediated. Phase 6 is not production
+frozen until the patched batches are externally revalidated and the remaining
+batches are completed.
+
+## Phase 6 Batch B remediation checkpoint
+
+Production remediation commit:
+
+`fa9ea11028b166dccb99a1c7a51129d7a6ab506b`
+
+Regression-audit alignment commit:
+
+`d659917a0fd91504fa4acdb8ceaee80ac6ea6ad9`
+
+Batch B addresses submission and instruction-contract findings only:
+
+- **P6-5 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  IOC receives exactly one arrival-time execution attempt; any unfilled
+  remainder transitions to CANCELLED immediately rather than resting to TTL.
+- **P6-6 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  Crossing GTC limits use the TAKER path and fee tier; POST_ONLY cannot take
+  on arrival, and a later crossed snapshot is not passive maker-fill evidence.
+- **P6-7 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  FOK remains unsupported and is refused before OMS mutation.
+- **P6-9 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  `Veska.execute` now enforces the canonical preflight result before new
+  executor submission.
+- **P6-11 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  Submission is allowed through the exact deadline and blocked only when
+  `now_ms > deadline_ms`.
+- **P6-19 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  Execution schemas reject the frozen non-finite numeric cases and negative
+  TTLs at Pydantic validation.
+- **P6-20 — REMEDIATED IN CODE / EXTERNAL REVALIDATION REQUIRED.**
+  Unknown venues are blocked by preflight, PaperExecutor validates venue truth
+  before mutation, and the fabricated 40ms fallback has been removed.
+
+Batch A remains patched and awaiting the same external revalidation. Batch C/D
+remain intentionally unremediated.
 
 ## Audit surface
 
@@ -555,6 +591,8 @@ behaviour and belong to remediation.
 | **Severity** | **HIGH** |
 | **Area** | `execution/paper/simulator.py::is_marketable`, `execution/paper/executor.py::poll` |
 | **Blocks Phase 6 validation** | Yes |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P1** |
 
 **Invariant.** `policy.can_rest(TimeInForce.IOC)` is `False`. An IOC order gets
 one executable attempt on arrival; any remainder terminates at once.
@@ -596,6 +634,8 @@ classifies by instruction, and nothing enforces what the instruction means.
 | **Severity** | **HIGH** |
 | **Area** | `execution/paper/simulator.py::fill_passive`, `is_marketable` |
 | **Blocks Phase 6 validation** | Yes |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P1** |
 
 **Invariant.** `policy.must_not_take(TimeInForce.POST_ONLY)` is `True`. A real
 venue rejects or reprices a post-only order that would cross, precisely so it
@@ -642,6 +682,8 @@ or reprice a crossing POST_ONLY order using `policy.must_not_take`.
 | **Severity** | **HIGH** |
 | **Area** | `execution/paper/executor.py::PAPER_CAPABILITIES`, `execution/paper/simulator.py` |
 | **Blocks Phase 6 validation** | Yes |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P1** |
 
 **Invariant.** `PAPER_CAPABILITIES.supports_fok` is `False`, and
 `policy.requires_full_fill(TimeInForce.FOK)` is `True`. An unsupported
@@ -725,6 +767,8 @@ paths, as the executor already does.
 | **Severity** | **HIGH** |
 | **Area** | `execution/veska/preflight.py`, `execution/veska/engine.py::execute` |
 | **Blocks Phase 6 validation** | No — it blocks nothing, which is the finding |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P1** |
 
 **Invariant.** A check that exists must either be called or be documented as
 unreachable. Phase 6 documents the latter honestly — `Veska.preflight` says
@@ -807,6 +851,8 @@ leaving EXIT and HEDGE exact.
 | **Severity** | **MEDIUM** |
 | **Area** | `execution/**` (no reader), `apps/orchestrator/orchestrator.py::_advance_execution` (cleanup only) |
 | **Blocks Phase 6 validation** | No |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P2** |
 
 **Invariant.** No new risk may begin after an expired deadline.
 
@@ -1063,6 +1109,8 @@ report. Either is cosmetic relative to everything above.
 | **Severity** | **HIGH** |
 | **Area** | `core/models/opportunity.py`, `core/models/execution.py` |
 | **Blocks Phase 6 validation** | Yes |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
+| **Priority** | **P1** |
 
 **Invariant.** Execution-domain values that participate in sizing, price,
 fees, slippage or expiry must reject non-finite values and invalid negative
@@ -1109,7 +1157,7 @@ execution-domain Pydantic models in a later production-remediation pass.
 | **Severity** | **HIGH** |
 | **Area** | `execution/paper/executor.py::_latency`, `execution/veska/preflight.py`, `execution/veska/engine.py::execute` |
 | **Blocks Phase 6 validation** | Yes |
-| **Status** | **PROPOSED FINDING / EXTERNALLY CONFIRMED — NOT REMEDIATED** |
+| **Status** | **REMEDIATED IN CODE — EXTERNAL REVALIDATION REQUIRED** |
 | **Priority** | **P1** |
 
 **Invariant.** A hand-built, persisted or replayed plan naming a venue that is

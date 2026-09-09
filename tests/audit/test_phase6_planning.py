@@ -1,25 +1,13 @@
-"""H11, H12, H23, H32 — planning must not size beyond what RUNE authorised.
+"""H11, H12, H23, H32 — planning and submission boundaries.
 
-H11: THE SIZING BRANCH
-======================
-Batch A makes execution role part of sizing. ENTRY is risk-increasing and is
-always derived from ``approved_notional / expected_price``, so an explicit leg
-quantity cannot enlarge RUNE's grant. EXIT and HEDGE remain allowed to carry
-the exact quantity needed to neutralise exposure that already exists.
+Batch A made ENTRY sizing explicitly respect RUNE's approved notional while
+preserving exact quantities for risk-reducing EXIT/HEDGE work.
 
-H12: CONSERVATION
-=================
-For an entry, per-leg planned notional should be approximately
-``approved_notional``, and the gross across N legs approximately
-``approved_notional * N`` — which is the meaning every existing reader already
-gives ``ExecutionPlan.notional`` (P5-2).
-
-H32: PREFLIGHT
-==============
-``preflight_plan`` checks structure and capability claims. It does **not**
-check deadlines, sizes, notional conservation or venue reachability, and
-``Veska.execute`` does not consult it at all. Both facts are asserted, because
-a check nobody calls is worth exactly as much as its callers.
+Batch B wires the canonical preflight gate into `Veska.execute`. Structural
+shape, capability claims, duplicate identity, configured/enabled venue truth
+and the supplied logical-time deadline are now enforced before OMS mutation.
+Plan notional conservation remains deliberately outside preflight because the
+frozen H12 audit did not establish a defect there.
 """
 
 from __future__ import annotations

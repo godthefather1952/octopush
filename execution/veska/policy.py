@@ -1,25 +1,13 @@
-"""Execution policy — what an order type and time-in-force *mean*.
+"""Execution policy — canonical time-in-force and order-type semantics.
 
-One canonical location for the semantics of ``TimeInForce`` and ``OrderType``,
-so that the executor, the router, a preflight check and a future live adapter
-all answer "may this order rest?" the same way instead of each re-deriving it
-from an ``in`` test at the call site.
+This pure module states what IOC, FOK, POST_ONLY and GTC mean so the router,
+preflight gate and paper executor share one vocabulary.
 
-WHAT THIS MODULE IS, AND IS NOT
-===============================
-It is a statement of intent: what the platform means by IOC, FOK, POST_ONLY and
-GTC. It is pure — no state, no clock, no configuration — so it can be read by
-anything without a dependency.
-
-It is **not** an enforcement layer, and this construction pass deliberately
-does not wire it into ``PaperExecutor``'s fill loop. Whether the executor's
-behaviour matches these definitions is exactly what a later validation pass
-exists to determine; changing the loop now would answer that question by
-assertion rather than by evidence, and would move the goalposts before the
-measurement.
-
-The one thing this module does establish is that there is now a single place to
-change if the answer turns out to be no.
+Batch B now enforces the validated portions of that contract: IOC receives one
+arrival-time attempt, unsupported FOK is refused before OMS mutation,
+POST_ONLY never removes liquidity, and actual crossing determines whether a
+GTC limit is a taker. The policy remains decision-free and contains no state or
+clock reads; enforcement stays in the executor and submission boundary.
 """
 
 from __future__ import annotations

@@ -1,39 +1,18 @@
-"""H3, H4, H5, H31 — time-in-force semantics, against the platform's own definitions.
+"""H3, H4, H5, H31 — time-in-force semantics against repository policy.
 
-THE ORACLE IS IN THE REPOSITORY
-===============================
-``execution/veska/policy.py`` is not this audit's opinion about what IOC, FOK
-and POST_ONLY mean. It is the platform's own canonical statement, written in
-Phase 6 and explicitly *not* wired into the fill loop:
+`execution/veska/policy.py` is the oracle for instruction meaning. Batch B
+now enforces the audited contract:
 
-    "It is **not** an enforcement layer, and this construction pass
-     deliberately does not wire it into ``PaperExecutor``'s fill loop. Whether
-     the executor's behaviour matches these definitions is exactly what a later
-     validation pass exists to determine."
+* IOC receives one executable attempt on arrival and any remainder terminates;
+* FOK remains unsupported and the VESKA preflight gate refuses it before OMS
+  mutation;
+* POST_ONLY that would cross on arrival is rejected and a later crossed
+  snapshot is not sufficient maker-fill evidence;
+* GTC is not intrinsically aggressive, but a limit through the opposing touch
+  follows the TAKER path and fee tier.
 
-This is that pass. Every assertion below compares the executor against
-``policy``'s own predicates, so a disagreement is the repository contradicting
-itself rather than the audit imposing a preference.
-
-WHAT ``is_marketable`` ACTUALLY DOES
-====================================
-``execution/paper/simulator.py``::
-
-    def is_marketable(order):
-        if order.order_type is OrderType.MARKET:
-            return True
-        return order.time_in_force in (TimeInForce.IOC, TimeInForce.FOK)
-
-Three consequences follow, and each is a hypothesis below:
-
-* **IOC** takes the marketable path but nothing terminates its remainder, so
-  it rests until its TTL — the GTC behaviour ``policy.can_rest`` denies it.
-* **FOK** takes the same path, which partially fills. ``policy.requires_full_fill``
-  says a partial fill is an illegal outcome for FOK, and
-  ``PAPER_CAPABILITIES.supports_fok`` is False — yet nothing rejects one.
-* **POST_ONLY** takes the *passive* path, which fills at the order's limit
-  price with ``Liquidity.MAKER`` even when the book is crossed against it.
-  ``policy.must_not_take`` says such an order must never remove liquidity.
+These tests preserve those economic properties rather than the old defect
+mechanisms.
 """
 
 from __future__ import annotations

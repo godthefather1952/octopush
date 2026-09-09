@@ -1,25 +1,18 @@
-"""Plan preflight — the construction-time check seam.
+"""Plan preflight — the canonical fail-closed submission gate.
 
-WHERE THE HARD CHECKS WILL GO
-=============================
-A plan is the last artefact between an authorised intent and orders at a venue.
-This module is the place a later pass puts the checks that must pass before any
-of it is submitted.
+A plan is the final artefact between an authorised intent and venue-side
+execution. Batch B wires this pure checker into `Veska.execute` before any new
+OMS order is created.
 
-This pass deliberately implements only what is *unquestionably* required: a
-plan must have orders, every order must name a venue, a symbol and an id, and
-the executor must claim to support the order type and time-in-force it is being
-asked for. Every one of those is structurally necessary for the plan to be
-workable at all — none is a judgement about whether it *should* be worked.
+The checker owns only validated submission boundaries: structural plan shape,
+executor capability claims, duplicate order identity, configured/enabled venue
+reachability, and the absolute submission deadline when logical time is
+supplied. It deliberately does not invent economic conservation rules that the
+frozen Phase 6 audit did not establish.
 
-Anything that requires a decision — deadline enforcement, per-role size rules,
-notional conservation, venue reachability — is deliberately absent. Adding a
-speculative rule here would create a safety boundary nobody has validated, and
-a boundary that has not been measured is a boundary nobody can trust.
-
-The result is returned, not raised. A structurally impossible plan is a fact
-about the plan, and the caller decides what to do with it; the check itself has
-no business ending a tick.
+The result remains data rather than an exception: VESKA records a blocked plan
+as FAILED, preserves reason codes in the submission report, and creates no
+economic exposure.
 """
 
 from __future__ import annotations

@@ -1,27 +1,12 @@
 """H10 — an expired plan must not start new risk.
 
-WHERE ``deadline_ms`` GOES, AND WHERE IT DOES NOT
-=================================================
-``TradeIntent.deadline_ms`` is set by the orchestrator to
-``tick_time + max_data_age_ms``. ``Veska.build_plan`` copies it onto the
-``ExecutionPlan``. ``ExecutionRegistry.register_plan`` copies it onto the
-``ExecutionPlanRecord``, whose own field comment says:
+Batch B makes the absolute deadline part of VESKA's canonical preflight gate.
+The boundary is inclusive: `now_ms == deadline_ms` remains valid, while
+`now_ms > deadline_ms` is refused before OMS or venue-timing mutation.
 
-    "The intent's absolute execution deadline, carried for observability.
-     Construction phase: nothing enforces it here."
-
-Nothing else in ``execution/**`` reads it. ``PaperExecutor.submit`` does not
-compare ``now_ms`` against it; neither does ``poll``.
-
-The one enforcement anywhere is in the orchestrator's ``_advance_execution``,
-which cancels still-live orders once ``tick_time > deadline``. That is a
-*cleanup* of risk already taken, not a bar on taking new risk — and it reads
-``is_live``, so an UNKNOWN order is not cancelled by it either (see H6).
-
-The invariant this module tests is deliberately the weakest useful one: **no
-new risk may BEGIN after an expired deadline**. It says nothing about whether
-an already-working order should be allowed to keep filling, which is a
-legitimate design question this phase does not answer.
+This finding is intentionally narrower than the lifecycle of an order accepted
+in time. Existing tests below continue to pin acknowledgement/fill behavior
+after the deadline for already-working orders without redefining that policy.
 """
 
 from __future__ import annotations
