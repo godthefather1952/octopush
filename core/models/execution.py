@@ -327,7 +327,7 @@ class PaperOrder(Envelope):
 
 
 class ExecutionReport(Envelope):
-    """What VESKA reports back after working a plan."""
+    """A detached snapshot of a plan's execution lifecycle at one instant."""
 
     plan_id: str
     intent_id: str

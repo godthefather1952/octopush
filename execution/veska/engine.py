@@ -82,6 +82,7 @@ class Veska:
         self.router = VenueRouter(settings)
         self.registry = ExecutionRegistry()
         self.plan_failures = 0
+        self._report_fingerprints: dict[str, tuple[object, ...]] = {}
         health.register(SERVICE, VERSION)
 
     # -- compatibility -----------------------------------------------------
@@ -197,6 +198,85 @@ class Veska:
             ),
         )
 
+    # -- execution reports -------------------------------------------------
+
+    def current_report(self, plan_id: str, now_ms: Millis) -> ExecutionReport:
+        """Build a detached lifecycle report from registry and OMS truth."""
+        record = self.registry.get(plan_id)
+        if record is None:
+            raise KeyError(f"no such execution plan: {plan_id}")
+        orders = [
+            order.model_copy(deep=True)
+            for order in self.executor.orders_for_plan(plan_id)
+        ]
+        fills = [
+            fill.model_copy(deep=True)
+            for order in orders
+            for fill in order.fills
+        ]
+        return ExecutionReport(
+            created_at=now_ms,
+            correlation_id=record.correlation_id,
+            plan_id=record.plan_id,
+            intent_id=record.intent_id,
+            orders=orders,
+            fills=fills,
+            complete=record.is_terminal,
+            notes=list(record.notes),
+        )
+
+    @staticmethod
+    def _report_fingerprint(report: ExecutionReport) -> tuple[object, ...]:
+        return (
+            report.complete,
+            tuple(
+                (
+                    order.client_order_id,
+                    order.status.value,
+                    order.filled_quantity,
+                    order.average_price,
+                    order.fees_paid,
+                    order.reject_reason,
+                    order.terminal_at,
+                )
+                for order in report.orders
+            ),
+            tuple(fill.fill_id for fill in report.fills),
+            tuple(report.notes),
+        )
+
+    async def _publish_execution_report(
+        self, report: ExecutionReport
+    ) -> None:
+        await self.bus.publish(
+            Event(
+                type=EventType.EXECUTION_REPORT,
+                ts_ms=report.created_at,
+                source=SERVICE,
+                schema_name="ExecutionReport",
+                correlation_id=report.correlation_id,
+                payload=report.to_json_dict(),
+            )
+        )
+
+    async def _publish_report_if_changed(
+        self, plan_id: str, now_ms: Millis
+    ) -> ExecutionReport | None:
+        report = self.current_report(plan_id, now_ms)
+        fingerprint = self._report_fingerprint(report)
+        if self._report_fingerprints.get(plan_id) == fingerprint:
+            return None
+        await self._publish_execution_report(report)
+        self._report_fingerprints[plan_id] = fingerprint
+        return report
+
+    async def _publish_changed_reports(self, now_ms: Millis) -> None:
+        for record in self.registry.all_records():
+            has_orders = bool(self.executor.orders_for_plan(record.plan_id))
+            if not has_orders and record.plan_id not in self._report_fingerprints:
+                continue
+            await self._publish_report_if_changed(record.plan_id, now_ms)
+
     # -- execution ---------------------------------------------------------
 
     async def execute(self, plan: ExecutionPlan, now_ms: Millis) -> ExecutionReport:
@@ -232,8 +312,13 @@ class Veska:
                 correlation_id=plan.correlation_id,
                 plan_id=plan.plan_id,
                 intent_id=plan.intent_id,
-                orders=resident,
-                complete=False,
+                orders=[order.model_copy(deep=True) for order in resident],
+                fills=[
+                    fill.model_copy(deep=True)
+                    for order in resident
+                    for fill in order.fills
+                ],
+                complete=record.is_terminal,
                 notes=["idempotent retry: existing order truth returned"],
             )
 
@@ -267,15 +352,9 @@ class Veska:
                 complete=False,
                 notes=notes,
             )
-            await self.bus.publish(
-                Event(
-                    type=EventType.EXECUTION_REPORT,
-                    ts_ms=report.created_at,
-                    source=SERVICE,
-                    schema_name="ExecutionReport",
-                    correlation_id=plan.correlation_id,
-                    payload=report.to_json_dict(),
-                )
+            await self._publish_execution_report(report)
+            self._report_fingerprints[plan.plan_id] = (
+                self._report_fingerprint(report)
             )
             return report
 
@@ -314,21 +393,15 @@ class Veska:
         )
         self.refresh_plan(plan.plan_id, now_ms)
 
-        await self.bus.publish(
-            Event(
-                type=EventType.EXECUTION_REPORT,
-                ts_ms=report.created_at,
-                source=SERVICE,
-                schema_name="ExecutionReport",
-                correlation_id=plan.correlation_id,
-                payload=report.to_json_dict(),
-            )
-        )
+        report = report.model_copy(deep=True)
+        await self._publish_execution_report(report)
+        self._report_fingerprints[plan.plan_id] = self._report_fingerprint(report)
         return report
 
     async def poll(self, now_ms: Millis) -> list[FillEvent]:
         fills = await self.executor.poll(now_ms)
-        self._refresh_plans_for_fills(fills, now_ms)
+        self.refresh_all_plans(now_ms)
+        await self._publish_changed_reports(now_ms)
         return fills
 
     async def cancel(self, client_order_id: str, now_ms: Millis) -> None:
@@ -336,10 +409,12 @@ class Veska:
         record = self.registry.plan_for_order(client_order_id)
         if record is not None:
             self.refresh_plan(record.plan_id, now_ms)
+            await self._publish_report_if_changed(record.plan_id, now_ms)
 
     async def cancel_all(self, now_ms: Millis) -> int:
         count = await self.executor.cancel_all(now_ms)
         self.refresh_all_plans(now_ms)
+        await self._publish_changed_reports(now_ms)
         return count
 
     async def cancel_plan(
@@ -377,6 +452,7 @@ class Veska:
 
         self.registry.note(plan_id, f"cancel requested for {requested} order(s)", now_ms)
         refreshed = self.refresh_plan(plan_id, now_ms)
+        await self._publish_report_if_changed(plan_id, now_ms)
         return ExecutionCommandResult(
             accepted=True,
             plan_id=plan_id,
@@ -403,6 +479,7 @@ class Veska:
         record = self.registry.plan_for_order(client_order_id)
         if record is not None:
             refreshed = self.refresh_plan(record.plan_id, now_ms)
+            await self._publish_report_if_changed(record.plan_id, now_ms)
             return result.model_copy(
                 update={
                     "plan_id": record.plan_id,
