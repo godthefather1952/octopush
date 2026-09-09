@@ -990,11 +990,11 @@ Whether that is deliberate is exactly the classification this finding asks for.
 
 **Invariant.** A fill's provenance is its own venue's and symbol's.
 
-**Evidence.** `source_ts = self.market.source_data_timestamp if self.market
-else None` — the market-wide value, regardless of which venue and symbol the
-order belongs to. The platform already has the correct helper,
-`MarketState.source_data_timestamp_for`, added for TIDAL-H4 and used by the
-orchestrator when building intents; the execution path does not use it.
+**Pre-remediation evidence.** `source_ts = self.market.source_data_timestamp
+if self.market else None` used the market-wide value, regardless of which
+venue and symbol the order belonged to. The platform already had the correct
+helper, `MarketState.source_data_timestamp_for`, from TIDAL-H4. Batch C now
+reuses that helper in the execution path for the exact order leg.
 
 **Expected audit test.**
 `test_phase6_passive_fills.py::TestFillProvenance` — five tests, covering a
