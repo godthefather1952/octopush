@@ -194,7 +194,7 @@ class TestFillStateVersusEventTruth:
         from execution.paper.executor import PaperExecutor
 
         source = inspect.getsource(PaperExecutor._record_fill)
-        oms_at = source.index("self.oms.apply_fill(fill)")
+        oms_at = source.index("self.oms.apply_fill(")
         account_at = source.index("self.account.apply_fill(fill)")
         publish_at = source.index("await self.bus.publish(")
         assert oms_at < publish_at

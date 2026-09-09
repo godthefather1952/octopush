@@ -169,15 +169,19 @@ class TestFillSimulator:
             ExecutionConfig(maker_fill_probability=1.0, queue_ahead_fraction=0.5), seed=3
         )
         order = new_order(
-            oms, quantity=4.0, time_in_force=TimeInForce.POST_ONLY, limit_price=100.0
+            oms, quantity=4.0, time_in_force=TimeInForce.POST_ONLY, limit_price=99.0
         )
-        view = BookView(opposing=[PriceLevel(price=99.5, size=10.0)])
+        view = BookView(
+            opposing=[PriceLevel(price=99.5, size=10.0)],
+            traded_through=1_000.0,
+        )
         fill = simulator.fill_passive(order, view, FeeSchedule(maker_bps=1.0))
         assert fill is not None
         assert fill.liquidity is Liquidity.MAKER
-        assert fill.price == pytest.approx(100.0)
-        # A queue sits ahead of us, so we do not get the whole size.
-        assert fill.quantity < 4.0
+        assert fill.price == pytest.approx(99.0)
+        assert fill.fee == pytest.approx(fill.quantity * fill.price * 0.0001)
+        # A queue and the global partial cap both prevent a whole-size fill.
+        assert 0.0 < fill.quantity < 4.0
 
     def test_passive_order_away_from_the_market_needs_flow(self, oms):
         simulator = FillSimulator(ExecutionConfig(maker_fill_probability=1.0), seed=3)

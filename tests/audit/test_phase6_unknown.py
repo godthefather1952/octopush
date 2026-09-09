@@ -147,7 +147,7 @@ class TestOpenOrderCapacity:
         """Risk capacity counts every order the venue may still hold."""
         from apps.orchestrator import orchestrator as orch_module
 
-        source = inspect.getsource(orch_module.Orchestrator)
+        source = inspect.getsource(orch_module.Orchestrator._risk_check)
         assert "open_orders=len(self.veska.outstanding_orders())" in source
         assert "open_orders=len(self.veska.open_orders())" not in source
 

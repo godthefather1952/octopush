@@ -15,7 +15,7 @@ from __future__ import annotations
 import inspect
 
 from core.models.common import OrderType, Side, TimeInForce
-from core.models.execution import ExecutionRole, OrderStatus
+from core.models.execution import ExecutionRole
 from execution.paper.executor import PAPER_CAPABILITIES
 from execution.veska.preflight import preflight_plan
 from tests.audit.veska_fixtures import (

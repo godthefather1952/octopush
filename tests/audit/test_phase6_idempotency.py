@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 from core.models.common import Side, TimeInForce
 from core.models.execution import OrderStatus
 from tests.audit.veska_fixtures import (
