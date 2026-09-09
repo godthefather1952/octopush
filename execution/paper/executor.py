@@ -36,7 +36,7 @@ from core.bus import EventBus
 from core.clock import Clock
 from core.config import Settings
 from core.events import Event, EventType
-from core.models.common import QTY_EPSILON, Millis
+from core.models.common import QTY_EPSILON, Millis, TimeInForce
 from core.models.execution import (
     ExecutionCommandResult,
     ExecutionReport,
@@ -51,7 +51,12 @@ from core.models.market import MarketState, PriceLevel
 from core.models.opportunity import ExecutionPlan
 from execution.oms import OrderManager
 from execution.paper.account import PaperAccount
-from execution.paper.simulator import BookView, FillSimulator, is_marketable
+from execution.paper.simulator import (
+    BookView,
+    FillSimulator,
+    is_marketable,
+    would_cross,
+)
 from execution.veska.executor import Executor
 
 log = logging.getLogger(__name__)
@@ -160,10 +165,8 @@ class PaperExecutor(Executor):
             pending.traded_through += volume * 0.01
 
     def _latency(self, venue: str) -> int:
-        try:
-            return self.settings.venue(venue).latency_ms
-        except KeyError:
-            return 40
+        """Configured venue latency; unknown venues never receive defaults."""
+        return self.settings.venue(venue).latency_ms
 
     # -- submission --------------------------------------------------------
 
@@ -180,10 +183,25 @@ class PaperExecutor(Executor):
 
         seen_ids: set[str] = set()
         duplicate_ids: set[str] = set()
+        enabled_venues = {venue.name for venue in self.settings.enabled_venues}
         for planned in plan.orders:
             if planned.client_order_id in seen_ids:
                 duplicate_ids.add(planned.client_order_id)
             seen_ids.add(planned.client_order_id)
+            if planned.venue not in enabled_venues:
+                raise ValueError(
+                    f"venue {planned.venue!r} is not configured and enabled"
+                )
+            if not PAPER_CAPABILITIES.supports_order_type(planned.order_type):
+                raise ValueError(
+                    f"unsupported order type: {planned.order_type.value}"
+                )
+            if not PAPER_CAPABILITIES.supports_time_in_force(
+                planned.time_in_force
+            ):
+                raise ValueError(
+                    f"unsupported time in force: {planned.time_in_force.value}"
+                )
         if duplicate_ids:
             duplicates = ", ".join(sorted(duplicate_ids))
             raise ValueError(
@@ -294,6 +312,17 @@ class PaperExecutor(Executor):
             if order.status is OrderStatus.SUBMITTING:
                 self.oms.transition(order.client_order_id, OrderStatus.ACKNOWLEDGED)
                 order.acknowledged_at = now_ms
+                arrival_view = self._book_view(order)
+                if (
+                    order.time_in_force is TimeInForce.POST_ONLY
+                    and would_cross(order, arrival_view)
+                ):
+                    order.reject_reason = "post-only order would take liquidity"
+                    self.oms.transition(order.client_order_id, OrderStatus.REJECTED)
+                    await self._publish_order(
+                        order, EventType.PAPER_ORDER_UPDATED, now_ms
+                    )
+                    continue
                 self.oms.transition(order.client_order_id, OrderStatus.OPEN)
                 await self._publish_order(order, EventType.PAPER_ORDER_UPDATED, now_ms)
 
@@ -315,6 +344,13 @@ class PaperExecutor(Executor):
                 await self._record_fill(order, fill, now_ms)
 
             if order.is_terminal:
+                continue
+
+            if order.time_in_force is TimeInForce.IOC:
+                self.oms.transition(order.client_order_id, OrderStatus.CANCELLED)
+                await self._publish_order(
+                    order, EventType.PAPER_ORDER_UPDATED, now_ms
+                )
                 continue
 
             if order.expires_at is not None and now_ms >= order.expires_at:
@@ -341,6 +377,10 @@ class PaperExecutor(Executor):
             return None
 
         latency = float(self._latency(order.venue))
+        taking = is_marketable(order) or (
+            order.time_in_force is not TimeInForce.POST_ONLY
+            and would_cross(order, view)
+        )
         simulated = (
             self.simulator.fill_marketable(
                 order,
@@ -348,7 +388,7 @@ class PaperExecutor(Executor):
                 self.settings.venue(order.venue).fees,
                 latency,
             )
-            if is_marketable(order)
+            if taking
             else self.simulator.fill_passive(
                 order, view, self.settings.venue(order.venue).fees
             )

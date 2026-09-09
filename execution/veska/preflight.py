@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from core.models.common import Millis
 from core.models.execution import ExecutorCapabilities
 from core.models.opportunity import ExecutionPlan, PlannedOrder
 
@@ -65,6 +66,7 @@ def _check_order(
     order: PlannedOrder,
     index: int,
     capabilities: ExecutorCapabilities | None,
+    allowed_venues: frozenset[str] | None,
     findings: _Findings,
 ) -> None:
     where = f"order[{index}]"
@@ -74,6 +76,11 @@ def _check_order(
         findings.add("MISSING_VENUE", f"{where} names no venue")
     if not order.symbol:
         findings.add("MISSING_SYMBOL", f"{where} names no symbol")
+    if allowed_venues is not None and order.venue not in allowed_venues:
+        findings.add(
+            "UNKNOWN_VENUE",
+            f"{where} names venue {order.venue!r}, which is not configured and enabled",
+        )
 
     # Quantity and price positivity are enforced by ``PlannedOrder``'s own
     # field constraints, so reaching here means they already hold. Restated as
@@ -107,6 +114,8 @@ def preflight_plan(
     plan: ExecutionPlan,
     *,
     capabilities: ExecutorCapabilities | None = None,
+    now_ms: Millis | None = None,
+    allowed_venues: frozenset[str] | None = None,
 ) -> PlanPreflight:
     """Check a plan's structural workability.
 
@@ -120,10 +129,21 @@ def preflight_plan(
 
     if not plan.orders:
         findings.add("EMPTY_PLAN", "the plan carries no orders")
+    if now_ms is not None and now_ms > plan.deadline_ms:
+        findings.add(
+            "EXPIRED_DEADLINE",
+            f"plan deadline {plan.deadline_ms} expired before submission at {now_ms}",
+        )
 
     seen: set[str] = set()
     for index, order in enumerate(plan.orders):
-        _check_order(order, index, capabilities, findings)
+        _check_order(
+            order,
+            index,
+            capabilities,
+            allowed_venues,
+            findings,
+        )
         if order.client_order_id in seen:
             findings.add(
                 "DUPLICATE_CLIENT_ORDER_ID",

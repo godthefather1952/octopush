@@ -184,15 +184,18 @@ class Veska:
         self.registry.register_plan(plan, now_ms)
         return plan
 
-    def preflight(self, plan: ExecutionPlan) -> PlanPreflight:
-        """Check a plan's structural workability against this executor.
-
-        Construction phase: offered, not enforced. ``execute`` does not consult
-        it, because turning a new check into a submission gate is a behavioural
-        change and this pass makes none. The seam exists so a later pass has
-        one place to put the checks it has evidence for.
-        """
-        return preflight_plan(plan, capabilities=self.executor.capabilities)
+    def preflight(
+        self, plan: ExecutionPlan, now_ms: Millis | None = None
+    ) -> PlanPreflight:
+        """Canonical fail-closed gate before any new executor submission."""
+        return preflight_plan(
+            plan,
+            capabilities=self.executor.capabilities,
+            now_ms=now_ms,
+            allowed_venues=frozenset(
+                venue.name for venue in self.settings.enabled_venues
+            ),
+        )
 
     # -- execution ---------------------------------------------------------
 
@@ -233,6 +236,48 @@ class Veska:
                 complete=False,
                 notes=["idempotent retry: existing order truth returned"],
             )
+
+        preflight = self.preflight(plan, now_ms)
+        if preflight.blocked:
+            notes = [
+                f"preflight blocked: {code}" for code in preflight.reason_codes
+            ]
+            self.registry.set_status(
+                plan.plan_id,
+                ExecutionPlanStatus.FAILED,
+                now_ms,
+                note="; ".join(notes),
+            )
+            await self.bus.publish(
+                Event(
+                    type=EventType.EXECUTION_PLAN,
+                    ts_ms=plan.created_at,
+                    source=SERVICE,
+                    schema_name="ExecutionPlan",
+                    correlation_id=plan.correlation_id,
+                    payload=plan.to_json_dict(),
+                )
+            )
+            report = ExecutionReport(
+                created_at=now_ms,
+                correlation_id=plan.correlation_id,
+                plan_id=plan.plan_id,
+                intent_id=plan.intent_id,
+                orders=[],
+                complete=False,
+                notes=notes,
+            )
+            await self.bus.publish(
+                Event(
+                    type=EventType.EXECUTION_REPORT,
+                    ts_ms=report.created_at,
+                    source=SERVICE,
+                    schema_name="ExecutionReport",
+                    correlation_id=plan.correlation_id,
+                    payload=report.to_json_dict(),
+                )
+            )
+            return report
 
         self.registry.set_status(plan.plan_id, ExecutionPlanStatus.SUBMITTING, now_ms)
 

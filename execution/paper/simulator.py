@@ -143,32 +143,25 @@ class FillSimulator:
         view: BookView,
         fees: FeeSchedule,
     ) -> SimulatedFill | None:
-        """Decide whether a resting order trades.
+        """Decide whether a genuinely resting order trades.
 
-        Modelled as: some fraction of the size at our price is ahead of us in
-        the queue, so we only trade once enough volume has traded through, and
-        even then only probabilistically.
+        A crossed snapshot is not maker evidence. If the opposite touch has
+        moved through a resting limit, the passive model must not manufacture
+        a fill merely because the book is crossed; only observed trade-flow
+        progress through the queue can justify a maker fill here.
         """
-        if order.limit_price is None:
+        if order.limit_price is None or not view.opposing:
             return None
-        opposing_touch = view.opposing[0].price if view.opposing else None
-        if opposing_touch is None:
+        if would_cross(order, view):
+            return None
+        if view.traded_through <= 0:
             return None
 
-        crossed = (
-            order.side is Side.BUY and opposing_touch <= order.limit_price
-        ) or (order.side is Side.SELL and opposing_touch >= order.limit_price)
-
-        if not crossed:
-            # The market has not come to us; only queue-jumping flow can fill,
-            # which we model as the base probability scaled by traded volume.
-            if view.traded_through <= 0:
-                return None
-            probability = self.config.maker_fill_probability * min(
-                1.0, view.traded_through / max(1e-9, order.remaining_quantity * order.limit_price)
-            )
-        else:
-            probability = self.config.maker_fill_probability
+        probability = self.config.maker_fill_probability * min(
+            1.0,
+            view.traded_through
+            / max(1e-9, order.remaining_quantity * order.limit_price),
+        )
 
         if self.rng.random() > probability:
             return None
@@ -237,8 +230,25 @@ class FillSimulator:
         )
 
 
+def would_cross(order: PaperOrder, view: BookView) -> bool:
+    """Whether this order's limit is through the current opposing touch."""
+    if order.order_type is OrderType.MARKET:
+        return bool(view.opposing)
+    if order.limit_price is None or not view.opposing:
+        return False
+    touch = view.opposing[0].price
+    return (
+        touch <= order.limit_price
+        if order.side is Side.BUY
+        else touch >= order.limit_price
+    )
+
+
 def is_marketable(order: PaperOrder) -> bool:
-    """Whether an order should be treated as taking liquidity."""
+    """Whether the instruction is intrinsically aggressive.
+
+    Price-dependent crossing is handled separately by :func:`would_cross`.
+    """
     if order.order_type is OrderType.MARKET:
         return True
     return order.time_in_force in (TimeInForce.IOC, TimeInForce.FOK)
