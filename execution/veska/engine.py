@@ -34,6 +34,7 @@ from core.models.execution import (
     ExecutionMetrics,
     ExecutionPlanRecord,
     ExecutionPlanStatus,
+    ExecutionRole,
     ExecutionReport,
     ExecutionSnapshot,
     ExecutorCapabilities,
@@ -134,13 +135,15 @@ class Veska:
             if routing.expected_price <= 0:
                 self.plan_failures += 1
                 return None
-            # An exit or hedge leg carries the exact quantity to trade; an
-            # entry leg is sized from the notional RUNE authorised.
-            quantity = (
-                leg.quantity
-                if leg.quantity is not None and leg.quantity > 0
-                else notional / routing.expected_price
-            )
+            # ENTRY is risk-increasing and is always bounded by the notional
+            # RUNE authorised. EXIT/HEDGE may carry an exact quantity because
+            # their job is to neutralise exposure that already exists.
+            if intent.execution_role is ExecutionRole.ENTRY:
+                quantity = notional / routing.expected_price
+            elif leg.quantity is not None and leg.quantity > 0:
+                quantity = leg.quantity
+            else:
+                quantity = notional / routing.expected_price
             if quantity <= 0:
                 continue
             fees = self.settings.venue(leg.venue).fees
@@ -194,10 +197,43 @@ class Veska:
     # -- execution ---------------------------------------------------------
 
     async def execute(self, plan: ExecutionPlan, now_ms: Millis) -> ExecutionReport:
-        # The plan may not have come from build_plan (a replayed or externally
-        # constructed one). Registering here is idempotent by plan id, so a
-        # plan built above is not registered twice.
-        self.registry.register_plan(plan, now_ms)
+        # A plan id names one immutable execution attempt. A build_plan-created
+        # record may exist before submission, but reusing that id for different
+        # instructions must fail closed rather than inherit the old record.
+        existing_plan = self.registry.plan(plan.plan_id)
+        if existing_plan is not None and existing_plan != plan:
+            raise ValueError(
+                f"plan_id {plan.plan_id} is already registered with different instructions"
+            )
+
+        record = self.registry.register_plan(plan, now_ms)
+        resident = self.executor.orders_for_plan(plan.plan_id)
+        if resident:
+            planned_ids = [o.client_order_id for o in plan.orders]
+            resident_ids = [o.client_order_id for o in resident]
+            if (
+                len(resident_ids) != len(planned_ids)
+                or set(resident_ids) != set(planned_ids)
+            ):
+                raise RuntimeError(
+                    f"plan {plan.plan_id} is partially submitted; existing orders "
+                    f"{resident_ids} do not match planned orders {planned_ids}"
+                )
+            if any(note.startswith("submission interrupted") for note in record.notes):
+                raise RuntimeError(
+                    f"plan {plan.plan_id} has orders from an interrupted submission; "
+                    "cancel or reconcile them before retrying"
+                )
+            return ExecutionReport(
+                created_at=now_ms,
+                correlation_id=plan.correlation_id,
+                plan_id=plan.plan_id,
+                intent_id=plan.intent_id,
+                orders=resident,
+                complete=False,
+                notes=["idempotent retry: existing order truth returned"],
+            )
+
         self.registry.set_status(plan.plan_id, ExecutionPlanStatus.SUBMITTING, now_ms)
 
         await self.bus.publish(
@@ -210,7 +246,23 @@ class Veska:
                 payload=plan.to_json_dict(),
             )
         )
-        report = await self.executor.submit(plan, now_ms)
+
+        try:
+            report = await self.executor.submit(plan, now_ms)
+        except Exception:
+            actual_orders = self.executor.orders_for_plan(plan.plan_id)
+            self.registry.attach_orders(
+                plan.plan_id,
+                [o.client_order_id for o in actual_orders],
+                now_ms,
+            )
+            self.refresh_plan(plan.plan_id, now_ms)
+            self.registry.note(
+                plan.plan_id,
+                f"submission interrupted after creating {len(actual_orders)} order(s)",
+                now_ms,
+            )
+            raise
 
         self.registry.attach_orders(
             plan.plan_id, [o.client_order_id for o in report.orders], now_ms

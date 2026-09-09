@@ -103,6 +103,11 @@ class OrderManager:
         client_order_id: str | None = None,
         ttl_ms: int | None = None,
     ) -> PaperOrder:
+        if client_order_id is not None and client_order_id in self.orders:
+            raise ValueError(
+                f"order {client_order_id} already exists; client_order_id is immutable"
+            )
+
         now = self.clock.now_ms()
         order = PaperOrder(
             created_at=now,
@@ -121,6 +126,10 @@ class OrderManager:
         )
         if client_order_id:
             order.client_order_id = client_order_id
+        if order.client_order_id in self.orders:
+            raise ValueError(
+                f"order {order.client_order_id} already exists; client_order_id is immutable"
+            )
         order.history = [(now, OrderStatus.CREATED)]
         self.orders[order.client_order_id] = order
         self.orders_created += 1

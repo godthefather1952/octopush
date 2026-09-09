@@ -178,6 +178,18 @@ class PaperExecutor(Executor):
         orders: list[PaperOrder] = []
         notes: list[str] = []
 
+        seen_ids: set[str] = set()
+        duplicate_ids: set[str] = set()
+        for planned in plan.orders:
+            if planned.client_order_id in seen_ids:
+                duplicate_ids.add(planned.client_order_id)
+            seen_ids.add(planned.client_order_id)
+        if duplicate_ids:
+            duplicates = ", ".join(sorted(duplicate_ids))
+            raise ValueError(
+                f"duplicate client_order_id(s) in plan {plan.plan_id}: {duplicates}"
+            )
+
         for planned in plan.orders:
             order = self.oms.from_plan(
                 planned, plan_id=plan.plan_id, intent_id=plan.intent_id, strategy=plan.strategy
@@ -216,11 +228,17 @@ class PaperExecutor(Executor):
         if order is None or not order.is_live:
             return
         if order.status in (OrderStatus.CREATED, OrderStatus.SUBMITTING):
-            # Not yet acknowledged; the venue has nothing to cancel, so the
-            # order resolves once it arrives.
-            self._pending.setdefault(
+            # A pre-ack cancel is explicit state, not a timing side-channel.
+            # Preserve the original arrival instant and consume the request
+            # deterministically on arrival before the order can work.
+            self.oms.transition(client_order_id, OrderStatus.CANCEL_PENDING)
+            pending = self._pending.setdefault(
                 client_order_id, _Pending(ack_at=now_ms)
-            ).cancel_at = now_ms
+            )
+            pending.cancel_at = now_ms
+            await self._publish_order(
+                order, EventType.PAPER_ORDER_UPDATED, now_ms
+            )
             return
         self.oms.transition(client_order_id, OrderStatus.CANCEL_PENDING)
         pending = self._pending.setdefault(client_order_id, _Pending(ack_at=now_ms))
@@ -257,6 +275,20 @@ class PaperExecutor(Executor):
                 continue
 
             if now_ms < pending.ack_at:
+                continue
+
+            # A cancellation requested before acknowledgement is cancel-on-
+            # arrival. It never enters the working/fill path and therefore
+            # cannot lose the ordinary post-ack cancel/fill race.
+            if (
+                order.status is OrderStatus.CANCEL_PENDING
+                and pending.cancel_at is not None
+                and pending.cancel_at <= pending.ack_at
+            ):
+                self.oms.transition(order.client_order_id, OrderStatus.CANCELLED)
+                await self._publish_order(
+                    order, EventType.PAPER_ORDER_UPDATED, now_ms
+                )
                 continue
 
             if order.status is OrderStatus.SUBMITTING:

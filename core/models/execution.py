@@ -60,9 +60,14 @@ TERMINAL_STATUSES: frozenset[OrderStatus] = frozenset(
 #: Legal order state transitions. ``UNKNOWN`` is reachable from any live state
 #: and can resolve back into any live or terminal state once truth is learned.
 ORDER_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
-    OrderStatus.CREATED: {OrderStatus.SUBMITTING, OrderStatus.REJECTED},
+    OrderStatus.CREATED: {
+        OrderStatus.SUBMITTING,
+        OrderStatus.CANCEL_PENDING,
+        OrderStatus.REJECTED,
+    },
     OrderStatus.SUBMITTING: {
         OrderStatus.ACKNOWLEDGED,
+        OrderStatus.CANCEL_PENDING,
         OrderStatus.REJECTED,
         OrderStatus.UNKNOWN,
     },
