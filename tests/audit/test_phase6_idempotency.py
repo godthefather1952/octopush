@@ -19,7 +19,7 @@ import inspect
 import pytest
 
 from core.models.common import Side, TimeInForce
-from core.models.execution import OrderStatus
+from core.models.execution import ExecutionPlanStatus, OrderStatus
 from tests.audit.veska_fixtures import (
     T0,
     VENUE_A,
@@ -181,8 +181,17 @@ class TestDuplicateClientOrderIdWithinOnePlan:
             plan_id="plan-dupe",
         )
 
-        with pytest.raises(ValueError, match="duplicate client_order_id"):
-            await harness.veska.execute(plan, T0)
+        report = await harness.veska.execute(plan, T0)
+
+        assert report.orders == []
+        assert not report.complete
+        assert any(
+            "DUPLICATE_CLIENT_ORDER_ID" in note for note in report.notes
+        ), report.notes
+
+        record = harness.veska.get_plan(plan.plan_id)
+        assert record is not None
+        assert record.status is ExecutionPlanStatus.FAILED
 
         resident = harness.orders_of("plan-dupe")
         assert resident == [], (
@@ -214,7 +223,7 @@ class TestDuplicateClientOrderIdWithinOnePlan:
         assert harness.oms.get("resident-id") is first
 
     def test_preflight_detects_the_duplicate(self):
-        """The check exists — which is what makes not wiring it a choice."""
+        """The canonical preflight gate catches duplicate identity before mutation."""
         from execution.paper.executor import PAPER_CAPABILITIES
         from execution.veska.preflight import preflight_plan
 
