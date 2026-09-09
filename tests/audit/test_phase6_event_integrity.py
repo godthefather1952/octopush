@@ -160,6 +160,7 @@ class TestEveryStateChangeIsPublished:
         await harness.veska.execute(plan, T0)
         await harness.drain_events()
         fills = await harness.veska.poll(T0 + _latency(harness))
+        await harness.drain_events()
 
         assert fills, "no fill; the publication check below is untested"
         assert len(harness.events_of(EventType.PAPER_FILL)) == len(fills)
@@ -285,6 +286,7 @@ class TestEventTimestamps:
         await harness.drain_events()
         at = T0 + _latency(harness)
         fills = await harness.veska.poll(at)
+        await harness.drain_events()
 
         assert fills
         published = harness.events_of(EventType.PAPER_FILL)
@@ -401,6 +403,7 @@ class TestPayloadIntegrity:
         await harness.veska.execute(plan, T0)
         await harness.drain_events()
         fills = await harness.veska.poll(T0 + _latency(harness))
+        await harness.drain_events()
         assert fills
 
         event = harness.events_of(EventType.PAPER_FILL)[0]
