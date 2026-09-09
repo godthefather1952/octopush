@@ -55,18 +55,17 @@ class TestCreateRejectsIdentityOverwrite:
         guard = source.index("already exists")
         assignment = source.index("self.orders[order.client_order_id] = order")
         assert guard < assignment
-        assert "if order.client_order_id in self.orders" not in source, (
-            "create now guards against a duplicate id; this finding may be "
-            "resolved and its evidence needs re-deriving"
-        )
+        assert "if order.client_order_id in self.orders" in source
 
-    def test_execute_submits_again_even_for_a_known_plan(self):
+    def test_execute_short_circuits_an_exact_retry_before_submission(self):
         from execution.veska.engine import Veska
 
         source = inspect.getsource(Veska.execute)
-        assert "register_plan" in source
-        assert "await self.executor.submit(plan, now_ms)" in source
-        assert "already submitted" not in source
+        resident_guard = source.index("if resident:")
+        submit_call = source.index("await self.executor.submit(plan, now_ms)")
+        assert resident_guard < submit_call
+        assert "idempotent retry: existing order truth returned" in source
+        assert "submission interrupted" in source
 
 
 class TestPlanResubmission:

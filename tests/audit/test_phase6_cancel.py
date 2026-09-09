@@ -318,19 +318,14 @@ class TestTransitionLegality:
         ):
             assert OrderStatus.CANCEL_PENDING in ORDER_TRANSITIONS[working]
 
-    def test_submitting_has_no_direct_cancellation_transition(self):
-        """Record the state-machine fact exposed by CI #53.
-
-        A SUBMITTING order currently has no direct route to CANCEL_PENDING or
-        CANCELLED. That does not excuse the lost cancel; it means a production
-        remediation must either add an explicit transition or retain the
-        request until acknowledgement processing can consume it deterministically.
-        """
+    def test_submitting_can_enter_cancel_pending_but_not_cancelled_directly(self):
+        """Pre-ack cancellation is explicit while terminal resolution waits for arrival."""
         reachable = ORDER_TRANSITIONS[OrderStatus.SUBMITTING]
-        assert OrderStatus.CANCEL_PENDING not in reachable
+        assert OrderStatus.CANCEL_PENDING in reachable
         assert OrderStatus.CANCELLED not in reachable
         assert reachable == {
             OrderStatus.ACKNOWLEDGED,
+            OrderStatus.CANCEL_PENDING,
             OrderStatus.REJECTED,
             OrderStatus.UNKNOWN,
         }
