@@ -21,8 +21,8 @@ from tests.audit.marin_fixtures import (
     build_marin,
     make_unknown,
 )
+from tests.audit.veska_fixtures import T0 as V0
 from tests.audit.veska_fixtures import (
-    T0 as V0,
     build_harness,
     execution_plan,
     market_state,
