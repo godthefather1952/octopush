@@ -69,7 +69,22 @@ tests/unit/test_reconciliation.py were not duplicated unnecessarily.
 
 ## 3. Validation execution evidence
 
-GitHub Actions PR run #100 / run id 34429490752 is attached to this audit branch.
+Codespaces focused Phase 7 audit executed the frozen audit head with live
+PostgreSQL/Redis backends.
+
+Focused result:
+
+- **32 passed**
+- **8 failed**
+- **0 skipped**
+- **0 errors during collection**
+- runtime **0.53s**
+
+One failure was an audit-fixture clock setup error and has been corrected
+without production mutation. Six failures reproduce P7-1 through P7-6 as
+intended. The remaining failure exposed P7-7 below.
+
+GitHub Actions PR run #100 / run id 34429490752 is also attached to this audit branch.
 
 Completed gates:
 
@@ -332,6 +347,53 @@ persistence/event relationship explicit and recoverable.
 
 Blocks Phase 7 freeze: YES.
 
+
+---
+
+### P7-7 — Workflow capture references nonexistent child snapshot IDs
+
+Severity: MEDIUM
+
+Priority: P1
+
+Finding:
+
+`Marin.begin_reconciliation()` captures standard internal execution/account
+snapshots and then attempts to read `snapshot_id` from those child models.
+
+The normal `ExecutionSnapshot` and account snapshot types are event/envelope
+models and do not expose that attribute. Codespaces reproduced:
+
+`AttributeError: 'ExecutionSnapshot' object has no attribute 'snapshot_id'`
+
+Audit invariant:
+
+`test_begin_reconciliation_stops_at_capturing`
+
+Reproduction:
+
+1. attach the repository's normal execution/account reconciliation sources;
+2. call `begin_reconciliation(now_ms)`;
+3. capture succeeds;
+4. run-record attachment dereferences a nonexistent child `snapshot_id`;
+5. the workflow raises before returning its CAPTURING run.
+
+Impact:
+
+The new Phase 7 reconciliation-workflow path cannot successfully begin with the
+platform's standard internal sources. The current orchestrator still uses the
+legacy `run()` path, so this does not break today's periodic paper
+reconciliation, but it blocks startup/manual workflow adoption.
+
+Remediation requirement:
+
+Run records must reference an identifier that the captured child snapshot
+models actually provide (for example their canonical event id), or those
+snapshot models must gain one explicit shared snapshot identity contract.
+Do not introduce parallel ambiguous ids.
+
+Blocks Phase 7 freeze: YES.
+
 ---
 
 ## 5. Policy decision — venue requirement in generic readiness
@@ -429,6 +491,7 @@ behavior findings.
 
 - P7-1 multi-venue truth preservation
 - P7-2 readiness source usability
+- P7-7 workflow snapshot identity contract
 
 Goal:
 
