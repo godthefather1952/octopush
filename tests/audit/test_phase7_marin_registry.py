@@ -13,7 +13,13 @@ from core.models.reconciliation import (
     ResolutionStatus,
     discrepancy_identity,
 )
-from tests.audit.marin_fixtures import T0, build_marin
+from tests.audit.marin_fixtures import (
+    T0,
+    build_marin,
+    empty_account_source,
+    empty_execution_source,
+    venue_source,
+)
 
 
 def mismatch(amount: float = 10.0) -> Mismatch:
@@ -102,6 +108,30 @@ class TestRunLifecycle:
 
         assert record.status is ReconciliationRunStatus.CAPTURING
         assert marin.last_result is None
+
+    def test_begin_reconciliation_attaches_real_snapshot_identities(
+        self, bus, clock, health
+    ):
+        marin = build_marin(bus=bus, clock=clock, health=health)
+        marin.attach_sources(
+            execution=empty_execution_source(),
+            account=empty_account_source(),
+            venues=[venue_source("A"), venue_source("B")],
+        )
+
+        record = marin.begin_reconciliation(T0)
+        snapshot = marin.last_snapshot
+
+        assert snapshot is not None
+        assert snapshot.execution is not None
+        assert snapshot.account is not None
+        assert record.execution_snapshot_id == snapshot.execution.event_id
+        assert record.account_snapshot_id == snapshot.account.snapshot_id
+        assert record.venue_snapshot_ids == [
+            venue.snapshot_id for venue in snapshot.venues
+        ]
+        assert len(record.venue_snapshot_ids) == 2
+        assert record.venue_snapshot_id == record.venue_snapshot_ids[0]
 
     def test_mirror_result_preserves_severity_and_result(self, bus, clock, health):
         marin = build_marin(bus=bus, clock=clock, health=health)
