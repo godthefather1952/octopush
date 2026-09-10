@@ -45,14 +45,15 @@ class TestCaptureHealth:
     def test_capture_uses_supplied_logical_time(self, bus, clock, health):
         marin = build_marin(bus=bus, clock=clock, health=health)
         marin.attach_sources(venues=[venue_source("A")])
-        clock.set(T0 + 999_999)
+        logical_now = clock.now_ms()
+        clock.set(logical_now + 999_999)
 
-        snapshot = marin.capture_snapshot(T0)
+        snapshot = marin.capture_snapshot(logical_now)
 
-        assert snapshot.created_at == T0
+        assert snapshot.created_at == logical_now
         assert snapshot.venue is not None
-        assert snapshot.venue.created_at == T0
-        assert snapshot.sources[0].captured_at == T0
+        assert snapshot.venue.created_at == logical_now
+        assert snapshot.sources[0].captured_at == logical_now
 
 
 class TestMultiVenueTruth:
