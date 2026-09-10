@@ -36,12 +36,7 @@ from core.models.ops import DeltaReport
 
 
 def is_outstanding(status: HedgeRequestStatus) -> bool:
-    """Whether final execution truth for this hedge is unknown.
-
-    True for UNKNOWN, which is the case worth being careful about: an UNKNOWN
-    hedge is not finished and is not known to be working, and treating it as
-    either would be a guess.
-    """
+    """Whether final execution truth for this hedge is unknown."""
     return status not in (
         HedgeRequestStatus.COMPLETE,
         HedgeRequestStatus.CANCELLED,
@@ -50,11 +45,7 @@ def is_outstanding(status: HedgeRequestStatus) -> bool:
 
 
 def is_active(status: HedgeRequestStatus) -> bool:
-    """Whether the hedge is currently known to be working.
-
-    Narrower than :func:`is_outstanding`. UNKNOWN is outstanding but not
-    active — nobody knows that it is working.
-    """
+    """Whether the hedge is currently known to be working."""
     return status in (
         HedgeRequestStatus.SUBMITTING,
         HedgeRequestStatus.WORKING,
@@ -64,23 +55,12 @@ def is_active(status: HedgeRequestStatus) -> bool:
 
 
 def needs_hedge(report: DeltaReport) -> bool:
-    """The condition ``build_hedges`` already applies, written down.
-
-    ``build_hedges`` skips a report that is within tolerance or whose residual
-    is zero. This says the same thing positively. It is not called from the
-    hedging path — the agent evaluates its own condition — so a disagreement
-    here can never change what the platform hedges.
-    """
+    """The condition ``build_hedges`` already applies, written down."""
     return not report.within_tolerance and abs(report.unhedged_delta) > 0
 
 
 def side_for_residual(residual: float) -> Side | None:
-    """Which side closes a residual: long too much sells, short too much buys.
-
-    ``None`` for a zero residual, because there is no side that closes nothing
-    — and returning an arbitrary one would let a caller submit an order to
-    correct an exposure that does not exist.
-    """
+    """Which side closes a residual: long too much sells, short too much buys."""
     if residual > 0:
         return Side.SELL
     if residual < 0:
@@ -92,35 +72,21 @@ def derive_hedge_status(
     plans: list[ExecutionPlanRecord],
     orders: list[OrderSummary] | None = None,
 ) -> HedgeRequestStatus:
-    """What a hedge's status looks like from Phase 6's execution view.
+    """Derive an observational hedge status from Phase 6 execution truth.
 
-    Conservative by construction, and in one direction only: **unresolved
-    beats resolved.** If any plan behind this hedge is UNKNOWN, the hedge is
-    UNKNOWN, whatever the other plans say. A hedge whose venue-side truth is
-    partly unknown has not finished, and the expensive mistake is deciding it
-    has.
-
-    Ordering, most cautious first:
-
-    1. no plans at all              -> PROPOSED (asked for, nothing working yet)
-    2. any plan UNKNOWN             -> UNKNOWN
-    3. any plan still active        -> WORKING, or PARTIALLY_FILLED if
-                                       anything has traded
-    4. every plan terminal:
-         something traded           -> COMPLETE
-         every plan CANCELLED/EXPIRED -> CANCELLED
-         otherwise                  -> FAILED
-
-    **Nothing decides from this.** No cancel, no resubmission, no risk action
-    reads the result; a caller records it. The exact treatment of mixed cases —
-    one plan filled and another cancelled, a partial fill on a cancelled plan —
-    is VALIDATION DEFERRED, and the conservative ordering above is a
-    construction choice rather than a proven rule.
+    UNKNOWN always dominates resolved states. Active plans remain outstanding.
+    For terminal plans, evidence that *something* traded is not sufficient to
+    declare the hedge complete: when order summaries are supplied, every order
+    must be fully filled before COMPLETE is returned. A cancelled or failed
+    plan with only a partial fill therefore keeps its terminal cancellation or
+    failure semantics instead of silently claiming the requested hedge closed.
     """
     if not plans:
         return HedgeRequestStatus.PROPOSED
 
     if any(plan.status is ExecutionPlanStatus.UNKNOWN for plan in plans):
+        return HedgeRequestStatus.UNKNOWN
+    if orders and any(order.status is OrderStatus.UNKNOWN for order in orders):
         return HedgeRequestStatus.UNKNOWN
 
     traded = _anything_traded(plans, orders)
@@ -134,8 +100,16 @@ def derive_hedge_status(
             else HedgeRequestStatus.WORKING
         )
 
-    if traded:
+    if orders:
+        fully_filled = bool(orders) and all(
+            order.quantity > 0 and order.filled_quantity >= order.quantity
+            for order in orders
+        )
+        if fully_filled:
+            return HedgeRequestStatus.COMPLETE
+    elif all(plan.status is ExecutionPlanStatus.COMPLETE for plan in plans):
         return HedgeRequestStatus.COMPLETE
+
     if all(
         plan.status in (ExecutionPlanStatus.CANCELLED, ExecutionPlanStatus.EXPIRED)
         for plan in plans
@@ -147,12 +121,7 @@ def derive_hedge_status(
 def _anything_traded(
     plans: list[ExecutionPlanRecord], orders: list[OrderSummary] | None
 ) -> bool:
-    """Whether any quantity is known to have executed.
-
-    Order summaries answer this directly when supplied. Without them the plan
-    status is the only evidence available, and it is read narrowly: only
-    PARTIALLY_FILLED and COMPLETE assert that something traded.
-    """
+    """Whether any quantity is known to have executed."""
     if orders:
         return any(order.filled_quantity > 0 for order in orders)
     return any(
@@ -163,12 +132,7 @@ def _anything_traded(
 
 
 def filled_notional(orders: list[OrderSummary]) -> float:
-    """Quote notional actually executed across a hedge's orders.
-
-    Uses each order's own average price, which is what it traded at. An order
-    with no average price contributes nothing rather than being valued at a
-    mark: a hedge's fill value is what it paid, not what it would be worth now.
-    """
+    """Quote notional actually executed across a hedge's orders."""
     total = 0.0
     for order in orders:
         if order.average_price is None:
@@ -178,11 +142,7 @@ def filled_notional(orders: list[OrderSummary]) -> float:
 
 
 def order_is_unresolved(status: OrderStatus) -> bool:
-    """Whether one order's venue-side truth is unknown.
-
-    A thin restatement of the execution vocabulary, here so hedging code can
-    ask the question without importing three enums to do it.
-    """
+    """Whether one order's venue-side truth is unknown."""
     return status is OrderStatus.UNKNOWN
 
 
