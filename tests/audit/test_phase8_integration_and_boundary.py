@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
 from pathlib import Path
 
@@ -23,9 +24,11 @@ from execution.gateway import VenueOrderSnapshot as GatewayOrder
 
 class TestTickIntegration:
     def test_source_preserves_canonical_phase_order(self):
+        # Every call passes the tick's logical instant alongside the phase, so
+        # the phase name is followed by a comma rather than a closing paren.
         source = inspect.getsource(Orchestrator._tick_body)
         positions = [
-            source.index(f"enter_phase(OrchestrationPhase.{phase})")
+            source.index(f"enter_phase(OrchestrationPhase.{phase}")
             for phase in ("OBSERVE", "SETTLE", "MEASURE", "PROTECT", "MANAGE", "SEEK")
         ]
         assert positions == sorted(positions)
@@ -105,14 +108,35 @@ class TestLayering:
 
 class TestObservabilityOnlyBoundary:
     def test_coordination_registry_is_not_used_in_a_decision_condition(self):
-        source = inspect.getsource(Orchestrator)
-        forbidden = (
-            "if self.coordination",
-            "if not self.coordination",
-            "while self.coordination",
-            "return self.coordination",
-        )
-        assert not any(token in source for token in forbidden)
+        """The registry may be written to and read out; it may not be branched on.
+
+        Checked over the syntax tree rather than over substrings, because the
+        substring form cannot tell a branch from a read accessor. ``return
+        self.coordination.recent_ticks(limit)`` in a public getter is the
+        opposite of a decision — it is how a display reads the record — while
+        ``if self.coordination...`` anywhere is the thing this forbids.
+        """
+        tree = ast.parse(inspect.getsource(Orchestrator))
+
+        def reads_the_registry(node: ast.AST) -> bool:
+            return any(
+                isinstance(child, ast.Attribute)
+                and child.attr == "coordination"
+                and isinstance(child.value, ast.Name)
+                and child.value.id == "self"
+                for child in ast.walk(node)
+            )
+
+        conditions: list[ast.AST] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If | ast.While | ast.IfExp | ast.Assert):
+                conditions.append(node.test)
+            elif isinstance(node, ast.ListComp | ast.SetComp | ast.GeneratorExp):
+                conditions.extend(
+                    test for generator in node.generators for test in generator.ifs
+                )
+
+        assert not any(reads_the_registry(test) for test in conditions)
 
     def test_phase8_files_add_no_private_execution_or_credentials(self):
         paths = (
@@ -127,12 +151,32 @@ class TestObservabilityOnlyBoundary:
             "place_order(",
             "submit_order(",
             "cancel_order(",
-            "requests.",
-            "httpx.",
-            "aiohttp.",
         )
-        joined = "\n".join(path.read_text(encoding="utf-8") for path in paths)
-        assert not any(token in joined for token in forbidden)
+        # Network clients are checked as imports, not as substrings. The
+        # registry's own ``consensus_requests`` dict makes a bare "requests."
+        # substring match a false positive on ordinary attribute access, and a
+        # guard that fires on its own bookkeeping cannot catch a real one.
+        forbidden_modules = {
+            "requests",
+            "httpx",
+            "aiohttp",
+            "urllib",
+            "urllib3",
+            "http",
+            "socket",
+            "websockets",
+        }
+        for path in paths:
+            text = path.read_text(encoding="utf-8")
+            assert not any(token in text for token in forbidden), path
+            for node in ast.walk(ast.parse(text)):
+                if isinstance(node, ast.Import):
+                    imported = {alias.name.split(".")[0] for alias in node.names}
+                elif isinstance(node, ast.ImportFrom):
+                    imported = {(node.module or "").split(".")[0]}
+                else:
+                    continue
+                assert not imported.intersection(forbidden_modules), path
 
     def test_agent_endpoint_descriptor_is_not_a_transport(self):
         fields = set(AgentEndpointDescriptor.model_fields)
