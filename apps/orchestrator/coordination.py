@@ -220,13 +220,23 @@ class CoordinationRegistry:
         ok: bool = True,
         detail: str = "",
     ) -> OrchestrationPhaseRecord | None:
-        """Close one phase. Returns ``None`` when it was never opened."""
+        """Close one phase. Returns ``None`` when it was never opened.
+
+        The first close wins. A phase that already carries a completion
+        instant is finished history: closing it again returns the record it
+        already has without touching the instant, the verdict or the detail.
+        A tick may legitimately re-enter a phase, and letting the second close
+        overwrite the first would make the record claim the phase succeeded at
+        an instant it did not, and hide whatever the first close recorded.
+        """
         record = self._tick(tick_id)
         if record is None:
             return None
         phase_record = record.phase_record(phase)
         if phase_record is None:
             return None
+        if phase_record.completed_at is not None:
+            return phase_record
         phase_record.completed_at = now_ms
         phase_record.ok = ok
         if detail:
@@ -242,11 +252,16 @@ class CoordinationRegistry:
 
         A tick already marked FAILED stays FAILED. Nothing here may convert a
         recorded failure into a success.
+
+        A tick already marked COMPLETE is left exactly as it was, and
+        ``ticks_completed`` does not move. The same terminal fact arriving
+        twice is one tick, not two: a lifetime counter that grew on a repeated
+        close would report a session that ran more ticks than it did.
         """
         record = self._tick(tick_id)
         if record is None:
             return None
-        if record.status is OrchestrationTickStatus.FAILED:
+        if record.is_terminal:
             return record
         record.status = OrchestrationTickStatus.COMPLETE
         record.current_phase = OrchestrationPhase.IDLE
@@ -268,10 +283,19 @@ class CoordinationRegistry:
         what it caught: same exception, same type, no retry and no
         translation. A framework that turned a raised tick into a logged note
         would be making a recovery decision nobody asked it to make.
+
+        A tick that already reached a terminal state keeps it, with its first
+        error and its first completion instant. Recording the same failure
+        twice is one failed tick, and a second call cannot rewrite the first
+        error into a later one — the first is the one that ended the tick.
+        A tick already COMPLETE stays COMPLETE for the same reason: history
+        that can be overwritten afterwards is not history.
         """
         record = self._tick(tick_id)
         if record is None:
             return None
+        if record.is_terminal:
+            return record
         record.status = OrchestrationTickStatus.FAILED
         record.completed_at = now_ms
         record.updated_at = now_ms
@@ -442,6 +466,12 @@ class CoordinationRegistry:
         if record is None:
             return None
 
+        #: Captured before any mutation below, because the lifetime counter
+        #: counts transitions into TIMED_OUT rather than observations of it.
+        #: A wait can be reported more than once — re-entered, re-observed —
+        #: and each report is the same timeout, not another one.
+        was_timed_out = record.status is ConsensusRequestStatus.TIMED_OUT
+
         responded_list = sorted(responded or [])
         if required is not None:
             record.required_agents = sorted(required)
@@ -462,7 +492,8 @@ class CoordinationRegistry:
         is_complete = complete if complete is not None else not record.missing_agents
         if timed_out and not is_complete:
             record.status = ConsensusRequestStatus.TIMED_OUT
-            self.requests_timed_out += 1
+            if not was_timed_out:
+                self.requests_timed_out += 1
         else:
             record.status = ConsensusRequestStatus.READY
         self._persist_request(record)
@@ -544,10 +575,16 @@ class CoordinationRegistry:
                 self.continuation_blocked += 1
 
         if request is not None:
+            was_completed = request.status is ConsensusRequestStatus.COMPLETED
             request.consensus_evaluation_id = record.evaluation_id
             request.status = ConsensusRequestStatus.COMPLETED
             request.updated_at = now_ms
-            self.requests_completed += 1
+            # Transitions, not observations — as with the timeout counter
+            # above. A second evaluation against the same open round replaces
+            # which evaluation the round points at; it does not mean the
+            # platform asked and completed two rounds.
+            if not was_completed:
+                self.requests_completed += 1
             self._persist_request(request)
 
         if opportunity_id is not None:
