@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from agents.okapi.registry import HedgeRegistry
 from agents.okapi.targets import HedgeTargetRegistry
-from core.models.common import Side
+from core.models.common import DataQuality, Side
 from core.models.hedging import HedgeOutcomeSummary, HedgeRequestStatus
 from tests.audit.phase9_fixtures import (
     CapturingHedgeStore,
@@ -15,7 +15,6 @@ from tests.audit.phase9_fixtures import (
     make_portfolio,
 )
 from tests.conftest import START_MS
-from core.models.common import DataQuality
 
 
 def test_register_request_is_idempotent_by_hedge_intent_id():
