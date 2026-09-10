@@ -109,19 +109,27 @@ def venue_source(
     )
 
 
-def empty_execution_source(*, available: bool = True) -> StaticSource:
+def empty_execution_source(
+    *, available: bool = True, complete: bool | None = None
+) -> StaticSource:
     from core.models.execution import ExecutionSnapshot
 
+    if complete is None:
+        complete = available
     return StaticSource(
         kind=ReconciliationSourceKind.EXECUTION,
         name="execution",
         factory=lambda now: ExecutionSnapshot(created_at=now),
         available=available,
-        complete=available,
+        complete=complete,
     )
 
 
-def empty_account_source(*, available: bool = True) -> StaticSource:
+def empty_account_source(
+    *, available: bool = True, complete: bool | None = None
+) -> StaticSource:
+    if complete is None:
+        complete = available
     return StaticSource(
         kind=ReconciliationSourceKind.ACCOUNT,
         name="account",
@@ -133,7 +141,7 @@ def empty_account_source(*, available: bool = True) -> StaticSource:
             peak_equity=100_000.0,
         ),
         available=available,
-        complete=available,
+        complete=complete,
     )
 
 
