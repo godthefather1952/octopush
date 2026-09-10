@@ -126,7 +126,7 @@ class Marin:
     venue_sources: list[ReconciliationSource] = field(default_factory=list)
     #: Reconstruction from durable events. ``None``; no implementation exists.
     recorded_source: ReconciliationSource | None = None
-    #: The most recent captured bundle, for inspection.
+    #: The most recent captured bundle, for inspection and readiness evidence.
     last_snapshot: ReconciliationSnapshot | None = None
 
     def __post_init__(self) -> None:
@@ -337,6 +337,21 @@ class Marin:
             configured.append(self.recorded_source)
         return configured
 
+    def _latest_source_health(
+        self, source: ReconciliationSource | None
+    ) -> SourceHealth | None:
+        """Health for this exact configured source in the latest capture."""
+        if source is None or self.last_snapshot is None:
+            return None
+        return next(
+            (
+                health
+                for health in self.last_snapshot.sources
+                if health.kind is source.kind and health.name == source.name
+            ),
+            None,
+        )
+
     def capture_snapshot(self, now_ms: Millis) -> ReconciliationSnapshot:
         """Capture every configured source into one bundle at ``now_ms``.
 
@@ -351,7 +366,7 @@ class Marin:
         """
         execution: ExecutionSnapshot | None = None
         account: AccountSnapshot | None = None
-        venue: VenueTruthSnapshot | None = None
+        venues: list[VenueTruthSnapshot] = []
         recorded: RecordedTruthSnapshot | None = None
         healths: list[SourceHealth] = []
         notes: list[str] = []
@@ -382,10 +397,7 @@ class Marin:
             elif source.kind is ReconciliationSourceKind.ACCOUNT:
                 account = capture.snapshot
             elif source.kind is ReconciliationSourceKind.VENUE:
-                # One venue snapshot is held for now. A multi-venue platform
-                # needs a list here, which is a shape question a later pass
-                # answers once a venue source actually exists.
-                venue = capture.snapshot
+                venues.append(capture.snapshot)
             elif source.kind is ReconciliationSourceKind.RECORDED:
                 recorded = capture.snapshot
 
@@ -393,7 +405,7 @@ class Marin:
             created_at=now_ms,
             execution=execution,
             account=account,
-            venue=venue,
+            venues=venues,
             recorded=recorded,
             sources=healths,
             notes=notes,
@@ -432,14 +444,12 @@ class Marin:
             now_ms,
             snapshot_id=snapshot.snapshot_id,
             execution_snapshot_id=(
-                snapshot.execution.snapshot_id if snapshot.execution else None
+                snapshot.execution.event_id if snapshot.execution else None
             ),
             account_snapshot_id=(
                 snapshot.account.snapshot_id if snapshot.account else None
             ),
-            venue_snapshot_id=(
-                snapshot.venue.snapshot_id if snapshot.venue else None
-            ),
+            venue_snapshot_ids=[venue.snapshot_id for venue in snapshot.venues],
             recorded_snapshot_id=(
                 snapshot.recorded.snapshot_id if snapshot.recorded else None
             ),
@@ -612,11 +622,52 @@ class Marin:
         open_warning = self.registry.open_warnings()
         unresolved = len(self.oms.unknown_orders())
 
+        execution_health = self._latest_source_health(self.execution_source)
+        account_health = self._latest_source_health(self.account_source)
+        recorded_health = self._latest_source_health(self.recorded_source)
+
+        execution_available = bool(
+            execution_health is not None
+            and execution_health.usable
+            and self.last_snapshot is not None
+            and self.last_snapshot.execution is not None
+        )
+        account_available = bool(
+            account_health is not None
+            and account_health.usable
+            and self.last_snapshot is not None
+            and self.last_snapshot.account is not None
+        )
+        recorded_available = bool(
+            recorded_health is not None
+            and recorded_health.usable
+            and self.last_snapshot is not None
+            and self.last_snapshot.recorded is not None
+        )
+        venue_available = sum(
+            1
+            for source in self.venue_sources
+            if (
+                (health := self._latest_source_health(source)) is not None
+                and health.usable
+            )
+        )
+
         reasons: list[str] = []
         if self.execution_source is None:
             reasons.append("NO_EXECUTION_SOURCE")
+        elif execution_health is None:
+            reasons.append("NO_EXECUTION_CAPTURE")
+        elif not execution_available:
+            reasons.append("EXECUTION_SOURCE_UNUSABLE")
+
         if self.account_source is None:
             reasons.append("NO_ACCOUNT_SOURCE")
+        elif account_health is None:
+            reasons.append("NO_ACCOUNT_CAPTURE")
+        elif not account_available:
+            reasons.append("ACCOUNT_SOURCE_UNUSABLE")
+
         if self.last_result is None:
             reasons.append("NO_RECONCILIATION_YET")
         elif not self.last_result.ok:
@@ -635,10 +686,10 @@ class Marin:
             open_critical=len(open_critical),
             open_warning=len(open_warning),
             unresolved_orders=unresolved,
-            execution_source_available=self.execution_source is not None,
-            account_source_available=self.account_source is not None,
-            venue_sources_available=len(self.venue_sources),
-            recorded_source_available=self.recorded_source is not None,
+            execution_source_available=execution_available,
+            account_source_available=account_available,
+            venue_sources_available=venue_available,
+            recorded_source_available=recorded_available,
             reason_codes=reasons,
         )
 
