@@ -26,6 +26,9 @@ class RecordingCoordinationStore(CoordinationStore):
     """Write-through seam that can fail on one exact persistence call."""
 
     fail_on: int | None = None
+    #: Raise on every write, not just one. Models a backend that is down for
+    #: the whole of a tick rather than flaking once.
+    fail_always: bool = False
     calls: int = 0
     ticks: list[OrchestrationTickRecord] = field(default_factory=list)
     requests: list[ConsensusRequestRecord] = field(default_factory=list)
@@ -34,7 +37,7 @@ class RecordingCoordinationStore(CoordinationStore):
 
     def _before_write(self) -> None:
         self.calls += 1
-        if self.fail_on is not None and self.calls == self.fail_on:
+        if self.fail_always or (self.fail_on is not None and self.calls == self.fail_on):
             raise RuntimeError("audit coordination-store failure")
 
     def put_tick(self, record: OrchestrationTickRecord) -> None:
