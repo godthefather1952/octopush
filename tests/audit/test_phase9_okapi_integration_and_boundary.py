@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import ast
 import inspect
-from pathlib import Path
-from types import SimpleNamespace
+import pathlib
+import types
 
 from apps.orchestrator.orchestrator import Orchestrator
 from core.models.hedging import HedgeRequestStatus
@@ -13,10 +13,10 @@ from tests.audit.phase9_fixtures import make_intent
 from tests.conftest import START_MS
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
-def _imports(path: Path) -> set[str]:
+def _imports(path: pathlib.Path) -> set[str]:
     tree = ast.parse(path.read_text())
     found: set[str] = set()
     for node in ast.walk(tree):
@@ -41,7 +41,9 @@ def test_okapi_runtime_contains_no_network_or_exchange_client_imports():
     }
     for path in (ROOT / "agents" / "okapi").glob("*.py"):
         roots = {name.split(".")[0] for name in _imports(path)}
-        assert roots.isdisjoint(forbidden), f"{path} imports network/exchange client: {roots & forbidden}"
+        assert roots.isdisjoint(forbidden), (
+            f"{path} imports network/exchange client: {roots & forbidden}"
+        )
 
 
 def test_core_hedging_models_do_not_import_outward_layers():
@@ -62,12 +64,12 @@ def test_orchestrator_hedge_decision_does_not_read_hedge_registry():
 def test_orchestrator_linkage_records_only_downstream_identifiers(platform):
     hedge = make_intent(hedge_id="hdg-linked")
     record = platform.okapi.hedge_registry.register_request(hedge, START_MS)
-    trade_intent = SimpleNamespace(intent_id="trade-intent-1")
-    plan = SimpleNamespace(plan_id="plan-1")
-    report = SimpleNamespace(
+    trade_intent = types.SimpleNamespace(intent_id="trade-intent-1")
+    plan = types.SimpleNamespace(plan_id="plan-1")
+    report = types.SimpleNamespace(
         orders=[
-            SimpleNamespace(client_order_id="order-1"),
-            SimpleNamespace(client_order_id="order-2"),
+            types.SimpleNamespace(client_order_id="order-1"),
+            types.SimpleNamespace(client_order_id="order-2"),
         ]
     )
 
@@ -86,9 +88,11 @@ def test_orchestrator_linkage_records_only_downstream_identifiers(platform):
 
 def test_missing_hedge_registry_record_cannot_break_linkage(platform):
     hedge = make_intent(hedge_id="hdg-not-registered")
-    trade_intent = SimpleNamespace(intent_id="trade-intent-1")
-    plan = SimpleNamespace(plan_id="plan-1")
-    report = SimpleNamespace(orders=[SimpleNamespace(client_order_id="order-1")])
+    trade_intent = types.SimpleNamespace(intent_id="trade-intent-1")
+    plan = types.SimpleNamespace(plan_id="plan-1")
+    report = types.SimpleNamespace(
+        orders=[types.SimpleNamespace(client_order_id="order-1")]
+    )
 
     platform.orchestrator._link_hedge(
         hedge, trade_intent, plan, report, START_MS + 1
@@ -116,4 +120,6 @@ def test_phase9_files_do_not_define_live_execution_mode_or_credentials():
     for path in paths:
         text = path.read_text().lower()
         for token in forbidden_tokens:
-            assert token not in text, f"{path} contains forbidden Phase 9 live token {token}"
+            assert token not in text, (
+                f"{path} contains forbidden Phase 9 live token {token}"
+            )
