@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
-import ast
-import inspect
-import pathlib
-import types
-
-from core.models.hedging import HedgeRequestStatus
-
-
-ROOT = pathlib.Path(__file__).resolve().parents[2]
 START_MS = 1_788_000_000_000
 
 
-def _imports(path: pathlib.Path) -> set[str]:
+def _root():
+    import pathlib
+
+    return pathlib.Path(__file__).resolve().parents[2]
+
+
+def _imports(path) -> set[str]:
+    import ast
+
     tree = ast.parse(path.read_text())
     found: set[str] = set()
     for node in ast.walk(tree):
@@ -37,7 +36,7 @@ def test_okapi_runtime_contains_no_network_or_exchange_client_imports():
         "coinbase",
         "kraken",
     }
-    for path in (ROOT / "agents" / "okapi").glob("*.py"):
+    for path in (_root() / "agents" / "okapi").glob("*.py"):
         roots = {name.split(".")[0] for name in _imports(path)}
         assert roots.isdisjoint(forbidden), (
             f"{path} imports network/exchange client: {roots & forbidden}"
@@ -45,13 +44,15 @@ def test_okapi_runtime_contains_no_network_or_exchange_client_imports():
 
 
 def test_core_hedging_models_do_not_import_outward_layers():
-    imports = _imports(ROOT / "core" / "models" / "hedging.py")
+    imports = _imports(_root() / "core" / "models" / "hedging.py")
     forbidden_prefixes = ("apps.", "agents.", "execution.", "venues.", "risk.")
     offending = sorted(name for name in imports if name.startswith(forbidden_prefixes))
     assert offending == []
 
 
 def test_orchestrator_hedge_decision_does_not_read_hedge_registry():
+    import inspect
+
     from apps.orchestrator.orchestrator import Orchestrator
 
     source = inspect.getsource(Orchestrator._hedge)
@@ -62,6 +63,9 @@ def test_orchestrator_hedge_decision_does_not_read_hedge_registry():
 
 
 def test_orchestrator_linkage_records_only_downstream_identifiers(platform):
+    import types
+
+    from core.models.hedging import HedgeRequestStatus
     from tests.audit.phase9_fixtures import make_intent
 
     hedge = make_intent(hedge_id="hdg-linked")
@@ -89,6 +93,8 @@ def test_orchestrator_linkage_records_only_downstream_identifiers(platform):
 
 
 def test_missing_hedge_registry_record_cannot_break_linkage(platform):
+    import types
+
     from tests.audit.phase9_fixtures import make_intent
 
     hedge = make_intent(hedge_id="hdg-not-registered")
@@ -107,11 +113,11 @@ def test_missing_hedge_registry_record_cannot_break_linkage(platform):
 
 def test_phase9_files_do_not_define_live_execution_mode_or_credentials():
     paths = [
-        ROOT / "agents" / "okapi" / "agent.py",
-        ROOT / "agents" / "okapi" / "policy.py",
-        ROOT / "agents" / "okapi" / "registry.py",
-        ROOT / "agents" / "okapi" / "targets.py",
-        ROOT / "core" / "models" / "hedging.py",
+        _root() / "agents" / "okapi" / "agent.py",
+        _root() / "agents" / "okapi" / "policy.py",
+        _root() / "agents" / "okapi" / "registry.py",
+        _root() / "agents" / "okapi" / "targets.py",
+        _root() / "core" / "models" / "hedging.py",
     ]
     forbidden_tokens = (
         "place_order",
