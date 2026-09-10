@@ -827,9 +827,10 @@ class StartupReconciliationRequest(Envelope):
 
 
 __all__ = [
+    "CLOSED_DISCREPANCY_STATUSES",
+    "RUN_TERMINAL_STATUSES",
     "AccountSnapshot",
     "ArchivedReconciliationRuns",
-    "CLOSED_DISCREPANCY_STATUSES",
     "DiscrepancyEntityType",
     "DiscrepancyStatus",
     "ReconciliationDiscrepancy",
@@ -844,7 +845,6 @@ __all__ = [
     "RecordedTruthSnapshot",
     "ResolutionAction",
     "ResolutionStatus",
-    "RUN_TERMINAL_STATUSES",
     "SourceAuthority",
     "SourceHealth",
     "StartupReconciliationRequest",
