@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import pytest
 
+from agents.marin import Marin
 from agents.marin.policy import is_resolvable_automatically, suggested_action
+from core.models.common import TimeInForce
 from core.models.execution import OrderStatus
 from core.models.ops import MismatchKind, Severity
 from core.models.reconciliation import (
@@ -18,6 +20,15 @@ from tests.audit.marin_fixtures import (
     ResolutionVeska,
     build_marin,
     make_unknown,
+)
+from tests.audit.veska_fixtures import (
+    T0 as V0,
+    build_harness,
+    execution_plan,
+    market_state,
+    planned_order,
+    price_levels,
+    venue_state,
 )
 
 
@@ -113,18 +124,6 @@ class TestResolutionAuthority:
 class TestStatusOnlyFilledResolution:
     async def test_filled_resolution_requires_fill_economics(self):
         """H7-45: FILLED cannot be established by status-only evidence."""
-        from agents.marin import Marin
-        from core.models.common import TimeInForce
-        from tests.audit.veska_fixtures import (
-            T0 as V0,
-            build_harness,
-            execution_plan,
-            market_state,
-            planned_order,
-            price_levels,
-            venue_state,
-        )
-
         harness = build_harness()
         harness.update_market(
             market_state(
