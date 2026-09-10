@@ -364,6 +364,13 @@ def consensus_evaluation_from_result(
     ``continuation_allowed`` rather than derived from ``agreement`` and a
     threshold. Deriving it would be re-deciding, and a record that re-decides
     can disagree with the decision it is recording.
+
+    The nested models are deep-copied rather than referenced. A contribution
+    or an opinion the caller still holds is a live object: keeping the same
+    instance would let a value recorded at instant T change at instant T+1,
+    and a history that moves after the fact cannot be replayed against or
+    audited. The agent-id collections need only a fresh list, since the ids
+    themselves are immutable.
     """
     return ConsensusEvaluationRecord(
         request_id=request_id,
@@ -372,8 +379,11 @@ def consensus_evaluation_from_result(
         created_at=now_ms,
         symbol=result.symbol,
         strategy=result.strategy,
-        opinion_refs=list(opinion_refs or []),
-        contributions=list(result.contributions),
+        opinion_refs=[ref.model_copy(deep=True) for ref in opinion_refs or []],
+        contributions=[
+            contribution.model_copy(deep=True)
+            for contribution in result.contributions
+        ],
         required_agents=list(required_agents or []),
         missing_agents=list(result.missing_agents),
         degraded_agents=list(result.degraded_agents),

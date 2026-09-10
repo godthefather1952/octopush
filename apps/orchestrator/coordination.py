@@ -876,34 +876,41 @@ class CoordinationRegistry:
         Dropping any of those is how a platform decides a question stopped
         existing because it stopped tracking the answer.
 
-        Returns the number of tick records released.
+        The two retentions are independent. Ticks and traces have unrelated
+        lifetimes — a trace outlives the tick that opened it, and an
+        opportunity can close on a tick that is still running — so asking for
+        closed traces to be released must not depend on whether a tick also
+        happened to be evictable. Each request is evaluated on its own.
+
+        Returns the number of tick records released. Traces released are not
+        counted in that number; the return value has always meant ticks.
         """
-        if keep_ticks is None:
-            return 0
-        if keep_ticks < 0:
-            raise ValueError("keep_ticks may not be negative")
+        released = 0
 
-        eligible = [
-            tick_id
-            for tick_id in self._tick_order
-            if tick_id != self.current_tick_id
-            and (record := self.ticks.get(tick_id)) is not None
-            and record.is_terminal
-        ]
-        excess = len(eligible) - keep_ticks
-        if excess <= 0:
-            return 0
+        if keep_ticks is not None:
+            if keep_ticks < 0:
+                raise ValueError("keep_ticks may not be negative")
 
-        doomed = eligible[:excess]
-        for tick_id in doomed:
-            self.ticks.pop(tick_id, None)
-        self._tick_order = [
-            tick_id for tick_id in self._tick_order if tick_id in self.ticks
-        ]
+            eligible = [
+                tick_id
+                for tick_id in self._tick_order
+                if tick_id != self.current_tick_id
+                and (record := self.ticks.get(tick_id)) is not None
+                and record.is_terminal
+            ]
+            excess = len(eligible) - keep_ticks
+            if excess > 0:
+                doomed = eligible[:excess]
+                for tick_id in doomed:
+                    self.ticks.pop(tick_id, None)
+                self._tick_order = [
+                    tick_id for tick_id in self._tick_order if tick_id in self.ticks
+                ]
+                released = len(doomed)
 
         if not keep_open_traces:
             self._release_closed_traces()
-        return len(doomed)
+        return released
 
     def _release_closed_traces(self) -> None:
         """Release traces whose opportunity is closed or rejected.

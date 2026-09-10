@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import pytest
 
+from apps.orchestrator.agent_directory import AgentDirectory
 from apps.orchestrator.coordination import CoordinationRegistry
 from core.models.common import AgentId
+from core.models.opportunity import StrategyState
 from core.models.orchestration import (
+    AgentCadence,
+    AgentSubjectScope,
     ConsensusPurpose,
     ConsensusRequestStatus,
     OrchestrationPhase,
@@ -22,6 +26,7 @@ from tests.audit.phase8_fixtures import (
     T0,
     RecordingCoordinationStore,
     consensus_result,
+    opinion_reference,
 )
 
 
@@ -361,3 +366,262 @@ class TestP8_4TimeoutCounterCountsTransitions:
             )
 
         assert registry.requests_completed == 1
+
+
+class TestP8_5ConsensusSnapshotsAreDetached:
+    def test_a_recorded_contribution_does_not_follow_the_live_one(self):
+        registry = CoordinationRegistry()
+        result = consensus_result()
+        record = registry.record_consensus(
+            result, T0, purpose=ConsensusPurpose.ENTRY, allowed=True
+        )
+
+        live = result.contributions[0]
+        recorded = record.contributions[0]
+        assert recorded is not live
+        live.signal = -0.99
+        live.confidence = 0.01
+        assert recorded.signal == 0.8
+        assert recorded.confidence == 0.9
+
+    def test_a_recorded_opinion_reference_does_not_follow_the_live_one(self):
+        registry = CoordinationRegistry()
+        refs = [opinion_reference()]
+        record = registry.record_consensus(
+            consensus_result(),
+            T0,
+            purpose=ConsensusPurpose.ENTRY,
+            opinion_refs=refs,
+            allowed=True,
+        )
+
+        assert record.opinion_refs[0] is not refs[0]
+        refs[0].signal = -0.5
+        assert record.opinion_refs[0].signal == 0.8
+
+    def test_agent_collections_are_detached_from_the_caller(self):
+        registry = CoordinationRegistry()
+        required = [AgentId.TIDAL, AgentId.NORO]
+        record = registry.record_consensus(
+            consensus_result(),
+            T0,
+            purpose=ConsensusPurpose.ENTRY,
+            required_agents=required,
+            allowed=True,
+        )
+
+        required.append(AgentId.ZEPHR)
+        assert record.required_agents == [AgentId.TIDAL, AgentId.NORO]
+
+    def test_the_engines_answer_is_copied_not_recomputed(self):
+        """Detachment must not have turned the record into a second decision."""
+        registry = CoordinationRegistry()
+        result = consensus_result(score=0.11, agreement=0.12)
+
+        record = registry.record_consensus(
+            result,
+            T0,
+            purpose=ConsensusPurpose.ENTRY,
+            entry_threshold=0.99,
+            allowed=True,
+        )
+
+        assert record.score == 0.11
+        assert record.agreement == 0.12
+        assert record.allowed is True
+
+    def test_incomplete_consensus_still_preserves_an_unset_verdict(self):
+        registry = CoordinationRegistry()
+        record = registry.record_consensus(
+            consensus_result(complete=False),
+            T0,
+            purpose=ConsensusPurpose.ENTRY,
+            allowed=None,
+        )
+        assert record.complete is False
+        assert record.allowed is None
+
+
+class TestP8_6DirectorySnapshotsAreDetached:
+    def _directory(self) -> AgentDirectory:
+        directory = AgentDirectory()
+        directory.register(
+            AgentId.TIDAL,
+            service="tidal",
+            version="1.0.0",
+            scope=AgentSubjectScope.OPPORTUNITY,
+            cadence=AgentCadence.FAST,
+            required_by_default=True,
+            weight=1.4,
+        )
+        return directory
+
+    def test_a_snapshot_does_not_follow_a_later_registration_change(self):
+        directory = self._directory()
+        snapshot = directory.snapshot(T0)
+
+        directory.register(AgentId.TIDAL, service="tidal", version="9.9.9")
+
+        assert snapshot.agents[0].version == "1.0.0"
+
+    def test_mutating_what_the_directory_returned_never_reaches_it(self):
+        directory = self._directory()
+        snapshot = directory.snapshot(T0)
+        handed_out = directory.get(AgentId.TIDAL)
+
+        assert handed_out is not None
+        assert snapshot.agents[0] is not handed_out
+        handed_out.version = "rewritten"
+        handed_out.weight = 99.0
+
+        again = directory.get(AgentId.TIDAL)
+        assert again is not None
+        assert again.version == "1.0.0"
+        assert again.weight == 1.4
+        assert snapshot.agents[0].version == "1.0.0"
+
+    def test_a_descriptor_registered_from_outside_is_copied_in(self):
+        directory = self._directory()
+        outside = directory.get(AgentId.TIDAL)
+        assert outside is not None
+        directory.register_descriptor(outside)
+
+        outside.version = "rewritten"
+
+        held = directory.get(AgentId.TIDAL)
+        assert held is not None
+        assert held.version == "1.0.0"
+
+    def test_mutating_a_snapshot_does_not_reach_the_directory(self):
+        directory = self._directory()
+        snapshot = directory.snapshot(T0)
+
+        snapshot.agents[0].version = "tampered"
+
+        live = directory.get(AgentId.TIDAL)
+        assert live is not None
+        assert live.version == "1.0.0"
+
+    def test_query_results_are_detached_from_the_directory(self):
+        directory = self._directory()
+        listed = directory.all()
+        required = directory.required()
+        by_scope = directory.by_scope(AgentSubjectScope.OPPORTUNITY)
+
+        listed[0].version = "a"
+        required[0].version = "b"
+        by_scope[0].version = "c"
+
+        live = directory.get(AgentId.TIDAL)
+        assert live is not None
+        assert live.version == "1.0.0"
+
+    def test_the_authoritative_required_list_is_mirrored_exactly(self):
+        directory = self._directory()
+        snapshot = directory.snapshot(T0, required_agents=[AgentId.NORO, AgentId.ZEPHR])
+        assert snapshot.required_agents == [AgentId.NORO, AgentId.ZEPHR]
+        assert snapshot.created_at == T0
+
+
+class TestP8_7ClosedTraceRetention:
+    def test_a_closed_trace_is_released_with_no_eligible_tick(self):
+        registry = CoordinationRegistry()
+        trace = registry.trace_for_opportunity("opp-1", T0, create=True)
+        registry.update_trace_state("opp-1", StrategyState.CLOSED, T0 + 1)
+
+        released = registry.compact(keep_ticks=0, keep_open_traces=False)
+
+        assert released == 0
+        assert trace is not None
+        assert registry.get_trace(trace.trace_id) is None
+        assert registry.resident_traces == 0
+
+    def test_closed_trace_release_happens_without_keep_ticks_at_all(self):
+        registry = CoordinationRegistry()
+        trace = registry.trace_for_opportunity("opp-1", T0, create=True)
+        registry.update_trace_state("opp-1", StrategyState.REJECTED, T0 + 1)
+
+        released = registry.compact(keep_open_traces=False)
+
+        assert released == 0
+        assert trace is not None
+        assert registry.get_trace(trace.trace_id) is None
+
+    def test_the_default_call_still_releases_nothing(self):
+        registry = CoordinationRegistry()
+        trace = registry.trace_for_opportunity("opp-1", T0, create=True)
+        registry.update_trace_state("opp-1", StrategyState.CLOSED, T0 + 1)
+        tick = registry.begin_tick(T0 + 2)
+        registry.complete_tick(T0 + 3)
+
+        assert registry.compact() == 0
+        assert trace is not None
+        assert registry.get_trace(trace.trace_id) is trace
+        assert registry.get_tick(tick.tick_id) is tick
+
+    def test_an_open_trace_survives_an_explicit_release(self):
+        registry = CoordinationRegistry()
+        trace = registry.trace_for_opportunity("opp-1", T0, create=True)
+        registry.update_trace_state("opp-1", StrategyState.MONITORING, T0 + 1)
+
+        registry.compact(keep_ticks=0, keep_open_traces=False)
+
+        assert trace is not None
+        assert registry.get_trace(trace.trace_id) is trace
+
+    def test_a_nonterminal_request_on_a_closed_trace_stays_resident(self):
+        registry = CoordinationRegistry()
+        registry.trace_for_opportunity("opp-1", T0, create=True)
+        request = registry.register_consensus_request("opp-1", T0)
+        registry.link_consensus("opp-1", "eval-x", T0, request_id=request.request_id)
+        registry.update_trace_state("opp-1", StrategyState.CLOSED, T0 + 1)
+
+        registry.compact(keep_ticks=0, keep_open_traces=False)
+
+        assert request.status is ConsensusRequestStatus.WAITING
+        assert registry.get_consensus_request(request.request_id) is request
+
+    def test_a_newer_round_on_the_same_correlation_is_not_orphaned(self):
+        registry = CoordinationRegistry()
+        registry.trace_for_opportunity("opp-1", T0, create=True)
+        first = registry.register_consensus_request(
+            "opp-1", T0, purpose=ConsensusPurpose.ENTRY
+        )
+        registry.record_consensus(
+            consensus_result(),
+            T0 + 1,
+            purpose=ConsensusPurpose.ENTRY,
+            correlation_id="opp-1",
+            allowed=True,
+            opportunity_id="opp-1",
+        )
+        newer = registry.register_consensus_request(
+            "opp-1", T0 + 2, purpose=ConsensusPurpose.CONTINUATION
+        )
+        registry.update_trace_state("opp-1", StrategyState.CLOSED, T0 + 3)
+
+        registry.compact(keep_ticks=0, keep_open_traces=False)
+
+        assert registry.get_consensus_request(first.request_id) is None
+        assert registry.request_for_correlation("opp-1") is newer
+
+    def test_release_does_not_disturb_lifetime_metrics(self):
+        registry = CoordinationRegistry()
+        registry.trace_for_opportunity("opp-1", T0, create=True)
+        registry.update_trace_state("opp-1", StrategyState.CLOSED, T0 + 1)
+        before = registry.metrics()
+
+        registry.compact(keep_ticks=0, keep_open_traces=False)
+        after = registry.metrics()
+
+        assert after.traces_created == before.traces_created == 1
+        assert after.traces_closed == before.traces_closed == 1
+
+    def test_tick_eviction_still_returns_the_number_of_ticks_released(self):
+        registry = CoordinationRegistry()
+        for number in (1, 2, 3):
+            registry.begin_tick(T0 + number, tick_number=number)
+            registry.complete_tick(T0 + number)
+
+        assert registry.compact(keep_ticks=1) == 2
+        assert registry.resident_ticks == 1
