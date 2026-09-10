@@ -108,7 +108,7 @@ class TestRetention:
             "opp-1", T0 + 2, purpose=ConsensusPurpose.CONTINUATION
         )
         registry.update_trace_state("opp-1", StrategyState.CLOSED, T0 + 3)
-        tick = registry.begin_tick(T0 + 3)
+        registry.begin_tick(T0 + 3)
         registry.complete_tick(T0 + 3)
 
         registry.compact(keep_ticks=0, keep_open_traces=False)
