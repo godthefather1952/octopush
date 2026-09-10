@@ -7,7 +7,6 @@ import inspect
 import pathlib
 import types
 
-from apps.orchestrator.orchestrator import Orchestrator
 from core.models.hedging import HedgeRequestStatus
 from tests.audit.phase9_fixtures import make_intent
 from tests.conftest import START_MS
@@ -54,6 +53,8 @@ def test_core_hedging_models_do_not_import_outward_layers():
 
 
 def test_orchestrator_hedge_decision_does_not_read_hedge_registry():
+    from apps.orchestrator.orchestrator import Orchestrator
+
     source = inspect.getsource(Orchestrator._hedge)
     assert "hedge_registry" not in source
     assert "hedge_for_id" not in source
