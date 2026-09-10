@@ -74,13 +74,33 @@ class TestResolutionAuthority:
             OrderStatus.CANCELLED,
             T0 + 1,
             source=ReconciliationSourceKind.ACCOUNT,
+            evidence={"account": "internal opinion"},
         )
 
         assert result.accepted is False
-        assert veska.calls == [], (
-            "MARIN forwarded UNKNOWN resolution even though the supplied "
-            "source kind is internal"
+        assert veska.calls == []
+        resolution = next(iter(marin.registry.resolutions.values()))
+        assert resolution.status is ResolutionStatus.REJECTED
+
+    async def test_authoritative_source_requires_explicit_evidence(
+        self, bus, clock, health
+    ):
+        marin = build_marin(bus=bus, clock=clock, health=health)
+        order = make_unknown(marin)
+        veska = ResolutionVeska(accepted=True)
+
+        result = await marin.apply_order_resolution(
+            veska,
+            order.client_order_id,
+            OrderStatus.CANCELLED,
+            T0 + 1,
+            source=ReconciliationSourceKind.OPERATOR,
         )
+
+        assert result.accepted is False
+        assert veska.calls == []
+        resolution = next(iter(marin.registry.resolutions.values()))
+        assert resolution.status is ResolutionStatus.REJECTED
 
     async def test_resolution_exception_becomes_terminal_failed_record(
         self, bus, clock, health
@@ -97,11 +117,13 @@ class TestResolutionAuthority:
                 OrderStatus.CANCELLED,
                 T0 + 1,
                 source=ReconciliationSourceKind.OPERATOR,
+                evidence={"ticket": "operator-confirmed"},
             )
 
         resolutions = list(marin.registry.resolutions.values())
         assert len(resolutions) == 1
         assert resolutions[0].status is ResolutionStatus.FAILED
+        assert any("RuntimeError" in note for note in resolutions[0].notes)
 
     async def test_normal_rejection_is_recorded_failed(self, bus, clock, health):
         marin = build_marin(bus=bus, clock=clock, health=health)
@@ -114,6 +136,7 @@ class TestResolutionAuthority:
             OrderStatus.CANCELLED,
             T0 + 1,
             source=ReconciliationSourceKind.OPERATOR,
+            evidence={"ticket": "operator-confirmed"},
         )
 
         assert result.accepted is False
@@ -165,7 +188,9 @@ class TestStatusOnlyFilledResolution:
         order = harness.oms.get("p7-unknown")
         assert order is not None
 
-        assert not result.accepted or order.filled_quantity == order.quantity, (
-            "UNKNOWN was resolved to FILLED without fill quantity, price, "
-            "fee, cash or position evidence"
-        )
+        assert result.accepted is False
+        assert order.status is OrderStatus.UNKNOWN
+        assert order.filled_quantity == 0.0
+        resolution = next(iter(marin.registry.resolutions.values()))
+        assert resolution.status is ResolutionStatus.REJECTED
+        assert any("fill economics" in note.lower() for note in resolution.notes)
