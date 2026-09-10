@@ -52,7 +52,7 @@ class TestTickLifecycle:
     def test_complete_phase_cannot_rewrite_finished_history(self):
         """H8-3: an already-closed phase is historical truth."""
         registry = CoordinationRegistry()
-        tick = registry.begin_tick(T0)
+        registry.begin_tick(T0)
         registry.enter_phase(OrchestrationPhase.MEASURE, T0)
         phase = registry.complete_phase(
             OrchestrationPhase.MEASURE, T0 + 1, ok=False, detail="original"
@@ -129,7 +129,7 @@ class TestPersistenceBoundary:
         """H8-7: the store may not lag a resident current-phase pointer."""
         store = RecordingCoordinationStore()
         registry = CoordinationRegistry(store=store)
-        tick = registry.begin_tick(T0)
+        registry.begin_tick(T0)
         registry.enter_phase(OrchestrationPhase.SETTLE, T0 + 1)
         registry.enter_phase(OrchestrationPhase.MEASURE, T0 + 2)
         before = store.calls
