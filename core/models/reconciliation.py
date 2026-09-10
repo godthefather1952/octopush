@@ -369,12 +369,24 @@ class ReconciliationSnapshot(Envelope):
 
     execution: ExecutionSnapshot | None = None
     account: AccountSnapshot | None = None
-    venue: VenueTruthSnapshot | None = None
+    #: Canonical venue truth. Every successful venue capture survives here in
+    #: configured-source order; no venue may overwrite another.
+    venues: list[VenueTruthSnapshot] = Field(default_factory=list)
     recorded: RecordedTruthSnapshot | None = None
 
     #: Per-source capture outcome, including the ones that failed.
     sources: list[SourceHealth] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+
+    @property
+    def venue(self) -> VenueTruthSnapshot | None:
+        """Compatibility view for legacy single-venue readers.
+
+        Multi-venue consumers must use :attr:`venues`. Returning the first
+        configured venue keeps old inspection code working without making a
+        scalar field canonical again.
+        """
+        return self.venues[0] if self.venues else None
 
     @property
     def available_sources(self) -> list[ReconciliationSourceKind]:
@@ -689,6 +701,10 @@ class ReconciliationRunRecord(Base):
     snapshot_id: str | None = None
     execution_snapshot_id: str | None = None
     account_snapshot_id: str | None = None
+    #: Canonical multi-venue snapshot identities for this run.
+    venue_snapshot_ids: list[str] = Field(default_factory=list)
+    #: Compatibility slot for older single-venue readers. When venue ids are
+    #: attached through the registry this is the first configured venue id.
     venue_snapshot_id: str | None = None
     recorded_snapshot_id: str | None = None
 
@@ -758,80 +774,52 @@ class ReconciliationMetrics(Base):
     runs_completed: int = 0
     clean_runs: int = 0
     runs_with_discrepancies: int = 0
-
     discrepancies_open: int = 0
     discrepancies_resolved: int = 0
     critical_seen: int = 0
     warnings_seen: int = 0
-
-    unknown_orders_seen: int = 0
-
     resolution_requests: int = 0
     resolution_applied: int = 0
     resolution_failed: int = 0
-
     snapshots_captured: int = 0
+    unknown_orders_seen: int = 0
 
 
 class ArchivedReconciliationRuns(Base):
-    """Totals for runs compacted out of memory.
-
-    The shape ``OrderManager.ArchivedOrders`` established: when a record leaves
-    memory, its aggregate stays, so a later question about the session's shape
-    still has an answer. Nothing populates this yet — retention policy is
-    deferred, and the hooks that would use it default to releasing nothing.
-    """
+    """What remains after finished run records leave resident memory."""
 
     count: int = 0
     clean: int = 0
     with_discrepancies: int = 0
-    critical_total: int = 0
-    warning_total: int = 0
-    by_trigger: dict[str, int] = Field(default_factory=dict)
-
-    def absorb(self, record: ReconciliationRunRecord) -> None:
-        self.count += 1
-        if record.found_discrepancies:
-            self.with_discrepancies += 1
-        else:
-            self.clean += 1
-        self.critical_total += record.critical_count
-        self.warning_total += record.warning_count
-        self.by_trigger[record.trigger.value] = (
-            self.by_trigger.get(record.trigger.value, 0) + 1
-        )
+    resolved: int = 0
+    failed: int = 0
+    last_completed_at: Millis | None = None
 
 
-class StartupReconciliationRequest(Base):
-    """What a future live startup would have to reconcile before trading.
+# ======================================================================
+# startup seam
+# ======================================================================
 
-    Framework only. Nothing blocks ``Platform.start()`` on this, nothing
-    queries a venue, and paper trading is unaffected.
 
-    The sequence it describes — connect the private venues, capture
-    authoritative truth, reconcile, and only then enable execution — is the one
-    a live platform cannot safely skip. Writing it down now means the phase
-    that implements it fills in a shape rather than inventing one under
-    pressure.
+class StartupReconciliationRequest(Envelope):
+    """What must be reconciled before a future live start enables execution.
+
+    **A request, not a gate.** Nothing in this build calls it from startup or
+    makes a trading decision from it. It records the requirements explicitly so
+    a live-execution phase has to satisfy them rather than invent them.
     """
 
-    created_at: Millis
     trigger: ReconciliationTrigger = ReconciliationTrigger.STARTUP
-    #: Sources that must answer before trading may be enabled.
     required_sources: list[ReconciliationSourceKind] = Field(default_factory=list)
-    #: Sources that were actually available when the request was prepared.
     available_sources: list[ReconciliationSourceKind] = Field(default_factory=list)
-    #: Whether unresolved critical discrepancies must be zero. Always True for
-    #: a live start; stated as a field so it is a decision, not an assumption.
     require_no_critical: bool = True
     require_no_unknown_orders: bool = True
     reason: str = ""
-    notes: list[str] = Field(default_factory=list)
 
     @property
     def missing_required(self) -> list[ReconciliationSourceKind]:
         available = set(self.available_sources)
-        return [k for k in self.required_sources if k not in available]
+        return [kind for kind in self.required_sources if kind not in available]
 
     @property
     def sources_satisfied(self) -> bool:
@@ -845,7 +833,6 @@ __all__ = [
     "ArchivedReconciliationRuns",
     "DiscrepancyEntityType",
     "DiscrepancyStatus",
-    "PositionSummary",
     "ReconciliationDiscrepancy",
     "ReconciliationMetrics",
     "ReconciliationReadiness",

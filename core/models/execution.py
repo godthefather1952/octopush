@@ -60,9 +60,14 @@ TERMINAL_STATUSES: frozenset[OrderStatus] = frozenset(
 #: Legal order state transitions. ``UNKNOWN`` is reachable from any live state
 #: and can resolve back into any live or terminal state once truth is learned.
 ORDER_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
-    OrderStatus.CREATED: {OrderStatus.SUBMITTING, OrderStatus.REJECTED},
+    OrderStatus.CREATED: {
+        OrderStatus.SUBMITTING,
+        OrderStatus.CANCEL_PENDING,
+        OrderStatus.REJECTED,
+    },
     OrderStatus.SUBMITTING: {
         OrderStatus.ACKNOWLEDGED,
+        OrderStatus.CANCEL_PENDING,
         OrderStatus.REJECTED,
         OrderStatus.UNKNOWN,
     },
@@ -194,23 +199,21 @@ class FillEvent(Envelope):
     venue: str
     symbol: str
     side: Side
-    quantity: float = Field(gt=0)
-    price: float = Field(gt=0)
-    fee: float = 0.0
+    quantity: float = Field(gt=0, allow_inf_nan=False)
+    price: float = Field(gt=0, allow_inf_nan=False)
+    fee: float = Field(default=0.0, allow_inf_nan=False)
     liquidity: Liquidity = Liquidity.TAKER
     #: Slippage against the price VESKA expected, in bps (signed: positive is
     #: worse than expected).
-    slippage_bps: float = 0.0
+    slippage_bps: float = Field(default=0.0, allow_inf_nan=False)
     strategy: str | None = None
-    #: This fill's own realized-P&L contribution (pre-fee), captured by
-    #: ``PaperAccount.apply_fill`` at the exact moment it applies this fill to
-    #: the position -- not re-derived later from live account state, which
-    #: can already reflect fills applied after this one but dispatched
-    #: before it (PAPER_FILL is queued, not delivered, at publish time; the
-    #: account can accumulate several fills before any of their handlers
-    #: run). Set once, before this event is ever published, so it stays
-    #: within "immutable once emitted".
-    realized_pnl_delta: float = 0.0
+    #: This fill's own realized-P&L contribution (pre-fee), previewed from a
+    #: detached position before PAPER_FILL publication. The same accounting
+    #: arithmetic is then committed after the event is accepted, so durable
+    #: fill truth already carries the value replay needs without consulting
+    #: later live account state. Set before publication and unchanged in
+    #: meaning after commit.
+    realized_pnl_delta: float = Field(default=0.0, allow_inf_nan=False)
 
     @property
     def notional(self) -> float:
@@ -239,14 +242,14 @@ class PaperOrder(Envelope):
     side: Side
     order_type: OrderType
     time_in_force: TimeInForce
-    quantity: float = Field(gt=0)
-    limit_price: float | None = None
-    expected_price: float
+    quantity: float = Field(gt=0, allow_inf_nan=False)
+    limit_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    expected_price: float = Field(gt=0, allow_inf_nan=False)
     status: OrderStatus = OrderStatus.CREATED
-    filled_quantity: float = 0.0
+    filled_quantity: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     #: Quantity-weighted average fill price.
-    average_price: float | None = None
-    fees_paid: float = 0.0
+    average_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    fees_paid: float = Field(default=0.0, allow_inf_nan=False)
     submitted_at: Millis | None = None
     acknowledged_at: Millis | None = None
     terminal_at: Millis | None = None
@@ -322,7 +325,7 @@ class PaperOrder(Envelope):
 
 
 class ExecutionReport(Envelope):
-    """What VESKA reports back after working a plan."""
+    """A detached snapshot of a plan's execution lifecycle at one instant."""
 
     plan_id: str
     intent_id: str

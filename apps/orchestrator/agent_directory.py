@@ -51,6 +51,14 @@ class AgentDirectory:
     ``agent_id`` replaces the descriptor in place rather than appending a
     duplicate: wiring may legitimately run twice in a test, and a directory
     that grew a second TIDAL each time would be reporting a fiction.
+
+    Descriptors are copied on the way in and on the way out. Registration is
+    the only way to change what the directory holds, so a caller cannot alter
+    the directory by mutating something it handed back, and a snapshot taken
+    at one instant cannot be rewritten by a registration made at a later one.
+    Without that, a captured orchestration snapshot would silently change
+    whenever live agent metadata did, which is the opposite of what a snapshot
+    is for.
     """
 
     def __init__(self) -> None:
@@ -87,12 +95,16 @@ class AgentDirectory:
             description=description,
         )
         self._agents[agent_id] = descriptor
-        return descriptor
+        return descriptor.model_copy(deep=True)
 
     def register_descriptor(self, descriptor: AgentDescriptor) -> AgentDescriptor:
-        """Register a descriptor built elsewhere."""
-        self._agents[descriptor.agent_id] = descriptor
-        return descriptor
+        """Register a descriptor built elsewhere.
+
+        The descriptor is copied, so the caller keeping its own reference and
+        editing it later does not edit the directory.
+        """
+        self._agents[descriptor.agent_id] = descriptor.model_copy(deep=True)
+        return descriptor.model_copy(deep=True)
 
     def forget(self, agent_id: AgentId) -> None:
         """Drop one registration. Nothing about trading changes."""
@@ -107,11 +119,12 @@ class AgentDirectory:
         absent, unhealthy, or excluded from consensus — the directory has no
         opinion on any of those.
         """
-        return self._agents.get(agent_id)
+        descriptor = self._agents.get(agent_id)
+        return None if descriptor is None else descriptor.model_copy(deep=True)
 
     def all(self) -> list[AgentDescriptor]:
         """Every registered descriptor, in registration order."""
-        return list(self._agents.values())
+        return [d.model_copy(deep=True) for d in self._agents.values()]
 
     def ids(self) -> list[AgentId]:
         """Every registered agent id, in registration order."""
@@ -124,15 +137,15 @@ class AgentDirectory:
         consensus engine reads ``ConsensusConfig.required_agents`` and is
         unaffected by anything here.
         """
-        return [d for d in self._agents.values() if d.required_by_default]
+        return [d for d in self.all() if d.required_by_default]
 
     def by_scope(self, scope: AgentSubjectScope) -> list[AgentDescriptor]:
         """Registered agents that look at a given kind of subject."""
-        return [d for d in self._agents.values() if d.scope is scope]
+        return [d for d in self.all() if d.scope is scope]
 
     def by_cadence(self, cadence: AgentCadence) -> list[AgentDescriptor]:
         """Registered agents that run at a given rhythm."""
-        return [d for d in self._agents.values() if d.cadence is cadence]
+        return [d for d in self.all() if d.cadence is cadence]
 
     def contains(self, agent_id: AgentId) -> bool:
         return agent_id in self._agents
@@ -141,7 +154,7 @@ class AgentDirectory:
         return len(self._agents)
 
     def __iter__(self) -> Iterable[AgentDescriptor]:
-        return iter(list(self._agents.values()))
+        return iter(self.all())
 
     # -- capture -----------------------------------------------------------
 
@@ -158,6 +171,9 @@ class AgentDirectory:
         snapshot falls back to what registration recorded, which may be stale.
         The snapshot never reconciles the two — a display that quietly
         "corrected" configuration would hide precisely the drift worth seeing.
+
+        The descriptors captured are detached copies, so this is a picture of
+        ``now_ms`` and stays one.
         """
         if required_agents is None:
             mirrored = [d.agent_id for d in self._agents.values() if d.required_by_default]

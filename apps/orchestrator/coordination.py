@@ -29,6 +29,11 @@ It is not a decision authority, and every design choice here defends that:
   raised; the exception itself still propagates untouched. A registry that
   swallowed an error to keep its own bookkeeping tidy would be deciding that
   the failure did not matter.
+* **Its backend cannot stop it either.** The optional
+  :class:`CoordinationStore` is written through best-effort: a failure there
+  is logged and dropped, never raised at the caller. A backend nobody is
+  required to configure must not become something the tick path is required
+  to succeed at.
 
 Every mutation takes ``now_ms`` from the caller. Nothing in this module reads a
 clock, so a replayed session records the instants the original recorded.
@@ -193,6 +198,11 @@ class CoordinationRegistry:
         if existing is not None:
             record.current_phase = phase
             record.updated_at = now_ms
+            # Re-entry moves the current-phase pointer, so it is a change to a
+            # persisted record even though no phase was appended. Returning
+            # without writing through would leave a configured backend showing
+            # a phase the tick has already left.
+            self._persist_tick(record)
             return existing
         phase_record = OrchestrationPhaseRecord(phase=phase, started_at=now_ms)
         record.phases = [*record.phases, phase_record]
@@ -210,13 +220,23 @@ class CoordinationRegistry:
         ok: bool = True,
         detail: str = "",
     ) -> OrchestrationPhaseRecord | None:
-        """Close one phase. Returns ``None`` when it was never opened."""
+        """Close one phase. Returns ``None`` when it was never opened.
+
+        The first close wins. A phase that already carries a completion
+        instant is finished history: closing it again returns the record it
+        already has without touching the instant, the verdict or the detail.
+        A tick may legitimately re-enter a phase, and letting the second close
+        overwrite the first would make the record claim the phase succeeded at
+        an instant it did not, and hide whatever the first close recorded.
+        """
         record = self._tick(tick_id)
         if record is None:
             return None
         phase_record = record.phase_record(phase)
         if phase_record is None:
             return None
+        if phase_record.completed_at is not None:
+            return phase_record
         phase_record.completed_at = now_ms
         phase_record.ok = ok
         if detail:
@@ -232,11 +252,16 @@ class CoordinationRegistry:
 
         A tick already marked FAILED stays FAILED. Nothing here may convert a
         recorded failure into a success.
+
+        A tick already marked COMPLETE is left exactly as it was, and
+        ``ticks_completed`` does not move. The same terminal fact arriving
+        twice is one tick, not two: a lifetime counter that grew on a repeated
+        close would report a session that ran more ticks than it did.
         """
         record = self._tick(tick_id)
         if record is None:
             return None
-        if record.status is OrchestrationTickStatus.FAILED:
+        if record.is_terminal:
             return record
         record.status = OrchestrationTickStatus.COMPLETE
         record.current_phase = OrchestrationPhase.IDLE
@@ -258,10 +283,19 @@ class CoordinationRegistry:
         what it caught: same exception, same type, no retry and no
         translation. A framework that turned a raised tick into a logged note
         would be making a recovery decision nobody asked it to make.
+
+        A tick that already reached a terminal state keeps it, with its first
+        error and its first completion instant. Recording the same failure
+        twice is one failed tick, and a second call cannot rewrite the first
+        error into a later one — the first is the one that ended the tick.
+        A tick already COMPLETE stays COMPLETE for the same reason: history
+        that can be overwritten afterwards is not history.
         """
         record = self._tick(tick_id)
         if record is None:
             return None
+        if record.is_terminal:
+            return record
         record.status = OrchestrationTickStatus.FAILED
         record.completed_at = now_ms
         record.updated_at = now_ms
@@ -289,6 +323,7 @@ class CoordinationRegistry:
         record.notes = [*record.notes, note]
         if now_ms is not None:
             record.updated_at = now_ms
+        self._persist_tick(record)
 
     def count_tick(
         self,
@@ -312,6 +347,7 @@ class CoordinationRegistry:
         record.execution_plans += execution_plans
         if now_ms is not None:
             record.updated_at = now_ms
+        self._persist_tick(record)
 
     # -- tick queries ------------------------------------------------------
 
@@ -430,6 +466,12 @@ class CoordinationRegistry:
         if record is None:
             return None
 
+        #: Captured before any mutation below, because the lifetime counter
+        #: counts transitions into TIMED_OUT rather than observations of it.
+        #: A wait can be reported more than once — re-entered, re-observed —
+        #: and each report is the same timeout, not another one.
+        was_timed_out = record.status is ConsensusRequestStatus.TIMED_OUT
+
         responded_list = sorted(responded or [])
         if required is not None:
             record.required_agents = sorted(required)
@@ -450,7 +492,8 @@ class CoordinationRegistry:
         is_complete = complete if complete is not None else not record.missing_agents
         if timed_out and not is_complete:
             record.status = ConsensusRequestStatus.TIMED_OUT
-            self.requests_timed_out += 1
+            if not was_timed_out:
+                self.requests_timed_out += 1
         else:
             record.status = ConsensusRequestStatus.READY
         self._persist_request(record)
@@ -532,10 +575,16 @@ class CoordinationRegistry:
                 self.continuation_blocked += 1
 
         if request is not None:
+            was_completed = request.status is ConsensusRequestStatus.COMPLETED
             request.consensus_evaluation_id = record.evaluation_id
             request.status = ConsensusRequestStatus.COMPLETED
             request.updated_at = now_ms
-            self.requests_completed += 1
+            # Transitions, not observations — as with the timeout counter
+            # above. A second evaluation against the same open round replaces
+            # which evaluation the round points at; it does not mean the
+            # platform asked and completed two rounds.
+            if not was_completed:
+                self.requests_completed += 1
             self._persist_request(request)
 
         if opportunity_id is not None:
@@ -827,34 +876,41 @@ class CoordinationRegistry:
         Dropping any of those is how a platform decides a question stopped
         existing because it stopped tracking the answer.
 
-        Returns the number of tick records released.
+        The two retentions are independent. Ticks and traces have unrelated
+        lifetimes — a trace outlives the tick that opened it, and an
+        opportunity can close on a tick that is still running — so asking for
+        closed traces to be released must not depend on whether a tick also
+        happened to be evictable. Each request is evaluated on its own.
+
+        Returns the number of tick records released. Traces released are not
+        counted in that number; the return value has always meant ticks.
         """
-        if keep_ticks is None:
-            return 0
-        if keep_ticks < 0:
-            raise ValueError("keep_ticks may not be negative")
+        released = 0
 
-        eligible = [
-            tick_id
-            for tick_id in self._tick_order
-            if tick_id != self.current_tick_id
-            and (record := self.ticks.get(tick_id)) is not None
-            and record.is_terminal
-        ]
-        excess = len(eligible) - keep_ticks
-        if excess <= 0:
-            return 0
+        if keep_ticks is not None:
+            if keep_ticks < 0:
+                raise ValueError("keep_ticks may not be negative")
 
-        doomed = eligible[:excess]
-        for tick_id in doomed:
-            self.ticks.pop(tick_id, None)
-        self._tick_order = [
-            tick_id for tick_id in self._tick_order if tick_id in self.ticks
-        ]
+            eligible = [
+                tick_id
+                for tick_id in self._tick_order
+                if tick_id != self.current_tick_id
+                and (record := self.ticks.get(tick_id)) is not None
+                and record.is_terminal
+            ]
+            excess = len(eligible) - keep_ticks
+            if excess > 0:
+                doomed = eligible[:excess]
+                for tick_id in doomed:
+                    self.ticks.pop(tick_id, None)
+                self._tick_order = [
+                    tick_id for tick_id in self._tick_order if tick_id in self.ticks
+                ]
+                released = len(doomed)
 
         if not keep_open_traces:
             self._release_closed_traces()
-        return len(doomed)
+        return released
 
     def _release_closed_traces(self) -> None:
         """Release traces whose opportunity is closed or rejected.
@@ -917,21 +973,67 @@ class CoordinationRegistry:
             return None
         return self.consensus_requests.get(request_id)
 
+    # -- write-through --------------------------------------------------
+    #
+    # Every helper below is best-effort by construction. A backend that is
+    # optional to configure cannot be mandatory to succeed: if writing history
+    # could raise into the tick path, an observability dependency would have
+    # become a trading dependency, and the platform would stop for a reason
+    # that has nothing to do with the market.
+    #
+    # So a store failure is logged with its traceback and swallowed. Resident
+    # truth is already committed by the time these run, so the in-memory
+    # record stays correct and only the durable copy is behind.
+    #
+    # The swallowing matters most in the one place it is easiest to miss.
+    # ``fail_tick`` runs inside the orchestrator's ``except`` block while the
+    # original exception is still in flight. If persistence raised there, that
+    # new error would replace the trading error on its way out, and the caller
+    # would be told the store broke rather than that the tick did. Catching
+    # here means the ``raise`` upstream re-raises exactly what it caught.
+
     def _persist_tick(self, record: OrchestrationTickRecord) -> None:
-        if self.store is not None:
+        if self.store is None:
+            return
+        try:
             self.store.put_tick(record)
+        except Exception:
+            log.exception(
+                "coordination store failed to persist tick %s", record.tick_id
+            )
 
     def _persist_request(self, record: ConsensusRequestRecord) -> None:
-        if self.store is not None:
+        if self.store is None:
+            return
+        try:
             self.store.put_consensus_request(record)
+        except Exception:
+            log.exception(
+                "coordination store failed to persist consensus request %s",
+                record.request_id,
+            )
 
     def _persist_evaluation(self, record: ConsensusEvaluationRecord) -> None:
-        if self.store is not None:
+        if self.store is None:
+            return
+        try:
             self.store.put_consensus_evaluation(record)
+        except Exception:
+            log.exception(
+                "coordination store failed to persist consensus evaluation %s",
+                record.evaluation_id,
+            )
 
     def _persist_trace(self, trace: DecisionTrace) -> None:
-        if self.store is not None:
+        if self.store is None:
+            return
+        try:
             self.store.put_trace(trace)
+        except Exception:
+            log.exception(
+                "coordination store failed to persist decision trace %s",
+                trace.trace_id,
+            )
 
 
 __all__ = ["CoordinationRegistry", "CoordinationStore"]
