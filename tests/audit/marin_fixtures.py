@@ -5,8 +5,8 @@ Audit-only. Nothing here is imported by production.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from agents.marin import Marin
 from agents.marin.source import ReconciliationSource, SourceCapture
