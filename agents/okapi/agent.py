@@ -4,12 +4,13 @@ Watches the gap between the exposure a strategy *intends* to carry and the
 exposure it actually has, and asks for simulated hedges to close it.
 
 For V1 the job is narrow and concrete: a cross-venue relative-value trade is
-supposed to be delta-neutral, and partial fills on one leg break that.  OKAPI
+supposed to be delta-neutral, and partial fills on one leg break that. OKAPI
 notices and proposes the offsetting trade.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from agents.okapi.registry import HedgeRegistry
@@ -49,10 +50,7 @@ class Okapi:
     desired_delta: dict[str, float] = field(default_factory=dict)
     hedges_requested: int = 0
     #: Phase 9. What became of each hedge request: status, and links to the
-    #: trade intent, plan, orders and any reconciliation run. Written to beside
-    #: the code that already decides and read by nothing in the hedging path --
-    #: ``working_hedges`` and ``_hedge_in_flight`` in the orchestrator remain
-    #: the authority on whether a hedge is in flight.
+    #: trade intent, plan, orders and any reconciliation run.
     hedge_registry: HedgeRegistry = field(default_factory=HedgeRegistry)
     #: Phase 9. Metadata mirroring :attr:`desired_delta`, which stays the value
     #: :meth:`delta_reports` actually measures against.
@@ -64,7 +62,12 @@ class Okapi:
     # -- intent ------------------------------------------------------------
 
     def set_desired_delta(self, symbol: str, notional: float) -> None:
-        self.desired_delta[symbol] = notional
+        if isinstance(notional, bool) or not isinstance(notional, (int, float)):
+            raise TypeError("desired delta must be a finite number")
+        value = float(notional)
+        if not math.isfinite(value):
+            raise ValueError("desired delta must be finite")
+        self.desired_delta[symbol] = value
 
     def target(self, symbol: str) -> float:
         return self.desired_delta.get(symbol, 0.0)
@@ -102,10 +105,7 @@ class Okapi:
     # -- hedging -----------------------------------------------------------
 
     def _hedge_venue(self, symbol: str, side: Side, market: MarketState) -> str | None:
-        """Cheapest usable venue to put the hedge on.
-
-        A buy hedge wants the lowest ask, a sell hedge the highest bid.
-        """
+        """Cheapest usable venue to put the hedge on."""
         candidates = [
             state
             for state in market.states_for(symbol)
@@ -119,11 +119,7 @@ class Okapi:
         return max(candidates, key=lambda s: s.metrics.best_bid).venue
 
     def hedge_available(self, symbol: str, market: MarketState) -> bool:
-        """Whether an offsetting venue is quoting at all.
-
-        RUNE consults this as a mandatory gate: a delta-neutral strategy must
-        not enter if it could not hedge the leg risk it is about to take.
-        """
+        """Whether an offsetting venue is quoting at all."""
         return (
             self._hedge_venue(symbol, Side.BUY, market) is not None
             and self._hedge_venue(symbol, Side.SELL, market) is not None
@@ -135,14 +131,11 @@ class Okapi:
         market: MarketState,
         now_ms: Millis | None = None,
     ) -> list[HedgeIntent]:
-        # A hedge intent's created_at/deadline are gated by RUNE, so this is
-        # economic time, not metadata (Phase 2 Batch 1.4).
         now = self.clock.now_ms() if now_ms is None else now_ms
         intents: list[HedgeIntent] = []
         for report in self.delta_reports(portfolio, now):
             if report.within_tolerance or abs(report.unhedged_delta) <= 0:
                 continue
-            # Long too much -> sell; short too much -> buy.
             side = Side.SELL if report.unhedged_delta > 0 else Side.BUY
             venue = self._hedge_venue(report.symbol, side, market)
             if venue is None:
@@ -150,7 +143,9 @@ class Okapi:
             intents.append(
                 HedgeIntent(
                     created_at=now,
-                    source_data_timestamp=market.source_data_timestamp,
+                    source_data_timestamp=market.source_data_timestamp_for(
+                        [(venue, report.symbol)]
+                    ),
                     symbol=report.symbol,
                     venue=venue,
                     side=side,
@@ -166,29 +161,15 @@ class Okapi:
                 )
             )
         self.hedges_requested += len(intents)
-        # Phase 9: record what was just decided. This runs after every economic
-        # value above is fixed, copies each intent field for field, and its
-        # result is not read by anything -- the returned ``intents`` list is
-        # unchanged and is still what the orchestrator works.
         self._mirror_hedge_intents(intents, now)
         return intents
 
     # -- observation (Phase 9) --------------------------------------------
-    #
-    # Everything below records or reports. None of it is called from the
-    # hedging path above except ``_mirror_hedge_intents``, which is a write
-    # whose result nothing branches on.
 
     def _mirror_hedge_intents(
         self, intents: list[HedgeIntent], now_ms: Millis
     ) -> list[HedgeRequestRecord]:
-        """Copy freshly built hedge intents into the registry.
-
-        Side, venue, notional, both deltas, urgency and reason codes are taken
-        straight off the intent. Nothing is recomputed, and the cause stays
-        UNCLASSIFIED: portfolio delta does not say what left the exposure
-        behind, and a guess would read like evidence.
-        """
+        """Copy freshly built hedge intents into the registry."""
         return [
             self.hedge_registry.register_request(
                 intent,
@@ -203,13 +184,7 @@ class Okapi:
         return self.target_registry.all_targets()
 
     def mirror_targets(self, now_ms: Millis, *, strategy: str = "") -> list[HedgeTarget]:
-        """Copy :attr:`desired_delta` into the target registry at ``now_ms``.
-
-        Explicitly caller-driven, and takes a logical instant rather than
-        reading the clock. ``set_desired_delta`` deliberately does not call
-        this: it has no ``now_ms`` to pass, and adding a clock read inside it
-        would put a wall-clock timestamp into the hedging path.
-        """
+        """Copy :attr:`desired_delta` into the target registry at ``now_ms``."""
         return self.target_registry.mirror(
             self.desired_delta, now_ms, strategy=strategy
         )
@@ -230,12 +205,7 @@ class Okapi:
         return self.hedge_registry.unknown()
 
     def hedge_for_id(self, hedge_id: str) -> HedgeRequestRecord | None:
-        """By registry id, or by the ``HedgeIntent.hedge_id`` it was built from.
-
-        The orchestrator uses the intent's id as the correlation id on the
-        trade intent, the plan and every order, so a caller holding a
-        downstream record almost always has that id rather than this one.
-        """
+        """By registry id, or by the ``HedgeIntent.hedge_id`` it was built from."""
         return self.hedge_registry.get(hedge_id) or self.hedge_registry.for_intent(
             hedge_id
         )
@@ -243,21 +213,9 @@ class Okapi:
     def delta_snapshot(
         self, portfolio: PortfolioState, now_ms: Millis
     ) -> DeltaSnapshot:
-        """Capture exposure at a caller-supplied instant.
-
-        Carries the ``DeltaReport`` objects :meth:`delta_reports` produced.
-        ``total_unhedged`` is the sum of their absolute residuals -- the same
-        expression :meth:`total_unhedged` evaluates, applied to the reports
-        already in hand so the snapshot does not trigger a second measurement
-        at a different instant. No second delta formula exists here: a platform
-        with two answers to "how much are we unhedged?" has no answer at all.
-        """
+        """Capture exposure at a caller-supplied instant."""
         reports = self.delta_reports(portfolio, now_ms)
         self.hedge_registry.delta_snapshots += 1
-        # Mirror the targets at the instant the caller supplied. Doing it here
-        # rather than inside ``set_desired_delta`` is deliberate: that method
-        # has no logical time to hand, and giving it a clock read would put a
-        # wall-clock timestamp into the hedging path.
         self.mirror_targets(now_ms)
         return DeltaSnapshot(
             created_at=now_ms,
@@ -271,13 +229,7 @@ class Okapi:
     def route_snapshot(
         self, symbol: str, side: Side, market: MarketState, now_ms: Millis
     ) -> HedgeRouteSnapshot:
-        """What the venue choice looked like, and which venue was chosen.
-
-        ``selected_venue`` **copies** :meth:`_hedge_venue`. This method runs no
-        comparison of its own — a buy hedge still wants the lowest ask and a
-        sell hedge the highest bid, decided in exactly one place, and a second
-        implementation here could quietly disagree with the first.
-        """
+        """What the venue choice looked like, and which venue was chosen."""
         candidates = [
             HedgeVenueCandidate(
                 venue=state.venue,
@@ -312,21 +264,10 @@ class Okapi:
         market: MarketState | None,
         now_ms: Millis,
     ) -> OkapiReadiness:
-        """Whether hedging is in a fit state. **Reporting only.**
-
-        This gates nothing. RUNE still calls :meth:`hedge_available` as its
-        mandatory pre-entry gate, unchanged; substituting this for it would
-        replace a tested decision with an untested one.
-
-        ``ready`` is False whenever anything is unestablished, including when
-        no market has been seen. Absence of evidence is not readiness.
-        """
+        """Whether hedging is in a fit state. Reporting only."""
         reports = self.delta_reports(portfolio, now_ms)
         total = sum(abs(r.unhedged_delta) for r in reports)
         symbols = sorted({r.symbol for r in reports} | set(self.desired_delta))
-        # Copies what ``hedge_available`` answers for every symbol in scope.
-        # Never a substitute for it: RUNE still calls it per symbol, per
-        # entry, and that call is the gate.
         if market is None or not symbols:
             hedging_available = False
         else:
@@ -367,17 +308,9 @@ class Okapi:
         market: MarketState | None,
         now_ms: Millis,
     ) -> OkapiSnapshot:
-        """One serializable view of hedging state.
-
-        Compact: targets, the current delta reports, and *ids* for the hedges
-        in flight. A snapshot that embedded every hedge record with its orders
-        and fills would be sized by session history rather than by what is
-        currently outstanding.
-        """
+        """One serializable view of hedging state."""
         reports = self.delta_reports(portfolio, now_ms)
         symbols = sorted({r.symbol for r in reports} | set(self.desired_delta))
-        # Same as ``delta_snapshot``: the mirror is refreshed at capture time,
-        # from the caller's logical instant, never from a clock read.
         self.mirror_targets(now_ms)
         return OkapiSnapshot(
             created_at=now_ms,
