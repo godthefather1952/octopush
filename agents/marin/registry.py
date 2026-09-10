@@ -192,11 +192,18 @@ class ReconciliationRegistry:
         snapshot_id: str | None = None,
         execution_snapshot_id: str | None = None,
         account_snapshot_id: str | None = None,
+        venue_snapshot_ids: list[str] | None = None,
         venue_snapshot_id: str | None = None,
         recorded_snapshot_id: str | None = None,
         source_kinds: list[ReconciliationSourceKind] | None = None,
         missing_source_kinds: list[ReconciliationSourceKind] | None = None,
     ) -> ReconciliationRunRecord | None:
+        """Attach captured truth identities without collapsing venue history.
+
+        ``venue_snapshot_ids`` is canonical. ``venue_snapshot_id`` remains a
+        compatibility input for older single-venue callers and is mirrored into
+        the canonical list rather than replacing it.
+        """
         record = self.runs.get(run_id)
         if record is None:
             return None
@@ -206,7 +213,13 @@ class ReconciliationRegistry:
             record.execution_snapshot_id = execution_snapshot_id
         if account_snapshot_id is not None:
             record.account_snapshot_id = account_snapshot_id
-        if venue_snapshot_id is not None:
+        if venue_snapshot_ids is not None:
+            record.venue_snapshot_ids = list(venue_snapshot_ids)
+            record.venue_snapshot_id = (
+                record.venue_snapshot_ids[0] if record.venue_snapshot_ids else None
+            )
+        elif venue_snapshot_id is not None:
+            record.venue_snapshot_ids = [venue_snapshot_id]
             record.venue_snapshot_id = venue_snapshot_id
         if recorded_snapshot_id is not None:
             record.recorded_snapshot_id = recorded_snapshot_id

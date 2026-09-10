@@ -35,6 +35,7 @@ from core.models.execution import (
     ExecutionPlanRecord,
     ExecutionPlanStatus,
     ExecutionReport,
+    ExecutionRole,
     ExecutionSnapshot,
     ExecutorCapabilities,
     FillEvent,
@@ -81,6 +82,7 @@ class Veska:
         self.router = VenueRouter(settings)
         self.registry = ExecutionRegistry()
         self.plan_failures = 0
+        self._report_fingerprints: dict[str, tuple[object, ...]] = {}
         health.register(SERVICE, VERSION)
 
     # -- compatibility -----------------------------------------------------
@@ -134,13 +136,15 @@ class Veska:
             if routing.expected_price <= 0:
                 self.plan_failures += 1
                 return None
-            # An exit or hedge leg carries the exact quantity to trade; an
-            # entry leg is sized from the notional RUNE authorised.
-            quantity = (
-                leg.quantity
-                if leg.quantity is not None and leg.quantity > 0
-                else notional / routing.expected_price
-            )
+            # ENTRY is risk-increasing and is always bounded by the notional
+            # RUNE authorised. EXIT/HEDGE may carry an exact quantity because
+            # their job is to neutralise exposure that already exists.
+            if intent.execution_role is ExecutionRole.ENTRY:
+                quantity = notional / routing.expected_price
+            elif leg.quantity is not None and leg.quantity > 0:
+                quantity = leg.quantity
+            else:
+                quantity = notional / routing.expected_price
             if quantity <= 0:
                 continue
             fees = self.settings.venue(leg.venue).fees
@@ -181,23 +185,179 @@ class Veska:
         self.registry.register_plan(plan, now_ms)
         return plan
 
-    def preflight(self, plan: ExecutionPlan) -> PlanPreflight:
-        """Check a plan's structural workability against this executor.
+    def preflight(
+        self, plan: ExecutionPlan, now_ms: Millis | None = None
+    ) -> PlanPreflight:
+        """Canonical fail-closed gate before any new executor submission."""
+        return preflight_plan(
+            plan,
+            capabilities=self.executor.capabilities,
+            now_ms=now_ms,
+            allowed_venues=frozenset(
+                venue.name for venue in self.settings.enabled_venues
+            ),
+        )
 
-        Construction phase: offered, not enforced. ``execute`` does not consult
-        it, because turning a new check into a submission gate is a behavioural
-        change and this pass makes none. The seam exists so a later pass has
-        one place to put the checks it has evidence for.
-        """
-        return preflight_plan(plan, capabilities=self.executor.capabilities)
+    # -- execution reports -------------------------------------------------
+
+    def current_report(self, plan_id: str, now_ms: Millis) -> ExecutionReport:
+        """Build a detached lifecycle report from registry and OMS truth."""
+        record = self.registry.get(plan_id)
+        if record is None:
+            raise KeyError(f"no such execution plan: {plan_id}")
+        orders = [
+            order.model_copy(deep=True)
+            for order in self.executor.orders_for_plan(plan_id)
+        ]
+        fills = [
+            fill.model_copy(deep=True)
+            for order in orders
+            for fill in order.fills
+        ]
+        return ExecutionReport(
+            created_at=now_ms,
+            correlation_id=record.correlation_id,
+            plan_id=record.plan_id,
+            intent_id=record.intent_id,
+            orders=orders,
+            fills=fills,
+            complete=record.is_terminal,
+            notes=list(record.notes),
+        )
+
+    @staticmethod
+    def _report_fingerprint(report: ExecutionReport) -> tuple[object, ...]:
+        return (
+            report.complete,
+            tuple(
+                (
+                    order.client_order_id,
+                    order.status.value,
+                    order.filled_quantity,
+                    order.average_price,
+                    order.fees_paid,
+                    order.reject_reason,
+                    order.terminal_at,
+                )
+                for order in report.orders
+            ),
+            tuple(fill.fill_id for fill in report.fills),
+            tuple(report.notes),
+        )
+
+    async def _publish_execution_report(
+        self, report: ExecutionReport
+    ) -> None:
+        await self.bus.publish(
+            Event(
+                type=EventType.EXECUTION_REPORT,
+                ts_ms=report.created_at,
+                source=SERVICE,
+                schema_name="ExecutionReport",
+                correlation_id=report.correlation_id,
+                payload=report.to_json_dict(),
+            )
+        )
+
+    async def _publish_report_if_changed(
+        self, plan_id: str, now_ms: Millis
+    ) -> ExecutionReport | None:
+        report = self.current_report(plan_id, now_ms)
+        fingerprint = self._report_fingerprint(report)
+        if self._report_fingerprints.get(plan_id) == fingerprint:
+            return None
+        await self._publish_execution_report(report)
+        self._report_fingerprints[plan_id] = fingerprint
+        return report
+
+    async def _publish_changed_reports(self, now_ms: Millis) -> None:
+        for record in self.registry.all_records():
+            has_orders = bool(self.executor.orders_for_plan(record.plan_id))
+            if not has_orders and record.plan_id not in self._report_fingerprints:
+                continue
+            await self._publish_report_if_changed(record.plan_id, now_ms)
 
     # -- execution ---------------------------------------------------------
 
     async def execute(self, plan: ExecutionPlan, now_ms: Millis) -> ExecutionReport:
-        # The plan may not have come from build_plan (a replayed or externally
-        # constructed one). Registering here is idempotent by plan id, so a
-        # plan built above is not registered twice.
-        self.registry.register_plan(plan, now_ms)
+        # A plan id names one immutable execution attempt. A build_plan-created
+        # record may exist before submission, but reusing that id for different
+        # instructions must fail closed rather than inherit the old record.
+        existing_plan = self.registry.plan(plan.plan_id)
+        if existing_plan is not None and existing_plan != plan:
+            raise ValueError(
+                f"plan_id {plan.plan_id} is already registered with different instructions"
+            )
+
+        record = self.registry.register_plan(plan, now_ms)
+        resident = self.executor.orders_for_plan(plan.plan_id)
+        if resident:
+            planned_ids = [o.client_order_id for o in plan.orders]
+            resident_ids = [o.client_order_id for o in resident]
+            if (
+                len(resident_ids) != len(planned_ids)
+                or set(resident_ids) != set(planned_ids)
+            ):
+                raise RuntimeError(
+                    f"plan {plan.plan_id} is partially submitted; existing orders "
+                    f"{resident_ids} do not match planned orders {planned_ids}"
+                )
+            if any(note.startswith("submission interrupted") for note in record.notes):
+                raise RuntimeError(
+                    f"plan {plan.plan_id} has orders from an interrupted submission; "
+                    "cancel or reconcile them before retrying"
+                )
+            return ExecutionReport(
+                created_at=now_ms,
+                correlation_id=plan.correlation_id,
+                plan_id=plan.plan_id,
+                intent_id=plan.intent_id,
+                orders=[order.model_copy(deep=True) for order in resident],
+                fills=[
+                    fill.model_copy(deep=True)
+                    for order in resident
+                    for fill in order.fills
+                ],
+                complete=record.is_terminal,
+                notes=["idempotent retry: existing order truth returned"],
+            )
+
+        preflight = self.preflight(plan, now_ms)
+        if preflight.blocked:
+            notes = [
+                f"preflight blocked: {code}" for code in preflight.reason_codes
+            ]
+            self.registry.set_status(
+                plan.plan_id,
+                ExecutionPlanStatus.FAILED,
+                now_ms,
+                note="; ".join(notes),
+            )
+            await self.bus.publish(
+                Event(
+                    type=EventType.EXECUTION_PLAN,
+                    ts_ms=plan.created_at,
+                    source=SERVICE,
+                    schema_name="ExecutionPlan",
+                    correlation_id=plan.correlation_id,
+                    payload=plan.to_json_dict(),
+                )
+            )
+            report = ExecutionReport(
+                created_at=now_ms,
+                correlation_id=plan.correlation_id,
+                plan_id=plan.plan_id,
+                intent_id=plan.intent_id,
+                orders=[],
+                complete=False,
+                notes=notes,
+            )
+            await self._publish_execution_report(report)
+            self._report_fingerprints[plan.plan_id] = (
+                self._report_fingerprint(report)
+            )
+            return report
+
         self.registry.set_status(plan.plan_id, ExecutionPlanStatus.SUBMITTING, now_ms)
 
         await self.bus.publish(
@@ -210,28 +370,38 @@ class Veska:
                 payload=plan.to_json_dict(),
             )
         )
-        report = await self.executor.submit(plan, now_ms)
+
+        try:
+            report = await self.executor.submit(plan, now_ms)
+        except Exception:
+            actual_orders = self.executor.orders_for_plan(plan.plan_id)
+            self.registry.attach_orders(
+                plan.plan_id,
+                [o.client_order_id for o in actual_orders],
+                now_ms,
+            )
+            self.refresh_plan(plan.plan_id, now_ms)
+            self.registry.note(
+                plan.plan_id,
+                f"submission interrupted after creating {len(actual_orders)} order(s)",
+                now_ms,
+            )
+            raise
 
         self.registry.attach_orders(
             plan.plan_id, [o.client_order_id for o in report.orders], now_ms
         )
         self.refresh_plan(plan.plan_id, now_ms)
 
-        await self.bus.publish(
-            Event(
-                type=EventType.EXECUTION_REPORT,
-                ts_ms=report.created_at,
-                source=SERVICE,
-                schema_name="ExecutionReport",
-                correlation_id=plan.correlation_id,
-                payload=report.to_json_dict(),
-            )
-        )
+        report = report.model_copy(deep=True)
+        await self._publish_execution_report(report)
+        self._report_fingerprints[plan.plan_id] = self._report_fingerprint(report)
         return report
 
     async def poll(self, now_ms: Millis) -> list[FillEvent]:
         fills = await self.executor.poll(now_ms)
-        self._refresh_plans_for_fills(fills, now_ms)
+        self.refresh_all_plans(now_ms)
+        await self._publish_changed_reports(now_ms)
         return fills
 
     async def cancel(self, client_order_id: str, now_ms: Millis) -> None:
@@ -239,10 +409,12 @@ class Veska:
         record = self.registry.plan_for_order(client_order_id)
         if record is not None:
             self.refresh_plan(record.plan_id, now_ms)
+            await self._publish_report_if_changed(record.plan_id, now_ms)
 
     async def cancel_all(self, now_ms: Millis) -> int:
         count = await self.executor.cancel_all(now_ms)
         self.refresh_all_plans(now_ms)
+        await self._publish_changed_reports(now_ms)
         return count
 
     async def cancel_plan(
@@ -280,6 +452,7 @@ class Veska:
 
         self.registry.note(plan_id, f"cancel requested for {requested} order(s)", now_ms)
         refreshed = self.refresh_plan(plan_id, now_ms)
+        await self._publish_report_if_changed(plan_id, now_ms)
         return ExecutionCommandResult(
             accepted=True,
             plan_id=plan_id,
@@ -306,6 +479,7 @@ class Veska:
         record = self.registry.plan_for_order(client_order_id)
         if record is not None:
             refreshed = self.refresh_plan(record.plan_id, now_ms)
+            await self._publish_report_if_changed(record.plan_id, now_ms)
             return result.model_copy(
                 update={
                     "plan_id": record.plan_id,

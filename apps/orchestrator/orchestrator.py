@@ -1385,7 +1385,7 @@ class Orchestrator:
             consensus_threshold=self.settings.consensus.entry_threshold,
             consensus_complete=result.complete,
             required_components=REQUIRED_COMPONENTS,
-            open_orders=len(self.veska.open_orders()),
+            open_orders=len(self.veska.outstanding_orders()),
             error_rate=self._error_rate(),
             unhedged_notional=self.okapi.total_unhedged(portfolio),
             strategy_exposure=self._current_strategy_exposure(),
@@ -1430,11 +1430,11 @@ class Orchestrator:
     async def _advance_execution(self, record: OpportunityRecord, market: MarketState) -> None:
         """Move on once the plan's orders have all reached a terminal state."""
         orders = [self.state.orders.get(oid) for oid in record.order_ids]
-        live = [o for o in orders if o is not None and o.is_live]
-        if live:
+        outstanding = [o for o in orders if o is not None and o.is_outstanding]
+        if outstanding:
             deadline = record.intent.deadline_ms if record.intent else None
             if deadline is not None and self.tick_time > deadline:
-                for order in live:
+                for order in outstanding:
                     await self.veska.cancel(order.client_order_id, self.tick_time)
             return
         filled = sum(o.filled_quantity for o in orders if o is not None)
@@ -1865,13 +1865,14 @@ class Orchestrator:
         order_ids = self.working_hedges.get(symbol)
         if not order_ids:
             return False
-        live = [
+        outstanding = [
             oid
             for oid in order_ids
-            if (order := self.state.orders.get(oid)) is not None and order.is_live
+            if (order := self.state.orders.get(oid)) is not None
+            and order.is_outstanding
         ]
-        if live:
-            self.working_hedges[symbol] = live
+        if outstanding:
+            self.working_hedges[symbol] = outstanding
             return True
         del self.working_hedges[symbol]
         return False
@@ -1889,7 +1890,7 @@ class Orchestrator:
 
     async def _advance_exit(self, record: OpportunityRecord, market: MarketState) -> None:
         orders = [self.state.orders.get(oid) for oid in record.order_ids]
-        if any(o is not None and o.is_live for o in orders):
+        if any(o is not None and o.is_outstanding for o in orders):
             return
 
         residual = self._residual_legs(record)
