@@ -12,9 +12,10 @@ from tests.audit.veska_fixtures import ExplodingBus
 
 
 class TestPublicationFailure:
-    async def test_critical_result_remains_available_when_event_publish_fails(
+    async def test_critical_result_remains_safety_visible_when_event_publish_fails(
         self, clock, health
     ):
+        """The legacy safety answer survives even when workflow commit does not."""
         bus = ExplodingBus(fail_on_publish=1)
         marin = build_marin(bus=bus, clock=clock, health=health)
         matched_trade(marin)
@@ -25,22 +26,30 @@ class TestPublicationFailure:
 
         assert marin.last_result is not None
         assert marin.last_result.ok is False
-        assert marin.registry.open_critical()
+        assert marin.last_result.critical
+        assert marin.registry.all_runs() == []
 
-    async def test_clean_run_does_not_commit_registry_before_event_acceptance(
+    async def test_clean_run_does_not_commit_registry_or_compaction_before_event(
         self, clock, health
     ):
-        """H7-49: workflow truth should not outrun its public event."""
+        """H7-49: workflow/retention truth may advance only after event acceptance."""
         bus = ExplodingBus(fail_on_publish=1)
         marin = build_marin(bus=bus, clock=clock, health=health)
+        order, fill = matched_trade(marin)
+        marin.account.retained_fills = 0
+        before_log = [item.fill_id for item in marin.account.fill_log]
 
         with pytest.raises(RuntimeError, match="audit-injected"):
             await marin.run(T0)
 
-        assert marin.registry.all_runs() == [], (
-            "the workflow registry advanced even though the reconciliation "
-            "completion event was rejected"
-        )
+        assert marin.last_result is not None
+        assert marin.last_result.ok is True
+        assert marin.registry.all_runs() == []
+        assert [item.fill_id for item in marin.account.fill_log] == before_log
+        assert fill.fill_id in before_log
+        assert marin.oms.get(order.client_order_id) is not None
+        assert marin.fills_sealed == 0
+        assert marin.orders_archived == 0
 
 
 class TestOrchestratorContract:
