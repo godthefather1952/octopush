@@ -8,11 +8,10 @@ import pathlib
 import types
 
 from core.models.hedging import HedgeRequestStatus
-from tests.audit.phase9_fixtures import make_intent
-from tests.conftest import START_MS
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+START_MS = 1_788_000_000_000
 
 
 def _imports(path: pathlib.Path) -> set[str]:
@@ -63,6 +62,8 @@ def test_orchestrator_hedge_decision_does_not_read_hedge_registry():
 
 
 def test_orchestrator_linkage_records_only_downstream_identifiers(platform):
+    from tests.audit.phase9_fixtures import make_intent
+
     hedge = make_intent(hedge_id="hdg-linked")
     record = platform.okapi.hedge_registry.register_request(hedge, START_MS)
     trade_intent = types.SimpleNamespace(intent_id="trade-intent-1")
@@ -88,6 +89,8 @@ def test_orchestrator_linkage_records_only_downstream_identifiers(platform):
 
 
 def test_missing_hedge_registry_record_cannot_break_linkage(platform):
+    from tests.audit.phase9_fixtures import make_intent
+
     hedge = make_intent(hedge_id="hdg-not-registered")
     trade_intent = types.SimpleNamespace(intent_id="trade-intent-1")
     plan = types.SimpleNamespace(plan_id="plan-1")
