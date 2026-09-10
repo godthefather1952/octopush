@@ -45,21 +45,13 @@ class Okapi:
     clock: Clock
     settings: Settings
     health: HealthRegistry
-    #: Symbol -> signed notional the strategies intend to carry. Cross-venue
-    #: relative value intends zero.
     desired_delta: dict[str, float] = field(default_factory=dict)
     hedges_requested: int = 0
-    #: Phase 9. What became of each hedge request: status, and links to the
-    #: trade intent, plan, orders and any reconciliation run.
     hedge_registry: HedgeRegistry = field(default_factory=HedgeRegistry)
-    #: Phase 9. Metadata mirroring :attr:`desired_delta`, which stays the value
-    #: :meth:`delta_reports` actually measures against.
     target_registry: HedgeTargetRegistry = field(default_factory=HedgeTargetRegistry)
 
     def __post_init__(self) -> None:
         self.health.register(SERVICE, VERSION)
-
-    # -- intent ------------------------------------------------------------
 
     def set_desired_delta(self, symbol: str, notional: float) -> None:
         if isinstance(notional, bool) or not isinstance(notional, (int, float)):
@@ -71,8 +63,6 @@ class Okapi:
 
     def target(self, symbol: str) -> float:
         return self.desired_delta.get(symbol, 0.0)
-
-    # -- measurement -------------------------------------------------------
 
     def delta_reports(
         self, portfolio: PortfolioState, now_ms: Millis | None = None
@@ -102,10 +92,7 @@ class Okapi:
     def total_unhedged(self, portfolio: PortfolioState) -> float:
         return sum(abs(r.unhedged_delta) for r in self.delta_reports(portfolio))
 
-    # -- hedging -----------------------------------------------------------
-
     def _hedge_venue(self, symbol: str, side: Side, market: MarketState) -> str | None:
-        """Cheapest usable venue to put the hedge on."""
         candidates = [
             state
             for state in market.states_for(symbol)
@@ -119,7 +106,6 @@ class Okapi:
         return max(candidates, key=lambda s: s.metrics.best_bid).venue
 
     def hedge_available(self, symbol: str, market: MarketState) -> bool:
-        """Whether an offsetting venue is quoting at all."""
         return (
             self._hedge_venue(symbol, Side.BUY, market) is not None
             and self._hedge_venue(symbol, Side.SELL, market) is not None
@@ -131,6 +117,12 @@ class Okapi:
         market: MarketState,
         now_ms: Millis | None = None,
     ) -> list[HedgeIntent]:
+        """Build economic hedge candidates without opening request history.
+
+        The orchestrator may suppress a candidate because the same symbol is
+        already being hedged. Registration therefore happens when the hedge is
+        actually published for work, not while candidates are merely measured.
+        """
         now = self.clock.now_ms() if now_ms is None else now_ms
         intents: list[HedgeIntent] = []
         for report in self.delta_reports(portfolio, now):
@@ -160,16 +152,11 @@ class Okapi:
                     ),
                 )
             )
-        self.hedges_requested += len(intents)
-        self._mirror_hedge_intents(intents, now)
         return intents
-
-    # -- observation (Phase 9) --------------------------------------------
 
     def _mirror_hedge_intents(
         self, intents: list[HedgeIntent], now_ms: Millis
     ) -> list[HedgeRequestRecord]:
-        """Copy freshly built hedge intents into the registry."""
         return [
             self.hedge_registry.register_request(
                 intent,
@@ -180,11 +167,9 @@ class Okapi:
         ]
 
     def hedge_targets(self) -> list[HedgeTarget]:
-        """Recorded target metadata. ``desired_delta`` remains the authority."""
         return self.target_registry.all_targets()
 
     def mirror_targets(self, now_ms: Millis, *, strategy: str = "") -> list[HedgeTarget]:
-        """Copy :attr:`desired_delta` into the target registry at ``now_ms``."""
         return self.target_registry.mirror(
             self.desired_delta, now_ms, strategy=strategy
         )
@@ -193,19 +178,15 @@ class Okapi:
         return self.hedge_registry.all()
 
     def active_hedges(self) -> list[HedgeRequestRecord]:
-        """Hedges currently known to be working. Excludes UNKNOWN."""
         return self.hedge_registry.active()
 
     def outstanding_hedges(self) -> list[HedgeRequestRecord]:
-        """Hedges whose final execution truth is not known. Includes UNKNOWN."""
         return self.hedge_registry.outstanding()
 
     def unknown_hedges(self) -> list[HedgeRequestRecord]:
-        """Hedges whose venue-side truth is unresolved. Never auto-resolved."""
         return self.hedge_registry.unknown()
 
     def hedge_for_id(self, hedge_id: str) -> HedgeRequestRecord | None:
-        """By registry id, or by the ``HedgeIntent.hedge_id`` it was built from."""
         return self.hedge_registry.get(hedge_id) or self.hedge_registry.for_intent(
             hedge_id
         )
@@ -213,7 +194,6 @@ class Okapi:
     def delta_snapshot(
         self, portfolio: PortfolioState, now_ms: Millis
     ) -> DeltaSnapshot:
-        """Capture exposure at a caller-supplied instant."""
         reports = self.delta_reports(portfolio, now_ms)
         self.hedge_registry.delta_snapshots += 1
         self.mirror_targets(now_ms)
@@ -229,7 +209,6 @@ class Okapi:
     def route_snapshot(
         self, symbol: str, side: Side, market: MarketState, now_ms: Millis
     ) -> HedgeRouteSnapshot:
-        """What the venue choice looked like, and which venue was chosen."""
         candidates = [
             HedgeVenueCandidate(
                 venue=state.venue,
@@ -264,7 +243,6 @@ class Okapi:
         market: MarketState | None,
         now_ms: Millis,
     ) -> OkapiReadiness:
-        """Whether hedging is in a fit state. Reporting only."""
         reports = self.delta_reports(portfolio, now_ms)
         total = sum(abs(r.unhedged_delta) for r in reports)
         symbols = sorted({r.symbol for r in reports} | set(self.desired_delta))
@@ -276,7 +254,6 @@ class Okapi:
             )
         outstanding = self.hedge_registry.outstanding()
         unknown = self.hedge_registry.unknown()
-
         reasons: list[str] = []
         if not self.desired_delta:
             reasons.append("NO_TARGETS_ESTABLISHED")
@@ -288,7 +265,6 @@ class Okapi:
             reasons.append(f"UNKNOWN_HEDGES:{len(unknown)}")
         if total > self.settings.risk.max_unhedged_notional:
             reasons.append("UNHEDGED_ABOVE_LIMIT")
-
         return OkapiReadiness(
             ready=not reasons,
             created_at=now_ms,
@@ -308,7 +284,6 @@ class Okapi:
         market: MarketState | None,
         now_ms: Millis,
     ) -> OkapiSnapshot:
-        """One serializable view of hedging state."""
         reports = self.delta_reports(portfolio, now_ms)
         symbols = sorted({r.symbol for r in reports} | set(self.desired_delta))
         self.mirror_targets(now_ms)
@@ -333,7 +308,6 @@ class Okapi:
         )
 
     async def publish_deltas(self, portfolio: PortfolioState) -> list[DeltaReport]:
-        """Publish the measurement. Hedge intents are published when worked."""
         reports = self.delta_reports(portfolio)
         for report in reports:
             await self.bus.publish(
@@ -349,6 +323,11 @@ class Okapi:
         return reports
 
     async def publish_hedge(self, intent: HedgeIntent) -> None:
+        """Publish a hedge that has passed orchestrator in-flight suppression."""
+        existing = self.hedge_registry.for_intent(intent.hedge_id)
+        if existing is None:
+            self.hedges_requested += 1
+            self._mirror_hedge_intents([intent], intent.created_at)
         await self.bus.publish(
             Event(
                 type=EventType.HEDGE_INTENT,
