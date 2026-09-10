@@ -9,9 +9,16 @@ import pytest
 
 from apps.orchestrator.orchestrator import Orchestrator
 from core.models.orchestration import (
+    AgentEndpointDescriptor,
     OrchestrationPhase,
     OrchestrationTickStatus,
 )
+from core.models.venue_execution import VenueBalanceSnapshot as CoreBalance
+from core.models.venue_execution import VenueFillSnapshot as CoreFill
+from core.models.venue_execution import VenueOrderSnapshot as CoreOrder
+from execution.gateway import VenueBalanceSnapshot as GatewayBalance
+from execution.gateway import VenueFillSnapshot as GatewayFill
+from execution.gateway import VenueOrderSnapshot as GatewayOrder
 
 
 class TestTickIntegration:
@@ -91,17 +98,6 @@ class TestLayering:
         assert violations == []
 
     def test_gateway_reexports_core_venue_value_types(self):
-        from core.models.venue_execution import (
-            VenueBalanceSnapshot as CoreBalance,
-            VenueFillSnapshot as CoreFill,
-            VenueOrderSnapshot as CoreOrder,
-        )
-        from execution.gateway import (
-            VenueBalanceSnapshot as GatewayBalance,
-            VenueFillSnapshot as GatewayFill,
-            VenueOrderSnapshot as GatewayOrder,
-        )
-
         assert GatewayOrder is CoreOrder
         assert GatewayFill is CoreFill
         assert GatewayBalance is CoreBalance
@@ -139,8 +135,6 @@ class TestObservabilityOnlyBoundary:
         assert not any(token in joined for token in forbidden)
 
     def test_agent_endpoint_descriptor_is_not_a_transport(self):
-        from core.models.orchestration import AgentEndpointDescriptor
-
         fields = set(AgentEndpointDescriptor.model_fields)
         assert fields == {"agent_id", "transport", "location", "detail"}
         assert not fields.intersection({"url", "credential", "secret", "client"})
