@@ -227,9 +227,11 @@ class Platform:
         self.operations.mark_starting(now)
         self._feeds_requested = feeds
 
-    async def start_bus(self) -> None:
+    async def start_bus(
+        self, *, record: bool = True, feeds: bool = True
+    ) -> None:
         """Start the bus under the Phase 11 lifecycle witness."""
-        self.prepare_start()
+        self.prepare_start(record=record, feeds=feeds)
         self.operations.set_startup_stage(StartupStage.BUS, self.clock.now_ms())
         try:
             await self.bus.start()
