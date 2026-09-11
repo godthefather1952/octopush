@@ -46,6 +46,18 @@ from core.models.shadow import (
 
 log = logging.getLogger(__name__)
 
+_DECISION_PROGRESS = {
+    ShadowDecisionStatus.OBSERVED: 0,
+    ShadowDecisionStatus.CONSENSUS_RECORDED: 1,
+    ShadowDecisionStatus.AUTHORIZED: 2,
+    ShadowDecisionStatus.PLANNED: 3,
+    ShadowDecisionStatus.PAPER_WORKING: 4,
+}
+_EXECUTION_PROGRESS = {
+    ShadowDecisionStatus.PLANNED: 0,
+    ShadowDecisionStatus.PAPER_WORKING: 1,
+}
+
 
 class ShadowStore(ABC):
     """The persistence seam for shadow history.
@@ -89,6 +101,8 @@ class ShadowRegistry:
     _by_opportunity: dict[str, str] = field(default_factory=dict)
     #: ``plan_id`` -> ``shadow_execution_id``.
     _by_plan: dict[str, str] = field(default_factory=dict)
+    #: ``client_order_id`` -> ``shadow_execution_id``.
+    _by_order: dict[str, str] = field(default_factory=dict)
     #: Registration order, so "recent" is a slice.
     _order: list[str] = field(default_factory=list)
 
@@ -162,21 +176,52 @@ class ShadowRegistry:
         if record is None:
             return None
         previous = record.status
+
+        if status is previous:
+            if reason and reason not in record.reason_codes:
+                record.reason_codes = [*record.reason_codes, reason]
+                record.updated_at = now_ms
+                self._persist_decision(record)
+            return record
+
+        # A terminal observation is historical fact. At-least-once delivery can
+        # replay an older event later; it must not resurrect the decision.
+        if record.is_terminal:
+            return record
+
+        # UNKNOWN can be resolved only by later execution truth, never by an
+        # earlier consensus/planning event arriving late.
+        if previous is ShadowDecisionStatus.UNKNOWN and status not in {
+            ShadowDecisionStatus.PAPER_WORKING,
+            ShadowDecisionStatus.PAPER_COMPLETE,
+            ShadowDecisionStatus.CLOSED,
+            ShadowDecisionStatus.FAILED,
+        }:
+            return record
+
+        if (
+            status not in SHADOW_TERMINAL_STATUSES
+            and status is not ShadowDecisionStatus.UNKNOWN
+            and previous is not ShadowDecisionStatus.UNKNOWN
+            and _DECISION_PROGRESS.get(status, -1) < _DECISION_PROGRESS.get(previous, -1)
+        ):
+            return record
+
         record.status = status
         record.updated_at = now_ms
         if reason and reason not in record.reason_codes:
             record.reason_codes = [*record.reason_codes, reason]
 
-        if status is not previous:
-            if status is ShadowDecisionStatus.AUTHORIZED:
-                self.decisions_authorized += 1
-            elif status is ShadowDecisionStatus.RISK_REJECTED:
-                self.decisions_rejected += 1
+        if status is ShadowDecisionStatus.AUTHORIZED:
+            self.decisions_authorized += 1
+        elif status in {
+            ShadowDecisionStatus.RISK_REJECTED,
+            ShadowDecisionStatus.REJECTED,
+        }:
+            self.decisions_rejected += 1
 
-        if record.is_terminal and record.terminal_at is None:
+        if record.is_terminal:
             record.terminal_at = now_ms
-        elif not record.is_terminal:
-            record.terminal_at = None
 
         self._persist_decision(record)
         return record
@@ -363,7 +408,13 @@ class ShadowRegistry:
         record = self.executions.get(execution_id)
         if record is None:
             return None
-        record.orders = list(orders)
+        for old in record.orders:
+            if self._by_order.get(old.client_order_id) == execution_id:
+                self._by_order.pop(old.client_order_id, None)
+        record.orders = [order.model_copy(deep=True) for order in orders]
+        for order in record.orders:
+            if order.client_order_id:
+                self._by_order[order.client_order_id] = execution_id
         record.updated_at = now_ms
         self._persist_execution(record)
         return record
@@ -388,10 +439,13 @@ class ShadowRegistry:
         record = self.executions.get(execution_id)
         if record is None:
             return None
-        for fill_id in fill_ids:
-            if fill_id not in record.paper_fill_ids:
-                record.paper_fill_ids = [*record.paper_fill_ids, fill_id]
-                self.fills_recorded += 1
+        new_ids = [fill_id for fill_id in fill_ids if fill_id not in record.paper_fill_ids]
+        # A duplicate delivery is a complete no-op, including money and time.
+        if fill_ids and not new_ids:
+            return record
+        for fill_id in new_ids:
+            record.paper_fill_ids = [*record.paper_fill_ids, fill_id]
+            self.fills_recorded += 1
         if paper_filled_notional is not None:
             record.paper_filled_notional = paper_filled_notional
         if paper_fees is not None:
@@ -408,13 +462,32 @@ class ShadowRegistry:
         record = self.executions.get(execution_id)
         if record is None:
             return None
-        record.status = status
-        record.updated_at = now_ms
-        if status in (
+        previous = record.status
+        if status is previous:
+            return record
+        if record.terminal_at is not None:
+            return record
+        if previous is ShadowDecisionStatus.UNKNOWN and status not in {
+            ShadowDecisionStatus.PAPER_WORKING,
             ShadowDecisionStatus.PAPER_COMPLETE,
             ShadowDecisionStatus.CLOSED,
             ShadowDecisionStatus.FAILED,
+        }:
+            return record
+        if (
+            status not in SHADOW_TERMINAL_STATUSES
+            and status is not ShadowDecisionStatus.UNKNOWN
+            and previous is not ShadowDecisionStatus.UNKNOWN
+            and _EXECUTION_PROGRESS.get(status, -1) < _EXECUTION_PROGRESS.get(previous, -1)
         ):
+            return record
+        record.status = status
+        record.updated_at = now_ms
+        if status in {
+            ShadowDecisionStatus.PAPER_COMPLETE,
+            ShadowDecisionStatus.CLOSED,
+            ShadowDecisionStatus.FAILED,
+        }:
             record.terminal_at = now_ms
         self._persist_execution(record)
         return record
@@ -435,11 +508,10 @@ class ShadowRegistry:
         """
         if checkpoint.decision_id not in self.decisions:
             return None
-        self.market_checkpoints.setdefault(checkpoint.decision_id, []).append(
-            checkpoint
-        )
+        stored = checkpoint.model_copy(deep=True)
+        self.market_checkpoints.setdefault(checkpoint.decision_id, []).append(stored)
         self.checkpoints_captured += 1
-        return checkpoint
+        return stored.model_copy(deep=True)
 
     def add_outcome_checkpoint(
         self, checkpoint: ShadowOutcomeCheckpoint
@@ -452,38 +524,51 @@ class ShadowRegistry:
         """
         if checkpoint.decision_id not in self.decisions:
             return None
-        self.outcome_checkpoints.setdefault(checkpoint.decision_id, []).append(
-            checkpoint
-        )
+        stored = checkpoint.model_copy(deep=True)
+        self.outcome_checkpoints.setdefault(checkpoint.decision_id, []).append(stored)
         self.outcomes_captured += 1
-        return checkpoint
+        return stored.model_copy(deep=True)
 
     def checkpoints_for(self, decision_id: str) -> list[ShadowMarketCheckpoint]:
-        return list(self.market_checkpoints.get(decision_id, []))
+        return [
+            checkpoint.model_copy(deep=True)
+            for checkpoint in self.market_checkpoints.get(decision_id, [])
+        ]
 
     def outcomes_for(self, decision_id: str) -> list[ShadowOutcomeCheckpoint]:
-        return list(self.outcome_checkpoints.get(decision_id, []))
+        return [
+            checkpoint.model_copy(deep=True)
+            for checkpoint in self.outcome_checkpoints.get(decision_id, [])
+        ]
 
     # ------------------------------------------------------------------
     # queries
     # ------------------------------------------------------------------
 
     def get(self, decision_id: str) -> ShadowDecisionRecord | None:
-        return self.decisions.get(decision_id)
+        record = self.decisions.get(decision_id)
+        return record.model_copy(deep=True) if record is not None else None
 
     def for_opportunity(self, opportunity_id: str) -> ShadowDecisionRecord | None:
         decision_id = self._by_opportunity.get(opportunity_id)
-        return self.decisions.get(decision_id) if decision_id else None
+        record = self.decisions.get(decision_id) if decision_id else None
+        return record.model_copy(deep=True) if record is not None else None
 
     def all(self) -> list[ShadowDecisionRecord]:
-        """Every resident decision, in registration order."""
-        return [self.decisions[did] for did in self._order if did in self.decisions]
+        """Detached copies of every resident decision, in registration order."""
+        return [
+            self.decisions[did].model_copy(deep=True)
+            for did in self._order
+            if did in self.decisions
+        ]
 
     def recent(self, limit: int = 20) -> list[ShadowDecisionRecord]:
         if limit <= 0:
             return []
         return [
-            self.decisions[did] for did in self._order[-limit:] if did in self.decisions
+            self.decisions[did].model_copy(deep=True)
+            for did in self._order[-limit:]
+            if did in self.decisions
         ]
 
     def active(self) -> list[ShadowDecisionRecord]:
@@ -501,9 +586,19 @@ class ShadowRegistry:
         self, decision_id: str | None = None
     ) -> list[ShadowExecutionRecord]:
         records = list(self.executions.values())
-        if decision_id is None:
-            return records
-        return [r for r in records if r.decision_id == decision_id]
+        if decision_id is not None:
+            records = [r for r in records if r.decision_id == decision_id]
+        return [record.model_copy(deep=True) for record in records]
+
+    def execution_for_plan(self, plan_id: str) -> ShadowExecutionRecord | None:
+        execution_id = self._by_plan.get(plan_id)
+        record = self.executions.get(execution_id) if execution_id else None
+        return record.model_copy(deep=True) if record is not None else None
+
+    def execution_for_order(self, client_order_id: str) -> ShadowExecutionRecord | None:
+        execution_id = self._by_order.get(client_order_id)
+        record = self.executions.get(execution_id) if execution_id else None
+        return record.model_copy(deep=True) if record is not None else None
 
     def snapshot(
         self,
@@ -514,6 +609,10 @@ class ShadowRegistry:
         paper_equity: float = 0.0,
         paper_pnl: float = 0.0,
         readiness: ShadowReadiness | None = None,
+        observer_events_seen: int = 0,
+        observer_intentionally_ignored: int = 0,
+        observer_unattributable: int = 0,
+        observer_failures: int = 0,
     ) -> ShadowSnapshot:
         """Counts and ids, never records.
 
@@ -526,7 +625,8 @@ class ShadowRegistry:
             created_at=now_ms,
             session_id=session_id,
             enabled=enabled,
-            decisions_total=len(self.decisions),
+            decisions_total=self.decisions_observed,
+            resident_decisions=len(self.decisions),
             authorized=self.decisions_authorized,
             rejected=self.decisions_rejected,
             paper_plans=self.plans_recorded,
@@ -538,6 +638,10 @@ class ShadowRegistry:
             current_paper_pnl=paper_pnl,
             market_checkpoints=self.checkpoints_captured,
             outcome_checkpoints=self.outcomes_captured,
+            observer_events_seen=observer_events_seen,
+            observer_intentionally_ignored=observer_intentionally_ignored,
+            observer_unattributable=observer_unattributable,
+            observer_failures=observer_failures,
             market_data=self.market_data,
             execution_provenance=ExecutionProvenance.PAPER_SIMULATOR,
             readiness=readiness,
@@ -581,6 +685,9 @@ class ShadowRegistry:
                 self.executions.pop(execution.shadow_execution_id, None)
                 if execution.plan_id is not None:
                     self._by_plan.pop(execution.plan_id, None)
+                for order in execution.orders:
+                    if self._by_order.get(order.client_order_id) == execution.shadow_execution_id:
+                        self._by_order.pop(order.client_order_id, None)
             self.decisions.pop(record.shadow_decision_id, None)
             self._by_opportunity.pop(record.opportunity_id, None)
         self._order = [did for did in self._order if did in self.decisions]
