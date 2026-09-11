@@ -393,7 +393,9 @@ class TestShadowReadSurface:
 
     def test_readiness_cannot_be_ready_when_execution_is_unavailable(self):
         platform = _shadow_platform()
-        platform.state.kill_switch.execution_disabled = True
+        platform.state.kill_switch = platform.state.kill_switch.model_copy(
+            update={"execution_disabled": True}
+        )
         readiness = platform.shadow_readiness(platform.clock.now_ms())
         assert readiness.paper_execution_available is False
         assert readiness.ready is False
