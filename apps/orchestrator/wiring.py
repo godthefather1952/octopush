@@ -581,7 +581,7 @@ class Platform:
             opportunities=self.orchestrator.coordination.opportunities_created_total,
             orders=self.oms.orders_created,
             fills=self.oms.fills_applied,
-            rejections=self.orchestrator.coordination.risk_rejections_total,
+            rejections=self.orchestrator.coordination.opportunity_rejections_total,
             hedges=self.okapi.hedges_requested,
             reconciliations=reconciliation.runs_completed,
             starting_equity=self.settings.paper_initial_balance,
