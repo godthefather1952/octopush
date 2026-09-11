@@ -36,7 +36,7 @@ async def test_bus_start_failure_is_recorded_and_exception_identity_survives(
     )
 
     with pytest.raises(_StartupBoom) as caught:
-        await platform.start(record=False)
+        await platform.start_bus(record=False)
 
     assert caught.value is error
     record = platform.current_session()
