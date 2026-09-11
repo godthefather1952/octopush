@@ -1,6 +1,6 @@
 # Phase 11 — Full-paper operational framework
 
-**Status: VALIDATED / CLOSED at the Phase 11 code-and-contract boundary.**
+**Status: REOPENED / SHUTDOWN REMEDIATION VALIDATED / FIELD RETEST REQUIRED.**
 
 Validation does **not** promote the platform toward live execution. `PreLiveReadinessSnapshot` remains conservative: its live-readiness framework fields still report `NOT_VALIDATED` because Phase 11 code validation is not evidence that the strategy or deployment is ready for real money.
 
@@ -19,6 +19,20 @@ platform did — none of which changes what the platform does.
 
 Frozen Phase 11 audit checkpoint: `d768cb1c044849eab3a341365dd750e93697273e`.
 Phase 11 was audited there, its findings were frozen, then remediation was performed on `validate-phase11-operations`. Earlier-phase baseline CI debt is tracked separately from Phase 11 results.
+
+A later Codespaces field run exposed P11-F1: Docker SIGTERM could stop embedded
+Uvicorn without causing the orchestrator/LUMEN forever-tasks to leave their
+shared wait, allowing Docker's grace period to expire before
+`Platform.stop() -> Recorder.stop() -> finalize_session()`. The affected
+historical PostgreSQL session remains OPEN and is intentionally not rewritten.
+
+The narrow shutdown remediation is on
+`remediate-phase11-graceful-shutdown`. Its production-code checkpoint
+`a0f3a8950218f4c99e6a1d66175f9cb25258c87b` passes a real subprocess
+SIGTERM contract that independently verifies a durable SQLite session becomes
+COMPLETE with non-null `ended_at`, zero `events_lost`, and persisted events.
+A fresh Docker/PostgreSQL field retest is still required before this phase is
+closed again.
 
 ## 2. Construction-only philosophy
 
