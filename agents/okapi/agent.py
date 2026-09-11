@@ -287,6 +287,17 @@ class Okapi:
         now_ms: Millis,
     ) -> OkapiSnapshot:
         reports = self.delta_reports(portfolio, now_ms)
+        # These reports are embedded in an observational snapshot, not
+        # published as events. Give them stable derived identities so two
+        # reads at the same logical instant are equivalent rather than minting
+        # fresh random event ids on every GET.
+        reports = [
+            report.model_copy(
+                update={"event_id": f"snapshot-delta-{report.symbol}-{now_ms}"},
+                deep=True,
+            )
+            for report in reports
+        ]
         symbols = sorted({r.symbol for r in reports} | set(self.desired_delta))
         return OkapiSnapshot(
             created_at=now_ms,
