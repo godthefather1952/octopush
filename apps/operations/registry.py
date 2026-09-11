@@ -132,10 +132,11 @@ class OperationalRegistry:
         record = self._session(session_id)
         if record is None:
             return None
-        record.status = SessionStatus.STARTING
-        record.updated_at = now_ms
-        self.sessions_started += 1
-        self._persist(record)
+        if record.status is SessionStatus.CREATED:
+            record.status = SessionStatus.STARTING
+            record.updated_at = now_ms
+            self.sessions_started += 1
+            self._persist(record)
         return record
 
     def mark_running(
@@ -149,13 +150,15 @@ class OperationalRegistry:
         record = self._session(session_id)
         if record is None:
             return None
-        if record.status is SessionStatus.FAILED:
+        if record.status in (SessionStatus.FAILED, SessionStatus.STOPPED):
             return record
-        record.status = SessionStatus.RUNNING
-        record.startup_stage = StartupStage.READY
-        record.started_at = now_ms
-        record.updated_at = now_ms
-        self._persist(record)
+        if record.status is not SessionStatus.RUNNING:
+            record.status = SessionStatus.RUNNING
+            record.startup_stage = StartupStage.READY
+            if record.started_at is None:
+                record.started_at = now_ms
+            record.updated_at = now_ms
+            self._persist(record)
         return record
 
     def mark_stopping(
@@ -164,7 +167,11 @@ class OperationalRegistry:
         record = self._session(session_id)
         if record is None:
             return None
-        if record.status is SessionStatus.FAILED:
+        if record.status in (
+            SessionStatus.FAILED,
+            SessionStatus.STOPPED,
+            SessionStatus.STOPPING,
+        ):
             return record
         record.status = SessionStatus.STOPPING
         record.shutdown_stage = ShutdownStage.REQUESTED
@@ -180,9 +187,12 @@ class OperationalRegistry:
             return None
         if record.status is SessionStatus.FAILED:
             # A run that failed did not later succeed at stopping cleanly.
-            record.stopped_at = now_ms
-            record.updated_at = now_ms
-            self._persist(record)
+            if record.stopped_at is None:
+                record.stopped_at = now_ms
+                record.updated_at = now_ms
+                self._persist(record)
+            return record
+        if record.status is SessionStatus.STOPPED:
             return record
         record.status = SessionStatus.STOPPED
         record.shutdown_stage = ShutdownStage.STOPPED
@@ -211,6 +221,14 @@ class OperationalRegistry:
         record = self._session(session_id)
         if record is None:
             return None
+        if record.status is SessionStatus.STOPPED:
+            return record
+        if record.status is SessionStatus.FAILED:
+            if failure and not record.failure:
+                record.failure = failure
+                record.updated_at = now_ms
+                self._persist(record)
+            return record
         record.status = SessionStatus.FAILED
         record.updated_at = now_ms
         if failure:
@@ -321,6 +339,7 @@ class OperationalRegistry:
         *,
         severity: OperationalIncidentSeverity = OperationalIncidentSeverity.INFO,
         detail: str = "",
+        session_id: str | None = None,
     ) -> OperationalIncident:
         """Record something notable. **Nothing acts on it.**
 
@@ -328,7 +347,11 @@ class OperationalRegistry:
         own, nothing escalates, and nothing halts. ``HealthRegistry`` remains
         the authority on component health and the kill switch on stopping.
         """
+        target_session = (
+            session_id if session_id is not None else self.current_session_id
+        )
         incident = OperationalIncident(
+            session_id=target_session,
             created_at=now_ms,
             component=component,
             severity=severity,
@@ -370,10 +393,21 @@ class OperationalRegistry:
     def session_annotations(self, session_id: str) -> list[OperatorAnnotation]:
         return list(self.annotations.get(session_id, []))
 
-    def open_incidents(self) -> list[OperationalIncident]:
-        return [i for i in self.incidents.values() if not i.resolved]
+    def open_incidents(
+        self, *, session_id: str | None = None
+    ) -> list[OperationalIncident]:
+        incidents = [i for i in self.incidents.values() if not i.resolved]
+        if session_id is None:
+            return incidents
+        return [i for i in incidents if i.session_id == session_id]
 
-    def metrics(self, **counts: int) -> OperationalMetrics:
+    def metrics(
+        self,
+        *,
+        ticks: int | None = None,
+        events_recorded: int | None = None,
+        **counts: int,
+    ) -> OperationalMetrics:
         """Counters, for display. Nothing reads these to decide anything.
 
         The per-session counts a caller passes in come from the components
@@ -386,8 +420,12 @@ class OperationalRegistry:
             sessions_started=self.sessions_started,
             sessions_completed=self.sessions_completed,
             sessions_failed=self.sessions_failed,
-            ticks=record.ticks if record else 0,
-            events_recorded=record.events_recorded if record else 0,
+            ticks=(record.ticks if record else 0) if ticks is None else ticks,
+            events_recorded=(
+                (record.events_recorded if record else 0)
+                if events_recorded is None
+                else events_recorded
+            ),
             **counts,
         )
 
@@ -411,10 +449,17 @@ class OperationalRegistry:
         """
         if keep_all:
             return 0
+        blocked_by_incident = {
+            incident.session_id
+            for incident in self.open_incidents()
+            if incident.session_id is not None
+        }
         doomed = [
             record
             for record in self.recent_sessions(len(self._order))
-            if record.is_terminal and record.session_id != self.current_session_id
+            if record.is_terminal
+            and record.session_id != self.current_session_id
+            and record.session_id not in blocked_by_incident
         ]
         for record in doomed:
             self.sessions.pop(record.session_id, None)
