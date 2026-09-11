@@ -150,10 +150,11 @@ class IntelligenceProviderDirectory:
         records a fact about the composition root; it does not cause any
         provider to be used, and nothing reads it to choose one.
         """
-        self._providers[descriptor.name] = descriptor
+        held = descriptor.model_copy(deep=True)
+        self._providers[held.name] = held
         if active:
-            self._active = descriptor.name
-        return descriptor
+            self._active = held.name
+        return held.model_copy(deep=True)
 
     def register_provider(
         self, provider: IntelligenceProvider, *, active: bool = False
@@ -162,14 +163,19 @@ class IntelligenceProviderDirectory:
         return self.register(describe_provider(provider), active=active)
 
     def get(self, name: str) -> IntelligenceProviderDescriptor | None:
-        return self._providers.get(name)
+        descriptor = self._providers.get(name)
+        return descriptor.model_copy(deep=True) if descriptor is not None else None
 
     def all(self) -> list[IntelligenceProviderDescriptor]:
-        return list(self._providers.values())
+        return [
+            descriptor.model_copy(deep=True)
+            for descriptor in self._providers.values()
+        ]
 
     def active(self) -> IntelligenceProviderDescriptor | None:
         """The descriptor for the provider LUMEN is wired with, if recorded."""
-        return self._providers.get(self._active) if self._active else None
+        descriptor = self._providers.get(self._active) if self._active else None
+        return descriptor.model_copy(deep=True) if descriptor is not None else None
 
     def names(self) -> list[str]:
         return list(self._providers.keys())
