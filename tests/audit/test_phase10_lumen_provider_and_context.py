@@ -201,7 +201,7 @@ async def test_analysis_timestamp_matches_the_context_instant_sent_to_provider(s
 
 
 async def test_headline_window_is_measured_against_the_payload_as_of_instant(settings):
-    clock = AdvancingClock(3_600_000)
+    clock = AdvancingClock(3_600_001)
     provider = RecordingProvider()
     lumen = build_lumen(settings, provider=provider, clock=clock)
     symbol = settings.symbols[0]
