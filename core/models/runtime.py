@@ -370,6 +370,9 @@ class OperationalIncident(Base):
     """
 
     incident_id: str = Field(default_factory=lambda: new_id("incident"))
+    #: Canonical recorder/operational session this incident belongs to.
+    #: None is reserved for process-level incidents raised before a session exists.
+    session_id: str | None = None
     created_at: Millis
     component: str = ""
     severity: OperationalIncidentSeverity = OperationalIncidentSeverity.INFO
