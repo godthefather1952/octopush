@@ -124,6 +124,7 @@ class ShadowObserver:
                     EventType.RECONCILIATION_MISMATCH,
                 ],
                 name="shadow-observer",
+                health_relevant=False,
             )
             self._subscribed = True
 
