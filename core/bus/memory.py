@@ -519,11 +519,14 @@ class InMemoryEventBus(EventBus):
         handler: Handler,
         types: Iterable[EventType] | None = None,
         name: str | None = None,
+        *,
+        health_relevant: bool = True,
     ) -> Subscription:
         sub = Subscription(
             name=name or str(getattr(handler, "__qualname__", "handler")),
             types=frozenset(types) if types is not None else None,
             handler=handler,
+            health_relevant=health_relevant,
         )
         self._subs.append(sub)
         return sub
@@ -552,7 +555,8 @@ class InMemoryEventBus(EventBus):
                     await sub.handler(event)
                     sub.delivered += 1
                     self.delivered_count += 1
-                    self._outcomes.record_success()
+                    if sub.health_relevant:
+                        self._outcomes.record_success()
                 except Exception:
                     sub.errors += 1
                     # Recorded BEFORE the optional re-raise: with
@@ -560,7 +564,8 @@ class InMemoryEventBus(EventBus):
                     # is still a failure that happened, and a window that
                     # forgot it would report the healthier of the two possible
                     # answers exactly when the bus is configured to be strict.
-                    self._outcomes.record_error()
+                    if sub.health_relevant:
+                        self._outcomes.record_error()
                     log.exception("handler %s failed on %s", sub.name, event.type)
                     if self._raise:
                         raise
