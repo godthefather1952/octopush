@@ -262,6 +262,7 @@ class RedisStreamBus(EventBus):
             name=name or str(getattr(handler, "__qualname__", "handler")),
             types=frozenset(types) if types is not None else None,
             handler=handler,
+            health_relevant=health_relevant,
         )
         self._subs.append(sub)
         return sub
@@ -336,10 +337,12 @@ class RedisStreamBus(EventBus):
                     await sub.handler(event)
                     sub.delivered += 1
                     self.delivered_count += 1
-                    self._outcomes.record_success()
+                    if sub.health_relevant:
+                        self._outcomes.record_success()
                 except Exception:
                     sub.errors += 1
-                    self._outcomes.record_error()
+                    if sub.health_relevant:
+                        self._outcomes.record_error()
                     log.exception("handler %s failed on %s", sub.name, event.type)
         finally:
             self._inflight -= 1
