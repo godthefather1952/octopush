@@ -255,8 +255,14 @@ class EventBus(ABC):
         handler: Handler,
         types: Iterable[EventType] | None = None,
         name: str | None = None,
+        *,
+        health_relevant: bool = True,
     ) -> Subscription:
-        """Register a handler. Valid before or after ``start()`` (clause 3)."""
+        """Register a handler. Valid before or after ``start()`` (clause 3).
+
+        Observational subscribers can set ``health_relevant=False`` so their
+        presence cannot change the risk-facing delivery-error measurement.
+        """
 
     @abstractmethod
     def unsubscribe(self, subscription: Subscription) -> None: ...
