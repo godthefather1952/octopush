@@ -80,7 +80,7 @@ def test_rune_fast_decision_path_never_calls_the_shared_provider():
 
 
 def test_replay_policy_declares_only_lumen_as_external_intelligence():
-    assert EXTERNAL_INTELLIGENCE_SOURCES == frozenset({"LUMEN"})
+    assert frozenset({"LUMEN"}) == EXTERNAL_INTELLIGENCE_SOURCES
 
 
 async def test_replay_with_an_exploding_provider_never_reinvokes_it(settings):
