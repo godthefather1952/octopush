@@ -60,6 +60,9 @@ class Okapi:
         if not math.isfinite(value):
             raise ValueError("desired delta must be finite")
         self.desired_delta[symbol] = value
+        # Mirror observational metadata on the write path. Snapshot/read
+        # methods must never create or advance registry state.
+        self.target_registry.set_target(symbol, value, self.clock.now_ms())
 
     def target(self, symbol: str) -> float:
         return self.desired_delta.get(symbol, 0.0)
@@ -196,7 +199,6 @@ class Okapi:
     ) -> DeltaSnapshot:
         reports = self.delta_reports(portfolio, now_ms)
         self.hedge_registry.delta_snapshots += 1
-        self.mirror_targets(now_ms)
         return DeltaSnapshot(
             created_at=now_ms,
             reports=reports,
@@ -286,7 +288,6 @@ class Okapi:
     ) -> OkapiSnapshot:
         reports = self.delta_reports(portfolio, now_ms)
         symbols = sorted({r.symbol for r in reports} | set(self.desired_delta))
-        self.mirror_targets(now_ms)
         return OkapiSnapshot(
             created_at=now_ms,
             targets=self.target_registry.all_targets(),
