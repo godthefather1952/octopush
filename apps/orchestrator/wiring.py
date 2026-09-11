@@ -215,27 +215,46 @@ class Platform:
     def session_id(self) -> str:
         return self.recorder.session_id
 
-    async def start(self, *, record: bool = True, feeds: bool = True) -> None:
-        """Start the platform and witness the real startup order.
+    def prepare_start(self, *, record: bool = True, feeds: bool = True) -> None:
+        """Open the canonical session record before externally-owned startup.
 
-        ``feeds=False`` leaves the venue adapters and the synthetic driver
-        stopped, which is what replay wants: the recorded events *are* the
-        market, and a live feed running alongside them would corrupt the run.
+        The production CLI starts the event bus before Platform.start().  This
+        hook lets Phase 11 witness that action without changing Platform.start()
+        semantics used by deterministic tests and direct callers.
         """
-        if self._started:
-            return
         now = self.clock.now_ms()
         self.operations.create_session(self.session_manifest(now, recording=record), now)
         self.operations.mark_starting(now)
         self._feeds_requested = feeds
-        try:
-            # The process always started the bus before storage and feeds.
-            # Keeping that action inside Platform.start() lets the operational
-            # record witness a bus-start failure without changing the order.
-            self.operations.set_startup_stage(StartupStage.BUS, self.clock.now_ms())
-            await self.bus.start()
-            self._bus_started = True
 
+    async def start_bus(self) -> None:
+        """Start the bus under the Phase 11 lifecycle witness."""
+        self.prepare_start()
+        self.operations.set_startup_stage(StartupStage.BUS, self.clock.now_ms())
+        try:
+            await self.bus.start()
+        except BaseException as exc:
+            self.operations.mark_failed(
+                self.clock.now_ms(), failure=f"{type(exc).__name__}: {exc}"
+            )
+            raise
+        self._bus_started = True
+
+    async def start(self, *, record: bool = True, feeds: bool = True) -> None:
+        """Start platform-owned storage and feeds.
+
+        ``feeds=False`` leaves the venue adapters and the synthetic driver
+        stopped, which is what replay wants: the recorded events *are* the
+        market, and a live feed running alongside them would corrupt the run.
+
+        Event-bus startup remains caller-owned, as it was before Phase 11.
+        The production CLI calls :meth:`start_bus` first; deterministic tests
+        may continue using publish/drain without a background dispatcher.
+        """
+        if self._started:
+            return
+        self.prepare_start(record=record, feeds=feeds)
+        try:
             if record:
                 self.operations.set_startup_stage(
                     StartupStage.STORAGE, self.clock.now_ms()
