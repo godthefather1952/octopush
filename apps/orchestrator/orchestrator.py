@@ -1260,6 +1260,7 @@ class Orchestrator:
         self.coordination.count_tick(risk_evaluations=1, now_ms=now)
         if not decision.approved:
             self.state.record_rejection(decision)
+            self.coordination.count_risk_rejection()
             for gate in decision.failed_gates:
                 self.metrics.inc(M.RISK_REJECTIONS, gate=gate.name)
             await self._reject(record, "RISK_REJECTED")
