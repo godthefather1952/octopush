@@ -152,3 +152,19 @@ After CI:
 4. define narrow remediation batches;
 5. present the exact first remediation prompt;
 6. stop before production mutation and request explicit approval.
+
+
+## Initial PR validation checkpoint
+
+Draft PR #5, candidate audit run #197:
+
+- paper boundary: PASS;
+- startup refusal of non-paper mode: PASS;
+- mypy(core): PASS;
+- Ruff: only the three documented repository baselines;
+- Python 3.11: the known packaging baseline only
+  (`1 failed / 1381 passed / 126 skipped`);
+- PostgreSQL/Redis backend precheck: PASS;
+- Python 3.12 full suite: running when this checkpoint was recorded.
+
+No Phase 10 production file has been modified.
