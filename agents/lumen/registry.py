@@ -140,13 +140,17 @@ class IntelligenceRegistry:
         folded into "old": not knowing when something was published is a
         different fact from knowing it is stale.
         """
-        items = list(evidence or [])
+        items = [item.model_copy(deep=True) for item in (evidence or [])]
         published = [item.published_at for item in items if item.published_at is not None]
         bundle = IntelligenceEvidenceBundle(
             created_at=now_ms,
             symbol=symbol,
             evidence=items,
-            market_context=market_context,
+            market_context=(
+                market_context.model_copy(deep=True)
+                if market_context is not None
+                else None
+            ),
             source_count=len({item.source for item in items if item.source}),
             latest_published_at=max(published) if published else None,
             complete=complete,
@@ -154,17 +158,27 @@ class IntelligenceRegistry:
         self.bundles[bundle.bundle_id] = bundle
         self.evidence_bundles += 1
         if self.store is not None:
-            self.store.put_evidence_bundle(bundle)
-        return bundle
+            try:
+                self.store.put_evidence_bundle(bundle)
+            except Exception:
+                log.exception(
+                    "optional intelligence bundle persistence failed",
+                    extra={"bundle_id": bundle.bundle_id},
+                )
+        return bundle.model_copy(deep=True)
 
     def get_bundle(self, bundle_id: str) -> IntelligenceEvidenceBundle | None:
-        return self.bundles.get(bundle_id)
+        bundle = self.bundles.get(bundle_id)
+        return bundle.model_copy(deep=True) if bundle is not None else None
 
     def evidence_bundle_list(self, limit: int = 20) -> list[IntelligenceEvidenceBundle]:
         """The most recently registered bundles, newest last."""
         if limit <= 0:
             return []
-        return list(self.bundles.values())[-limit:]
+        return [
+            bundle.model_copy(deep=True)
+            for bundle in list(self.bundles.values())[-limit:]
+        ]
 
     def known_evidence_identities(self) -> set[str]:
         """Identity keys for every item in every resident bundle.
@@ -354,16 +368,14 @@ class IntelligenceRegistry:
         record = self.analyses.get(analysis_id)
         if record is None:
             return None
-        if record.status not in (
-            IntelligenceRunStatus.UNAVAILABLE,
-            IntelligenceRunStatus.FAILED,
-        ):
-            record.status = IntelligenceRunStatus.COMPLETED
+        if record.is_terminal:
+            return record.model_copy(deep=True)
+        record.status = IntelligenceRunStatus.COMPLETED
         record.completed_at = now_ms
         record.updated_at = now_ms
         self.analyses_completed += 1
         self._persist(record)
-        return record
+        return record.model_copy(deep=True)
 
     def mark_unavailable(
         self, analysis_id: str, now_ms: Millis, *, error: str = ""
@@ -377,6 +389,8 @@ class IntelligenceRegistry:
         record = self.analyses.get(analysis_id)
         if record is None:
             return None
+        if record.is_terminal:
+            return record.model_copy(deep=True)
         record.status = IntelligenceRunStatus.UNAVAILABLE
         record.provider_unavailable = True
         record.completed_at = now_ms
@@ -384,7 +398,7 @@ class IntelligenceRegistry:
         if error:
             record.error = error
         self._persist(record)
-        return record
+        return record.model_copy(deep=True)
 
     def mark_failed(
         self, analysis_id: str, now_ms: Millis, *, error: str = ""
@@ -392,13 +406,15 @@ class IntelligenceRegistry:
         record = self.analyses.get(analysis_id)
         if record is None:
             return None
+        if record.is_terminal:
+            return record.model_copy(deep=True)
         record.status = IntelligenceRunStatus.FAILED
         record.completed_at = now_ms
         record.updated_at = now_ms
         if error:
             record.error = error
         self._persist(record)
-        return record
+        return record.model_copy(deep=True)
 
     def mark_malformed(
         self, analysis_id: str, now_ms: Millis, *, error: str = ""
@@ -414,6 +430,8 @@ class IntelligenceRegistry:
         record = self.analyses.get(analysis_id)
         if record is None:
             return None
+        if record.is_terminal:
+            return record.model_copy(deep=True)
         record.malformed_response = True
         record.status = IntelligenceRunStatus.FAILED
         record.completed_at = now_ms
@@ -422,7 +440,7 @@ class IntelligenceRegistry:
             record.error = error
         self.malformed_responses += 1
         self._persist(record)
-        return record
+        return record.model_copy(deep=True)
 
     def link_opinion(
         self, analysis_id: str, ref: PublishedOpinionRef, now_ms: Millis
@@ -437,59 +455,87 @@ class IntelligenceRegistry:
         record = self.analyses.get(analysis_id)
         if record is None:
             return None
-        record.published_opinion_ref = ref
+        if record.status is IntelligenceRunStatus.PUBLISHED:
+            return record.model_copy(deep=True)
+        if record.status in (
+            IntelligenceRunStatus.UNAVAILABLE,
+            IntelligenceRunStatus.FAILED,
+        ):
+            return record.model_copy(deep=True)
+        held_ref = ref.model_copy(deep=True)
+        record.published_opinion_ref = held_ref
         record.status = IntelligenceRunStatus.PUBLISHED
         record.updated_at = now_ms
-        if ref.symbol:
-            self._latest_opinion[ref.symbol] = ref
+        if held_ref.symbol:
+            self._latest_opinion[held_ref.symbol] = held_ref.model_copy(deep=True)
         self.opinions_published += 1
         self._persist(record)
-        return record
+        return record.model_copy(deep=True)
 
     # ------------------------------------------------------------------
     # queries
     # ------------------------------------------------------------------
 
     def get_analysis(self, analysis_id: str) -> IntelligenceAnalysisRecord | None:
-        return self.analyses.get(analysis_id)
+        record = self.analyses.get(analysis_id)
+        return record.model_copy(deep=True) if record is not None else None
 
     def all_analyses(self) -> list[IntelligenceAnalysisRecord]:
         """Every resident analysis, oldest first."""
-        return [self.analyses[aid] for aid in self._order if aid in self.analyses]
+        return [
+            self.analyses[aid].model_copy(deep=True)
+            for aid in self._order
+            if aid in self.analyses
+        ]
 
     def recent_analyses(self, limit: int = 20) -> list[IntelligenceAnalysisRecord]:
         """The most recent analyses, newest last."""
         if limit <= 0:
             return []
         return [
-            self.analyses[aid] for aid in self._order[-limit:] if aid in self.analyses
+            self.analyses[aid].model_copy(deep=True)
+            for aid in self._order[-limit:]
+            if aid in self.analyses
         ]
 
     def analyses_for_symbol(self, symbol: str) -> list[IntelligenceAnalysisRecord]:
-        return [record for record in self.all_analyses() if record.symbol == symbol]
+        return [
+            record.model_copy(deep=True)
+            for record in self.analyses.values()
+            if record.symbol == symbol
+        ]
 
     def latest_for_symbol(self, symbol: str) -> IntelligenceAnalysisRecord | None:
         analysis_id = self._latest_by_symbol.get(symbol)
-        return self.analyses.get(analysis_id) if analysis_id else None
+        record = self.analyses.get(analysis_id) if analysis_id else None
+        return record.model_copy(deep=True) if record is not None else None
 
     def latest_opinion_for_symbol(self, symbol: str) -> PublishedOpinionRef | None:
-        return self._latest_opinion.get(symbol)
+        ref = self._latest_opinion.get(symbol)
+        return ref.model_copy(deep=True) if ref is not None else None
 
     def latest_opinions(self) -> dict[str, PublishedOpinionRef]:
-        return dict(self._latest_opinion)
+        return {
+            symbol: ref.model_copy(deep=True)
+            for symbol, ref in self._latest_opinion.items()
+        }
 
     def latest_analysis_ids(self) -> dict[str, str]:
         return dict(self._latest_by_symbol)
 
     def pending(self) -> list[IntelligenceAnalysisRecord]:
         """Analyses that have not reached a terminal state."""
-        return [record for record in self.all_analyses() if not record.is_terminal]
+        return [
+            record.model_copy(deep=True)
+            for record in self.analyses.values()
+            if not record.is_terminal
+        ]
 
     def unavailable(self) -> list[IntelligenceAnalysisRecord]:
         """Analyses whose provider declined or could not be reached."""
         return [
-            record
-            for record in self.all_analyses()
+            record.model_copy(deep=True)
+            for record in self.analyses.values()
             if record.status is IntelligenceRunStatus.UNAVAILABLE
         ]
 
@@ -578,8 +624,15 @@ class IntelligenceRegistry:
     # ------------------------------------------------------------------
 
     def _persist(self, record: IntelligenceAnalysisRecord) -> None:
-        if self.store is not None:
+        if self.store is None:
+            return
+        try:
             self.store.put_analysis(record)
+        except Exception:
+            log.exception(
+                "optional intelligence analysis persistence failed",
+                extra={"analysis_id": record.analysis_id},
+            )
 
 
 __all__ = ["IntelligenceRegistry", "IntelligenceStore"]
