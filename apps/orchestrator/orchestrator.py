@@ -285,6 +285,7 @@ class Orchestrator:
     async def _reject(self, record: OpportunityRecord, reason: str) -> None:
         record.rejected_reason = reason
         self.metrics.inc(M.OPPORTUNITIES_REJECTED, stage=reason)
+        self.coordination.count_opportunity_rejection()
         await self.transition(record, StrategyState.REJECTED)
 
     # -- the tick ----------------------------------------------------------
