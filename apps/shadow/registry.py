@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 
 from core.models.common import Millis
 from core.models.shadow import (
+    SHADOW_TERMINAL_STATUSES,
     ExecutionProvenance,
     MarketDataProvenance,
     ShadowDecisionRecord,
