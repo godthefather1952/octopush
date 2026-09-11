@@ -2,11 +2,13 @@
 
 ## Final status
 
-**VALIDATED / CLOSED**
+**REOPENED / REMEDIATION VALIDATED / FIELD RETEST REQUIRED**
 
 Repository: `godthefather1952/octopush`
 
-Branch: `validate-phase11-operations`
+Original validation branch: `validate-phase11-operations`
+
+Field-remediation branch: `remediate-phase11-graceful-shutdown`
 
 Frozen audit checkpoint:
 
@@ -24,6 +26,109 @@ live trading and does not change the meaning of the conservative
 `PreLiveReadinessSnapshot` live-readiness claims.
 
 ---
+
+## Field finding after initial closure
+
+### P11-F1 — Docker SIGTERM could leave a durable session OPEN
+
+**Severity:** HIGH
+
+A real Codespaces/Docker paper run on final documented Phase 11 checkpoint
+`677c71bd4b7b8c561a5b9c8e7aefb527f2aa104d` ran for 8,351 orchestrator
+ticks and reported 162,968 events recorded, 320 paper orders, 306 paper fills,
+32 hedges and 418 reconciliations with no runtime error and the PAPER boundary
+intact.
+
+The operator then stopped the stack with `./stop-paper.sh`. Docker removed the
+trading-floor container after approximately 10.6 seconds and preserved the
+PostgreSQL volume. Direct inspection of the exact session afterwards showed:
+
+```
+session_id    session-575e8faf35e04e4592afe87da7bb04cb
+status        OPEN
+ended_at      NULL
+events_lost   0
+```
+
+The historical row remains intentionally untouched. `events_lost = 0` on an
+OPEN session is not proof that the final recorder tail was flushed, so
+retroactively certifying it COMPLETE would violate the recorder-integrity
+contract.
+
+**Root cause:** the embedded Uvicorn server could own SIGTERM/SIGINT while the
+top-level process awaited `asyncio.gather()` across Uvicorn plus the
+never-ending orchestrator and LUMEN loops. Uvicorn could shut down its API task
+without causing those other tasks to finish. The process therefore remained
+alive until Docker's termination grace expired, so the canonical
+`Platform.stop() -> Recorder.stop() -> EventStore.finalize_session()` path
+was never guaranteed to run.
+
+**Remediation:** `apps/orchestrator/__main__.py` now gives the trading-floor
+process explicit ownership of SIGTERM/SIGINT through one shared stop event.
+Embedded Uvicorn opts out of installing competing signal handlers across both
+older (`install_signal_handlers`) and newer (`capture_signals`) Uvicorn
+interfaces. A signal, duration expiry or clean runtime-task termination now
+converges on the existing ordered shutdown path exactly once:
+
+```
+STOPPING_API
+STOPPING_LOOPS
+STOPPING_FEEDS
+DRAINING_BUS
+STOPPING_RECORDER
+Recorder.stop()
+EventStore.finalize_session()
+STOPPED
+```
+
+No trading economics, risk gate, execution behavior, reconciliation semantics,
+hedging economics, intelligence behavior, CI configuration or PAPER boundary
+was changed. `scripts/stop-paper.sh` did not need a second lifecycle
+implementation or a larger Docker kill timeout.
+
+**Permanent regression test:**
+`tests/contract/test_phase11_process_shutdown.py` launches the real
+`python -m apps.orchestrator` process with an embedded API and a temporary
+durable SQLite store, waits for a recorded event, sends a real POSIX SIGTERM,
+requires a bounded clean process exit, then independently reopens SQLite and
+asserts that the exact session is COMPLETE, has a non-null `ended_at`, reports
+zero `events_lost`, and contains persisted events.
+
+The test is deliberately a subprocess contract rather than another direct
+`await platform.stop()` test, because direct cleanup was already passing and
+could not reproduce the field failure.
+
+### Automated validation of P11-F1 remediation
+
+Validated production-code checkpoint:
+
+`a0f3a8950218f4c99e6a1d66175f9cb25258c87b`
+
+Python 3.11 unit + contract result:
+
+```
+1 failed, 1382 passed, 126 skipped in 63.57s
+```
+
+The sole failure is the pre-existing packaging assertion for
+`${TF_FEED:-simulated}`. The ordinary pre-remediation baseline was
+`1 failed, 1381 passed, 126 skipped`, so the new process-level SIGTERM
+contract contributed one additional passing test and no additional failure.
+
+Other gates at the same production-code checkpoint:
+
+- PAPER boundary: **PASS**
+- mypy(core): **PASS**
+- Ruff: exactly the same three baseline findings only
+  (`agents/marin/agent.py` I001, `agents/marin/source.py` I001,
+  `agents/okapi/registry.py` SIM102)
+- New Phase 11 Ruff findings: **0**
+
+A real Docker/PostgreSQL field retest remains required before Phase 11 can be
+closed again. The retest must create a new session, stop it through
+`./stop-paper.sh`, then prove that new row is COMPLETE with non-null
+`ended_at`, zero `events_lost`, and persisted events. The historical OPEN
+session above must remain unchanged.
 
 ## Scope
 
@@ -342,20 +447,31 @@ the non-published snapshot representation.
 
 ## Final disposition
 
-Frozen Phase 11 findings: **9**
+Original frozen Phase 11 findings: **9**
 
-Remediated: **9 / 9**
+Original remediation: **9 / 9**
 
-Dedicated Phase 11 tests: **14 / 14 passing**
+Post-closure field findings: **1**
 
-New paper-boundary regressions: **0**
+P11-F1 automated remediation: **VALIDATED**
 
-New mypy(core) regressions: **0**
+Permanent process-level SIGTERM contract: **PASS**
 
-New Ruff regressions: **0**
+Python 3.11 new regressions: **0** (only the known packaging baseline remains)
 
-New Python 3.11 unit/contract regressions: **0**
+PAPER-boundary regressions: **0**
 
-Known repository baseline debt remains explicitly out of Phase 11 scope.
+mypy(core) regressions: **0**
 
-**PHASE 11 — VALIDATED / CLOSED**
+Ruff regressions: **0** (three known baseline findings remain)
+
+Historical affected PostgreSQL session:
+`session-575e8faf35e04e4592afe87da7bb04cb` — **OPEN / intentionally untouched**
+
+Phase 11 is **not closed again yet**. The code-level remediation is validated,
+but the exact Docker/Codespaces shutdown path that exposed P11-F1 must be
+retested against PostgreSQL and produce a new COMPLETE session before closure.
+
+**Current status: PHASE 11 REOPENED / REMEDIATION VALIDATED / FIELD RETEST REQUIRED**
+
+Do not begin Phase 12 until that field retest passes.
