@@ -62,9 +62,12 @@ _STATE_STATUS: dict[str, ShadowDecisionStatus] = {
     "AUTHORIZED": ShadowDecisionStatus.AUTHORIZED,
     "EXECUTING": ShadowDecisionStatus.PAPER_WORKING,
     "WORKING": ShadowDecisionStatus.PAPER_WORKING,
+    "HEDGING": ShadowDecisionStatus.PAPER_WORKING,
+    "RECONCILING": ShadowDecisionStatus.PAPER_WORKING,
+    "MONITORING": ShadowDecisionStatus.PAPER_WORKING,
     "EXITING": ShadowDecisionStatus.PAPER_WORKING,
     "CLOSED": ShadowDecisionStatus.CLOSED,
-    "REJECTED": ShadowDecisionStatus.RISK_REJECTED,
+    "REJECTED": ShadowDecisionStatus.REJECTED,
 }
 
 
@@ -88,7 +91,9 @@ class ShadowObserver:
         #: True only under the SHADOW profile. See the module docstring.
         self.enabled = enabled
         self.events_seen = 0
-        self.events_ignored = 0
+        self.events_intentionally_ignored = 0
+        self.events_unattributable = 0
+        self.handler_failures = 0
         self._subscribed = False
 
     # -- wiring ------------------------------------------------------------
@@ -144,8 +149,8 @@ class ShadowObserver:
         try:
             self._dispatch(event)
         except Exception:  # pragma: no cover - defensive, see docstring
-            self.events_ignored += 1
-            log.debug(
+            self.handler_failures += 1
+            log.warning(
                 "shadow observer could not record an event",
                 extra={"type": event.type.value},
                 exc_info=True,
@@ -170,7 +175,7 @@ class ShadowObserver:
             # observer sees the whole shape of a session, but linking a hedge
             # or a run to a decision needs evidence the event does not carry.
             # An invented link is worse than none.
-            self.events_ignored += 1
+            self.events_intentionally_ignored += 1
             return
         handler(event)
 
@@ -184,8 +189,12 @@ class ShadowObserver:
         """
         correlation = event.correlation_id
         if not correlation:
+            self.events_unattributable += 1
             return None
-        return self.registry.for_opportunity(correlation)
+        record = self.registry.for_opportunity(correlation)
+        if record is None:
+            self.events_unattributable += 1
+        return record
 
     # -- handlers ----------------------------------------------------------
 
@@ -243,7 +252,7 @@ class ShadowObserver:
         if not decision_id:
             return
         verdict = str(payload.get("verdict", "")).upper()
-        approved = verdict == "APPROVED" if verdict else None
+        approved = verdict in {"APPROVED", "APPROVED_REDUCED"} if verdict else None
         self.registry.link_risk(
             record.shadow_decision_id,
             str(decision_id),
@@ -282,15 +291,33 @@ class ShadowObserver:
         record = self._decision_for(event)
         if record is None:
             return
+        payload = event.payload
+        plan_id = payload.get("plan_id")
+        if not plan_id:
+            self.events_unattributable += 1
+            return
+        execution = self.registry.execution_for_plan(str(plan_id))
+        if execution is None:
+            self.events_unattributable += 1
+            return
         order_ids = [
             str(o.get("client_order_id"))
-            for o in event.payload.get("orders", [])
+            for o in payload.get("orders", [])
             if isinstance(o, dict) and o.get("client_order_id")
         ]
         if order_ids:
             self.registry.link_orders(
                 record.shadow_decision_id, order_ids, event.ts_ms
             )
+        self.registry.set_execution_status(
+            execution.shadow_execution_id,
+            (
+                ShadowDecisionStatus.PAPER_COMPLETE
+                if bool(payload.get("complete"))
+                else ShadowDecisionStatus.PAPER_WORKING
+            ),
+            event.ts_ms,
+        )
 
     def _on_order(self, event: Event) -> None:
         """Copy one paper order's current state onto its execution record.
@@ -304,12 +331,12 @@ class ShadowObserver:
             return
         payload = event.payload
         plan_id = payload.get("plan_id")
-        executions = self.registry.execution_records(record.shadow_decision_id)
-        execution = next(
-            (e for e in executions if plan_id and e.plan_id == str(plan_id)),
-            executions[-1] if executions else None,
-        )
+        if not plan_id:
+            self.events_unattributable += 1
+            return
+        execution = self.registry.execution_for_plan(str(plan_id))
         if execution is None:
+            self.events_unattributable += 1
             return
         summary = ShadowOrderSummary(
             client_order_id=str(payload.get("client_order_id", "")),
@@ -330,7 +357,13 @@ class ShadowObserver:
         self.registry.record_orders(
             execution.shadow_execution_id, [*others, summary], event.ts_ms
         )
-        if str(payload.get("status", "")).upper() == "UNKNOWN":
+        order_status = str(payload.get("status", "")).upper()
+        if order_status == "UNKNOWN":
+            self.registry.set_execution_status(
+                execution.shadow_execution_id,
+                ShadowDecisionStatus.UNKNOWN,
+                event.ts_ms,
+            )
             # UNKNOWN propagates upward and is never auto-resolved: the
             # rehearsal cannot claim to know what happened to an order the
             # platform cannot see.
@@ -339,6 +372,12 @@ class ShadowObserver:
                 ShadowDecisionStatus.UNKNOWN,
                 event.ts_ms,
                 reason="ORDER_UNKNOWN",
+            )
+        else:
+            self.registry.set_execution_status(
+                execution.shadow_execution_id,
+                ShadowDecisionStatus.PAPER_WORKING,
+                event.ts_ms,
             )
 
     def _on_fill(self, event: Event) -> None:
@@ -351,16 +390,24 @@ class ShadowObserver:
         record = self._decision_for(event)
         if record is None:
             return
-        executions = self.registry.execution_records(record.shadow_decision_id)
-        if not executions:
-            return
-        execution = executions[-1]
         payload = event.payload
-        fill_id = payload.get("fill_id") or payload.get("event_id")
-        notional = float(payload.get("notional", 0.0) or 0.0)
+        fill_id = payload.get("fill_id")
+        client_order_id = payload.get("client_order_id")
+        if not fill_id or not client_order_id:
+            self.events_unattributable += 1
+            return
+        execution = self.registry.execution_for_order(str(client_order_id))
+        if execution is None:
+            self.events_unattributable += 1
+            return
+        if str(fill_id) in execution.paper_fill_ids:
+            return
+        quantity = float(payload.get("quantity", 0.0) or 0.0)
+        price = float(payload.get("price", 0.0) or 0.0)
+        notional = quantity * price
         self.registry.link_fills(
             execution.shadow_execution_id,
-            [str(fill_id)] if fill_id else [],
+            [str(fill_id)],
             event.ts_ms,
             paper_filled_notional=execution.paper_filled_notional + notional,
             paper_fees=execution.paper_fees + float(payload.get("fee", 0.0) or 0.0),
@@ -382,7 +429,13 @@ class ShadowObserver:
         status = _STATE_STATUS.get(target)
         if status is None:
             return
-        self.registry.set_status(record.shadow_decision_id, status, event.ts_ms)
+        reason = str(detail.get("reason", "") or "")
+        self.registry.set_status(
+            record.shadow_decision_id,
+            status,
+            event.ts_ms,
+            reason=reason,
+        )
 
     # -- explicit capture seams -------------------------------------------
 
