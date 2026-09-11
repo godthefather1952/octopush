@@ -69,7 +69,8 @@ async def run(args: argparse.Namespace) -> None:
         },
     )
 
-    await platform.start(record=not args.no_record)
+    await platform.start_bus(record=not args.no_record, feeds=True)
+    await platform.start(record=not args.no_record, feeds=True)
 
     tasks = [
         asyncio.create_task(platform.orchestrator.run_forever(), name="orchestrator"),
