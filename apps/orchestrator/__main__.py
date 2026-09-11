@@ -17,6 +17,7 @@ from apps.api.app import create_app
 from apps.orchestrator.wiring import build_platform
 from core.config import load_settings
 from core.logging import configure_logging
+from core.models.runtime import ShutdownStage
 
 log = logging.getLogger("apps.orchestrator")
 
@@ -68,7 +69,6 @@ async def run(args: argparse.Namespace) -> None:
         },
     )
 
-    await platform.bus.start()
     await platform.start(record=not args.no_record)
 
     tasks = [
@@ -100,13 +100,22 @@ async def run(args: argparse.Namespace) -> None:
     except (KeyboardInterrupt, asyncio.CancelledError):  # pragma: no cover
         pass
     finally:
+        # Phase 11 witnesses the same shutdown order the process has always
+        # used. These observations do not control or suppress shutdown.
+        platform.operations.mark_stopping(platform.clock.now_ms())
         api_task = next((t for t in tasks if t.get_name() == "api"), None)
         if server is not None and api_task is not None:
+            platform.operations.set_shutdown_stage(
+                ShutdownStage.STOPPING_API, platform.clock.now_ms()
+            )
             # Let uvicorn unwind its own lifespan before anything is cancelled,
             # otherwise every shutdown prints a CancelledError traceback.
             server.should_exit = True
             with contextlib.suppress(TimeoutError, Exception):
                 await asyncio.wait_for(asyncio.shield(api_task), timeout=5.0)
+        platform.operations.set_shutdown_stage(
+            ShutdownStage.STOPPING_LOOPS, platform.clock.now_ms()
+        )
         for task in tasks:
             task.cancel()
         for task in tasks:
