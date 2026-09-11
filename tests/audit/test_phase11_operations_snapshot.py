@@ -74,7 +74,7 @@ async def test_session_summary_matches_authoritative_session_counters(platform) 
         assert summary.fills == platform.oms.fills_applied
         assert (
             summary.rejections
-            == platform.orchestrator.coordination.risk_rejections_total
+            == platform.orchestrator.coordination.opportunity_rejections_total
         )
         assert summary.hedges == platform.okapi.hedges_requested
         assert summary.reconciliations == platform.marin.metrics().runs_completed
