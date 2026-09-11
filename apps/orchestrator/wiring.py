@@ -640,32 +640,104 @@ class Platform:
         someone to later set True, and there must be no such place.
         """
         live_feed = self.settings.feed is FeedKind.LIVE
+        paper_mode = self.settings.mode is TradingMode.PAPER
+        market = self.state.market
+        market_available = (
+            market is not None
+            and any(
+                sum(1 for state in market.states_for(symbol) if state.quality.is_usable) >= 2
+                for symbol in self.settings.symbols
+            )
+        )
+        recording_active = self._recording and self.recorder.healthy
+        coordination = self.orchestrator.coordination_readiness(now_ms)
+        risk_available = (
+            self.health.status_of(AgentId.RUNE.value, now_ms) is HealthStatus.HEALTHY
+        )
+        paper_execution_available = (
+            not self.state.kill_switch.execution_disabled
+            and self.health.status_of("VESKA", now_ms) is HealthStatus.HEALTHY
+        )
+        reconciliation_available = (
+            self.marin.last_result is not None
+            and self.marin.last_result.ok
+            and self.health.status_of("MARIN", now_ms) is HealthStatus.HEALTHY
+        )
+        hedging_available = (
+            market is not None
+            and self.health.status_of("OKAPI", now_ms) is HealthStatus.HEALTHY
+            and bool(self.settings.symbols)
+            and all(self.okapi.hedge_available(symbol, market) for symbol in self.settings.symbols)
+        )
+        private_execution_absent = (
+            isinstance(self.executor, PaperExecutor)
+            and self.executor.is_paper
+            and all(
+                not adapter.capabilities.authenticated
+                and not adapter.capabilities.order_submission
+                for adapter in self.adapters.values()
+            )
+        )
+        observer_healthy = (
+            self.shadow_observer is None
+            or (
+                self.shadow_observer.handler_failures == 0
+                and self.shadow_observer.events_unattributable == 0
+            )
+        )
+
         reasons: list[str] = []
         if not self.is_shadow:
             reasons.append("PROFILE_NOT_SHADOW")
+        if not paper_mode:
+            reasons.append("PAPER_MODE_NOT_CONFIRMED")
         if not live_feed:
             reasons.append("FEED_NOT_PUBLIC_LIVE")
-        if self.state.market is None:
-            reasons.append("NO_MARKET_STATE")
+        if not market_available:
+            reasons.append("NO_USABLE_MARKET_STATE")
         if not self._recording:
             reasons.append("NOT_RECORDING")
+        elif not self.recorder.healthy:
+            reasons.append("RECORDER_UNHEALTHY")
+        if not coordination.ready:
+            reasons.append("COORDINATION_NOT_READY")
+        if not risk_available:
+            reasons.append("RISK_UNAVAILABLE")
+        if not paper_execution_available:
+            reasons.append("PAPER_EXECUTION_UNAVAILABLE")
         if self.marin.last_result is None:
             reasons.append("NO_RECONCILIATION_BASELINE")
+        elif not reconciliation_available:
+            reasons.append("RECONCILIATION_UNAVAILABLE")
+        if not hedging_available:
+            reasons.append("HEDGING_UNAVAILABLE")
+        if not private_execution_absent:
+            reasons.append("PRIVATE_EXECUTION_PRESENT")
+        if self.shadow_observer is not None:
+            if self.shadow_observer.events_unattributable:
+                reasons.append(
+                    f"OBSERVER_UNATTRIBUTABLE:{self.shadow_observer.events_unattributable}"
+                )
+            if self.shadow_observer.handler_failures:
+                reasons.append(
+                    f"OBSERVER_FAILURES:{self.shadow_observer.handler_failures}"
+                )
 
         return ShadowReadiness(
             ready=not reasons,
             created_at=now_ms,
             profile_is_shadow=self.is_shadow,
-            paper_mode_confirmed=self.settings.mode is TradingMode.PAPER,
+            paper_mode_confirmed=paper_mode,
             public_live_feed_configured=live_feed,
-            market_data_available=self.state.market is not None,
-            recording_active=self._recording,
-            coordination_available=True,
-            risk_available=True,
-            paper_execution_available=not self.state.kill_switch.execution_disabled,
-            reconciliation_available=self.marin.last_result is not None,
-            hedging_available=bool(self.okapi.desired_delta),
-            private_execution_absent=True,
+            market_data_available=market_available,
+            recording_active=recording_active,
+            coordination_available=coordination.ready,
+            risk_available=risk_available,
+            paper_execution_available=paper_execution_available,
+            reconciliation_available=reconciliation_available,
+            hedging_available=hedging_available,
+            observer_healthy=observer_healthy,
+            private_execution_absent=private_execution_absent,
             reason_codes=reasons,
         )
 
@@ -687,6 +759,22 @@ class Platform:
             paper_equity=(portfolio.equity if portfolio else 0.0),
             paper_pnl=(portfolio.net_pnl if portfolio else 0.0),
             readiness=self.shadow_readiness(now_ms),
+            observer_events_seen=(
+                self.shadow_observer.events_seen if self.shadow_observer else 0
+            ),
+            observer_intentionally_ignored=(
+                self.shadow_observer.events_intentionally_ignored
+                if self.shadow_observer
+                else 0
+            ),
+            observer_unattributable=(
+                self.shadow_observer.events_unattributable
+                if self.shadow_observer
+                else 0
+            ),
+            observer_failures=(
+                self.shadow_observer.handler_failures if self.shadow_observer else 0
+            ),
         )
 
     def shadow_decision(self, decision_id: str):
