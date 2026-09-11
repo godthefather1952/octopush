@@ -7,9 +7,9 @@ from agents.lumen.provider import ClaudeProvider, NullProvider, ScriptedProvider
 from agents.lumen.providers import describe_provider
 from core.models.intelligence import IntelligenceRunStatus
 from tests.audit.phase10_fixtures import (
+    VALID_RESPONSE,
     AdvancingClock,
     RecordingProvider,
-    VALID_RESPONSE,
     build_lumen,
     market_state,
 )
