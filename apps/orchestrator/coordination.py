@@ -142,6 +142,7 @@ class CoordinationRegistry:
     traces_closed: int = 0
     opportunities_seen_total: int = 0
     opportunities_created_total: int = 0
+    opportunity_rejections_total: int = 0
     risk_rejections_total: int = 0
 
     # ------------------------------------------------------------------
@@ -353,6 +354,10 @@ class CoordinationRegistry:
         if now_ms is not None:
             record.updated_at = now_ms
         self._persist_tick(record)
+
+    def count_opportunity_rejection(self) -> None:
+        """Count one opportunity reaching REJECTED. Observation only."""
+        self.opportunity_rejections_total += 1
 
     def count_risk_rejection(self) -> None:
         """Count one rejected risk decision. Observation only; gates are unchanged."""
