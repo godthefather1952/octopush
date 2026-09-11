@@ -176,13 +176,13 @@ def market_state(now_ms: int = 1_788_000_000_000, symbol: str = "BTC-USD") -> Ma
 
 
 __all__ = [
+    "VALID_RESPONSE",
     "AdvancingClock",
     "CapturingBus",
     "ExplodingProvider",
     "FailingIntelligenceStore",
     "FailingPublishBus",
     "RecordingProvider",
-    "VALID_RESPONSE",
     "build_lumen",
     "market_state",
 ]
