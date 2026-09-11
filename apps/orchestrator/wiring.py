@@ -33,6 +33,7 @@ from core.events import Event, EventType
 from core.health import HealthRegistry
 from core.models.common import AgentId, TradingMode
 from core.models.market import OrderBookSnapshot, TradeEvent
+from core.models.ops import HealthStatus
 from core.models.orchestration import AgentCadence, AgentSubjectScope
 from core.models.runtime import (
     FeedKind,
@@ -42,6 +43,7 @@ from core.models.runtime import (
     OperationalSnapshot,
     PreLiveReadinessSnapshot,
     SessionManifest,
+    SessionStatus,
     SessionSummary,
     ShutdownStage,
     StartupStage,
@@ -204,6 +206,9 @@ class Platform:
     market_generator: SyntheticMarket | None = None
     resync_bridge: ResyncBridge | None = None
     _started: bool = False
+    _bus_started: bool = False
+    _feeds_requested: bool = False
+    _feeds_started: bool = False
     _recording: bool = False
 
     @property
@@ -211,7 +216,7 @@ class Platform:
         return self.recorder.session_id
 
     async def start(self, *, record: bool = True, feeds: bool = True) -> None:
-        """Start the platform.
+        """Start the platform and witness the real startup order.
 
         ``feeds=False`` leaves the venue adapters and the synthetic driver
         stopped, which is what replay wants: the recorded events *are* the
@@ -219,28 +224,37 @@ class Platform:
         """
         if self._started:
             return
-        # Phase 11 metadata. Every call below sits beside an action that
-        # already happened; none of them changes an order of operations, a
-        # branch or a return, and nothing later reads what they record.
         now = self.clock.now_ms()
         self.operations.create_session(self.session_manifest(now, recording=record), now)
         self.operations.mark_starting(now)
+        self._feeds_requested = feeds
         try:
+            # The process always started the bus before storage and feeds.
+            # Keeping that action inside Platform.start() lets the operational
+            # record witness a bus-start failure without changing the order.
+            self.operations.set_startup_stage(StartupStage.BUS, self.clock.now_ms())
+            await self.bus.start()
+            self._bus_started = True
+
             if record:
-                self.operations.set_startup_stage(StartupStage.STORAGE, now)
+                self.operations.set_startup_stage(
+                    StartupStage.STORAGE, self.clock.now_ms()
+                )
                 await self.recorder.start()
                 self.recorder.attach(self.bus)
                 self._recording = True
-            self.operations.set_startup_stage(StartupStage.MARKET_FEEDS, now)
+
+            self.operations.set_startup_stage(
+                StartupStage.MARKET_FEEDS, self.clock.now_ms()
+            )
             if feeds:
                 for adapter in self.adapters.values():
                     await adapter.start()
                 if self.sim_driver is not None:
                     await self.sim_driver.start()
+                self._feeds_started = True
         except BaseException as exc:
             # Record that startup raised, then re-raise the SAME exception.
-            # The registry is a witness, not a handler: swallowing this would
-            # leave a half-built platform looking like a running one.
             self.operations.mark_failed(
                 self.clock.now_ms(), failure=f"{type(exc).__name__}: {exc}"
             )
@@ -249,20 +263,36 @@ class Platform:
         self.operations.mark_running(self.clock.now_ms())
 
     async def stop(self) -> None:
+        record = self.current_session()
+        if (
+            record is not None
+            and record.status in (SessionStatus.STOPPED, SessionStatus.FAILED)
+            and record.stopped_at is not None
+        ):
+            return
+
         now = self.clock.now_ms()
         self.operations.mark_stopping(now)
         try:
-            self.operations.set_shutdown_stage(ShutdownStage.STOPPING_FEEDS, now)
+            self.operations.set_shutdown_stage(
+                ShutdownStage.STOPPING_FEEDS, self.clock.now_ms()
+            )
             if self.sim_driver is not None:
                 await self.sim_driver.stop()
             for adapter in self.adapters.values():
                 await adapter.stop()
-            self.operations.set_shutdown_stage(ShutdownStage.DRAINING_BUS, now)
+            self._feeds_started = False
+
+            self.operations.set_shutdown_stage(
+                ShutdownStage.DRAINING_BUS, self.clock.now_ms()
+            )
             await self.bus.stop()
+            self._bus_started = False
+
             if self._recording:
                 # Only close a store this platform actually opened.
                 self.operations.set_shutdown_stage(
-                    ShutdownStage.STOPPING_RECORDER, now
+                    ShutdownStage.STOPPING_RECORDER, self.clock.now_ms()
                 )
                 await self.recorder.stop()
                 self._recording = False
@@ -365,21 +395,66 @@ class Platform:
         market_ok = self.state.market is not None
         kill_clear = self.state.kill_switch.trading_allowed
         unknown_orders = len(self.veska.unknown_orders())
-        reconciled = self.marin.last_result is not None
+        record = self.current_session()
+        recording_requested = bool(
+            record is not None
+            and record.manifest is not None
+            and record.manifest.recording_requested
+        )
+
+        bus_ready = self._bus_started
+        # A replay deliberately starts with feeds=False; in that case the
+        # feed requirement is satisfied by recorded inputs rather than a live
+        # adapter task. Before Platform.start(), _started remains False.
+        feed_ready = self._started and (
+            not self._feeds_requested or self._feeds_started
+        )
+        storage_ready = bool(
+            self._started and (not recording_requested or self.recorder.healthy)
+        )
+        recording_ready = bool(
+            self._started and (not recording_requested or self._recording)
+        )
+        risk_ready = self.health.status_of("RUNE", now_ms) is HealthStatus.HEALTHY
+        execution_ready = (
+            self.health.status_of("VESKA", now_ms) is HealthStatus.HEALTHY
+            and not self.state.kill_switch.execution_disabled
+        )
+        reconciliation_ready = bool(
+            self.marin.last_result is not None
+            and self.marin.last_result.ok
+            and self.health.status_of("MARIN", now_ms) is HealthStatus.HEALTHY
+        )
+        portfolio = self.state.portfolio or self.executor.account.snapshot()
+        hedging_ready = self.okapi.readiness(
+            portfolio, self.state.market, now_ms
+        ).ready
 
         reasons: list[str] = []
-        if not agents_ok:
-            reasons.extend(f"COMPONENT_UNHEALTHY:{name}" for name in unhealthy)
+        if not bus_ready:
+            reasons.append("BUS_NOT_STARTED")
+        if not feed_ready:
+            reasons.append("FEED_NOT_READY")
         if not market_ok:
             reasons.append("NO_MARKET_STATE")
-        if not kill_clear:
-            reasons.append("KILL_SWITCH_ENGAGED")
-        if not reconciled:
-            reasons.append("NO_RECONCILIATION_BASELINE")
+        if not agents_ok:
+            reasons.extend(f"COMPONENT_UNHEALTHY:{name}" for name in unhealthy)
+        if not risk_ready:
+            reasons.append("RISK_NOT_READY")
+        if not execution_ready:
+            reasons.append("EXECUTION_NOT_READY")
+        if not reconciliation_ready:
+            reasons.append("RECONCILIATION_NOT_READY")
+        if not hedging_ready:
+            reasons.append("HEDGING_NOT_READY")
         if unknown_orders:
             reasons.append(f"UNKNOWN_ORDERS:{unknown_orders}")
-        if not self._recording:
+        if recording_requested and not storage_ready:
+            reasons.append("STORAGE_UNHEALTHY")
+        if recording_requested and not recording_ready:
             reasons.append("NOT_RECORDING")
+        if not kill_clear:
+            reasons.append("KILL_SWITCH_ENGAGED")
 
         return OperationalReadiness(
             ready=not reasons,
@@ -387,16 +462,16 @@ class Platform:
             profile=self.profile,
             feed=self.settings.feed,
             paper_mode_confirmed=self.settings.mode is TradingMode.PAPER,
-            feed_ready=bool(self.adapters),
-            storage_ready=self.recorder.healthy,
-            bus_ready=self._started,
+            feed_ready=feed_ready,
+            storage_ready=storage_ready,
+            bus_ready=bus_ready,
             market_ready=market_ok,
             required_agents_ready=agents_ok,
-            risk_ready=True,
-            execution_ready=not self.state.kill_switch.execution_disabled,
-            reconciliation_ready=reconciled,
-            hedging_ready=bool(self.okapi.desired_delta),
-            recording_ready=self._recording,
+            risk_ready=risk_ready,
+            execution_ready=execution_ready,
+            reconciliation_ready=reconciliation_ready,
+            hedging_ready=hedging_ready,
+            recording_ready=recording_ready,
             kill_switch_clear=kill_clear,
             # Reported, never required.
             intelligence_available=self.lumen.consecutive_failures == 0
@@ -413,6 +488,15 @@ class Platform:
         """
         snapshot = self.health.snapshot(now_ms)
         portfolio = self.state.portfolio
+        record = self.current_session()
+        recording_requested = bool(
+            record is not None
+            and record.manifest is not None
+            and record.manifest.recording_requested
+        )
+        execution_metrics = self.veska.metrics()
+        reconciliation_metrics = self.marin.metrics()
+        intelligence_snapshot = self.lumen.lumen_snapshot(now_ms)
         return OperationalSnapshot(
             created_at=now_ms,
             session=self.current_session(),
@@ -441,7 +525,7 @@ class Platform:
                     else {}
                 ),
             },
-            execution=self.veska.metrics().model_dump(mode="json"),
+            execution=execution_metrics.model_dump(mode="json"),
             reconciliation={
                 "ok": (
                     None if self.marin.last_result is None else self.marin.last_result.ok
@@ -451,10 +535,10 @@ class Platform:
             hedging=self.okapi.okapi_snapshot(
                 self.executor.account.snapshot(), self.state.market, now_ms
             ).model_dump(mode="json"),
-            intelligence=self.lumen.lumen_snapshot(now_ms).model_dump(mode="json"),
+            intelligence=intelligence_snapshot.model_dump(mode="json"),
             portfolio=(portfolio.model_dump(mode="json") if portfolio else {}),
             recording={
-                "requested": self._recording,
+                "requested": recording_requested,
                 "active": self._recording and self.recorder.healthy,
                 "session_id": self.session_id,
                 "events_recorded": self.recorder.events_recorded,
@@ -464,10 +548,17 @@ class Platform:
             metrics=self.operations.metrics(
                 ticks=self.orchestrator.ticks,
                 events_recorded=self.recorder.events_recorded,
+                paper_orders=self.oms.orders_created,
+                paper_fills=self.oms.fills_applied,
+                opportunities=self.orchestrator.coordination.opportunities_created_total,
+                risk_rejections=self.orchestrator.coordination.risk_rejections_total,
+                hedges=self.okapi.hedges_requested,
+                reconciliations=reconciliation_metrics.runs_completed,
+                intelligence_analyses=self.lumen.intel_registry.analyses_completed,
                 shadow_decisions=len(self.shadow.decisions),
             ),
             readiness=self.operational_readiness(now_ms),
-            incidents=self.operations.open_incidents(),
+            incidents=self.operations.open_incidents(session_id=self.session_id),
         )
 
     def session_summary(self, now_ms: int) -> SessionSummary:
@@ -479,6 +570,7 @@ class Platform:
         record = self.current_session()
         portfolio = self.state.portfolio
         execution = self.veska.metrics()
+        reconciliation = self.marin.metrics()
         return SessionSummary(
             session_id=self.session_id,
             profile=self.profile,
@@ -487,12 +579,17 @@ class Platform:
             stopped_at=record.stopped_at if record else None,
             ticks=self.orchestrator.ticks,
             events_recorded=self.recorder.events_recorded,
-            orders=execution.orders_created,
-            fills=execution.fills,
+            opportunities=self.orchestrator.coordination.opportunities_created_total,
+            orders=self.oms.orders_created,
+            fills=self.oms.fills_applied,
+            rejections=self.orchestrator.coordination.risk_rejections_total,
             hedges=self.okapi.hedges_requested,
+            reconciliations=reconciliation.runs_completed,
             starting_equity=self.settings.paper_initial_balance,
             ending_equity=(portfolio.equity if portfolio else 0.0),
+            gross_pnl=(portfolio.gross_pnl if portfolio else 0.0),
             net_pnl=(portfolio.net_pnl if portfolio else 0.0),
+            fees=(portfolio.fees_paid if portfolio else 0.0),
             kill_switch_triggers=list(self.state.kill_switch.triggered_by),
         )
 
