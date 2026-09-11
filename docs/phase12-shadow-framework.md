@@ -1,6 +1,6 @@
 # Phase 12 — Shadow framework
 
-**Status: FRAMEWORK CONSTRUCTED. NOT VALIDATED.**
+**Status: VALIDATED / CLOSED at the Phase 12 code-and-contract boundary. FIELD SHADOW TEST PENDING.**
 
 ---
 
@@ -87,8 +87,9 @@ inventing parallel names. `shadow_decision_id` is the one new identifier, and
 only because the registry needs its own key.
 
 `ShadowDecisionStatus` records the rehearsal lifecycle: OBSERVED,
-CONSENSUS_RECORDED, RISK_REJECTED, AUTHORIZED, PLANNED, PAPER_WORKING,
-PAPER_COMPLETE, CLOSED, UNKNOWN, FAILED. **It records the lifecycle; it does
+CONSENSUS_RECORDED, RISK_REJECTED, REJECTED, AUTHORIZED, PLANNED,
+PAPER_WORKING, PAPER_COMPLETE, CLOSED, UNKNOWN, FAILED. `RISK_REJECTED` is
+reserved for a RUNE rejection; `REJECTED` records non-risk terminal rejection. **It records the lifecycle; it does
 not control it.** Every transition is driven by the platform's existing state
 machine and copied down.
 
@@ -141,8 +142,9 @@ Events read: `OPPORTUNITY_DETECTED`, `CONSENSUS_UPDATED`, `TRADE_INTENT`,
 execution path is introduced.**
 
 A handler that fails is logged and counted, never re-raised into the bus: the
-observer's failure mode is a gap in the record, which is visible, rather than a
-broken session, which is not what anyone asked for.
+observer's failure mode is a gap in the record, visible through shadow
+snapshot/readiness counters. Intentionally ignored, unattributable, and actual
+handler-failure events have separate counters.
 
 ### Activation
 
@@ -150,9 +152,11 @@ The observer records only under `OperationalProfile.SHADOW`, and under PAPER it
 is not attached to the bus at all — so an ordinary paper session neither
 subscribes nor accumulates a rehearsal history it will never read.
 
-**That activation is observational, not economic.** No decision anywhere
-differs because the observer is running. If one did, a shadow session would not
-be rehearsing this platform — it would be rehearsing a different one.
+**That activation is observational, not economic.** The observer subscribes
+with `health_relevant=False`, so adding it does not change the EventBus rolling
+error-rate window consumed by RUNE's `MAX_ERROR_RATE` gate. Its own delivery and
+failure counters remain observable. Deterministic PAPER-vs-SHADOW validation
+proves the economic output remains equal for identical inputs.
 
 ## 9. Paper fill vs real fill
 
@@ -218,16 +222,17 @@ rehearsal the operator probably wanted, and readiness says so
 (`FEED_NOT_PUBLIC_LIVE`) rather than refusing at configuration load, where it
 would be a policy this phase may not set.
 
-`private_execution_absent` reports **True**, because only `PaperExecutor`
-exists. It is phrased as an absence deliberately: a field named for the
-*presence* of live execution would be a place for someone to later set True, and
-there must be no such place.
+`private_execution_absent` is derived from the actual executor and venue
+capabilities. Readiness also checks usable market state, recorder health,
+coordination, RUNE, VESKA, MARIN, OKAPI and observer gaps. Mandatory false
+conditions contribute reason codes. Readiness remains reporting-only.
 
 ## 14. `ShadowSnapshot`
 
-Counts and **ids**, never records: decisions total, authorized, rejected, plans,
-orders, fills, active and unknown decision ids, checkpoint counts, and equity
-and P&L from the single `PaperAccount`.
+Counts and **ids**, never records: lifetime decisions total, resident decisions,
+authorized, rejected, plans, orders, fills, active and unknown decision ids,
+checkpoint counts, observer-gap counters, and equity/P&L from the single
+`PaperAccount`.
 
 Under PAPER it reports `enabled: false` with empty counts.
 
@@ -355,77 +360,34 @@ deployment_authorization ...... NOT_IMPLEMENTED
 
 ---
 
-## VALIDATION DEFERRED
+## VALIDATION STATUS
 
-**Nothing in this phase has been validated.** No test was written, changed or
-run; no linter, type checker, replay, container, provider call or platform tick
-was executed.
+Phase 12 was audited at `1acd9c58b5885c4be44be1529a5831d8e821815c` and remediated on `remediate-phase12-shadow`.
 
-### Configuration and feed
+The last production-code-changing commit is `42baa7ffa02036fa38de762c2f2dad10fbfabdce`. The validated code-and-test checkpoint is `60190fca1ebce95a79fac7ad6f06f49e7662dbdf`.
 
-* shadow profile configuration
-* live public feed behaviour
-* feed reconnects
-* real-market timestamp quality
+Eight frozen findings were remediated: P12-C1, P12-H1 through P12-H5, and P12-M1 through P12-M2.
 
-### Execution realism
+Permanent validation lives in `tests/unit/test_phase12_shadow.py`: 16 test functions / 17 pytest cases. Coverage includes risk-health neutrality at and above the RUNE threshold, duplicate/delayed fill ownership, lifecycle monotonicity, generic-vs-risk rejection truth, APPROVED_REDUCED semantics, detached registry reads, compaction counters, observer failure visibility, same-time snapshot/API purity, the PAPER-only boundary, and deterministic PAPER-vs-SHADOW economic equivalence.
 
-* paper execution realism
-* paper fill probability
-* paper vs real fill divergence
-* slippage realism
-* maker fills
-* taker fills
-* IOC
-* FOK
-* POST_ONLY
-* cancel races
-* UNKNOWN orders
-* multi-leg fills
+### Automated evidence
 
-### Component behaviour under live data
+At `60190fca1ebce95a79fac7ad6f06f49e7662dbdf`:
 
-* hedge behaviour
-* exit behaviour
-* MARIN behaviour
-* LUMEN behaviour
-* consensus behaviour
-* RUNE behaviour
+* Python 3.11 unit + contract: **1399 passed, 126 skipped, 1 known baseline packaging failure**. All 17 Phase 12 pytest cases pass.
+* PAPER boundary job: **PASS**.
+* mypy on `core/`: **PASS**.
+* Ruff: exactly the three pre-existing findings (`agents/marin/agent.py` I001, `agents/marin/source.py` I001, `agents/okapi/registry.py:360` SIM102); no Phase 12 lint regression.
+* Python 3.12 backend precheck: **PASS**. The subsequent full-suite step entered the repository's already-established long-running condition; Phase 12 does not claim that baseline issue is fixed.
 
-### The record itself
+The deterministic equivalence test drives the same seeded market and logical clock under PAPER and SHADOW, exercises RUNE, and compares opportunity state, risk decisions, OMS orders, fills, portfolio state, OKAPI hedge records, MARIN result and kill-switch state. Economic summaries are equal; only observational shadow data differs.
 
-* decision completeness
-* shadow identity
-* shadow trace completeness
-* checkpoint timing
-* checkpoint correctness
-* future-return calculations
-* paper P&L accuracy
+### Remaining field validation
 
-### Inference hazards
+Code-and-contract closure does **not** establish simulator realism against real venue fills or live-deployment readiness. A field SHADOW rehearsal against real public market data remains pending, including reconnect/staleness behavior, real-market timestamp quality, long-session retention/resource behavior, and shutdown/session-finalization under an actual SHADOW run.
 
-* survivorship bias
-* look-ahead bias
-* data leakage
-
-### Operations
-
-* recording consistency
-* replay of shadow sessions
-* live feed replay
-* long-session retention
-* resource bounds
-* performance
-* restart behaviour
-* startup recovery
-
-### The live question
-
-* pre-live readiness
-* private venue comparison
-* promotion safety
+No authenticated venue executor, private order channel, credential boundary, or shadow-to-live promotion switch was added. `PreLiveReadinessSnapshot` remains conservative.
 
 ## Testing status
 
-**No Phase 12 tests exist.** Treat every behaviour described here as
-constructed and unproven.
+**PHASE 12 REMEDIATED / AUTOMATED VALIDATION PASS / FIELD SHADOW TEST PENDING.**
