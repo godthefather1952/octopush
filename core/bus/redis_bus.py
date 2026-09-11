@@ -255,6 +255,8 @@ class RedisStreamBus(EventBus):
         handler: Handler,
         types: Iterable[EventType] | None = None,
         name: str | None = None,
+        *,
+        health_relevant: bool = True,
     ) -> Subscription:
         # Clause 3: valid before or after start(); the consumer reads the
         # subscription list at dispatch time, so this takes effect at once.
