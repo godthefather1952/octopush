@@ -105,6 +105,7 @@ class ShadowDecisionStatus(StrEnum):
     OBSERVED = "OBSERVED"
     CONSENSUS_RECORDED = "CONSENSUS_RECORDED"
     RISK_REJECTED = "RISK_REJECTED"
+    REJECTED = "REJECTED"
     AUTHORIZED = "AUTHORIZED"
     PLANNED = "PLANNED"
     PAPER_WORKING = "PAPER_WORKING"
@@ -120,6 +121,7 @@ class ShadowDecisionStatus(StrEnum):
 SHADOW_TERMINAL_STATUSES: frozenset[ShadowDecisionStatus] = frozenset(
     {
         ShadowDecisionStatus.RISK_REJECTED,
+        ShadowDecisionStatus.REJECTED,
         ShadowDecisionStatus.PAPER_COMPLETE,
         ShadowDecisionStatus.CLOSED,
         ShadowDecisionStatus.FAILED,
@@ -437,6 +439,7 @@ class ShadowReadiness(Base):
     paper_execution_available: bool = False
     reconciliation_available: bool = False
     hedging_available: bool = False
+    observer_healthy: bool = True
 
     #: True when no authenticated executor exists — the safe state, and the
     #: only one this build has.
@@ -466,7 +469,10 @@ class ShadowSnapshot(Base):
     #: False under the PAPER profile, where the observer records nothing.
     enabled: bool = False
 
+    #: Lifetime decisions observed. Compaction never decreases this.
     decisions_total: int = 0
+    #: Decisions still resident in the in-memory registry.
+    resident_decisions: int = 0
     authorized: int = 0
     rejected: int = 0
 
@@ -483,6 +489,11 @@ class ShadowSnapshot(Base):
 
     market_checkpoints: int = 0
     outcome_checkpoints: int = 0
+
+    observer_events_seen: int = 0
+    observer_intentionally_ignored: int = 0
+    observer_unattributable: int = 0
+    observer_failures: int = 0
 
     market_data: MarketDataProvenance = MarketDataProvenance.UNKNOWN
     execution_provenance: ExecutionProvenance = ExecutionProvenance.PAPER_SIMULATOR
