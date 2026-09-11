@@ -424,7 +424,10 @@ class TestShadowReadSurface:
             paths = client.get("/openapi.json").json()["paths"]
         assert "/api/shadow" in paths
         assert set(paths["/api/shadow"]) == {"get"}
-        assert not any("promote" in path or "live" in path for path in paths)
+        assert not any("promote" in path for path in paths)
+        live_named = {path: methods for path, methods in paths.items() if "live" in path}
+        assert live_named == {"/api/pre-live": paths["/api/pre-live"]}
+        assert set(paths["/api/pre-live"]) == {"get"}
 
 
 async def _economic_run(profile: OperationalProfile) -> dict:
