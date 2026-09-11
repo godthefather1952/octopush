@@ -226,6 +226,9 @@ class Subscription:
     name: str
     types: frozenset[EventType] | None
     handler: Handler
+    #: Whether this handler contributes to the risk-facing delivery-health window.
+    #: Observational subscribers may opt out so telemetry cannot change risk.
+    health_relevant: bool = True
     #: Events this subscription has seen; exposed for health/metrics.
     delivered: int = 0
     errors: int = 0
