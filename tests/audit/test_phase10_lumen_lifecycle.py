@@ -9,10 +9,10 @@ from core.models.intelligence import (
     PublishedOpinionRef,
 )
 from tests.audit.phase10_fixtures import (
+    VALID_RESPONSE,
     CapturingBus,
     FailingPublishBus,
     RecordingProvider,
-    VALID_RESPONSE,
     build_lumen,
 )
 
