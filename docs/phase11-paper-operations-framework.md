@@ -1,6 +1,8 @@
 # Phase 11 — Full-paper operational framework
 
-**Status: FRAMEWORK CONSTRUCTED. NOT VALIDATED.**
+**Status: VALIDATED / CLOSED at the Phase 11 code-and-contract boundary.**
+
+Validation does **not** promote the platform toward live execution. `PreLiveReadinessSnapshot` remains conservative: its live-readiness framework fields still report `NOT_VALIDATED` because Phase 11 code validation is not evidence that the strategy or deployment is ready for real money.
 
 Every phase before this one gave a *component* a memory. Phase 6 gave execution
 one, Phase 7 reconciliation, Phase 8 coordination, Phase 9 hedging, Phase 10
@@ -15,8 +17,8 @@ platform did — none of which changes what the platform does.
 
 ## 1. Baseline
 
-Built from `9e94cf1659adf6f9905d3667155dd30b51cf29d7` (Phases 9 + 10). Phase 5
-frozen and validated; Phases 6–10 constructed with validation deferred.
+Frozen Phase 11 audit checkpoint: `d768cb1c044849eab3a341365dd750e93697273e`.
+Phase 11 was audited there, its findings were frozen, then remediation was performed on `validate-phase11-operations`. Earlier-phase baseline CI debt is tracked separately from Phase 11 results.
 
 ## 2. Construction-only philosophy
 
@@ -173,10 +175,13 @@ rather than introducing a second notion of what matters.
 `Orchestrator.tick()`, not `_seek`, not execution.
 
 `ready` is False whenever anything required is unestablished, including when
-nothing has been checked. Absence of evidence is not readiness. Reason codes
-name the blocker: `COMPONENT_UNHEALTHY:<name>`, `NO_MARKET_STATE`,
-`KILL_SWITCH_ENGAGED`, `NO_RECONCILIATION_BASELINE`, `UNKNOWN_ORDERS:n`,
-`NOT_RECORDING`.
+nothing has been checked. Absence of evidence is not readiness. The validated
+producer derives each reported dimension from an existing authority rather than
+object existence or hard-coded optimism. Reason codes include `BUS_NOT_STARTED`,
+`FEED_NOT_READY`, `NO_MARKET_STATE`, `COMPONENT_UNHEALTHY:<name>`,
+`RISK_NOT_READY`, `EXECUTION_NOT_READY`, `RECONCILIATION_NOT_READY`,
+`HEDGING_NOT_READY`, `UNKNOWN_ORDERS:n`, `STORAGE_UNHEALTHY`,
+`NOT_RECORDING`, and `KILL_SWITCH_ENGAGED`.
 
 **LUMEN's absence never makes this unready.** LUMEN is optional — not in
 `REQUIRED_COMPONENTS`, not in `ConsensusConfig.required_agents` — and the
@@ -219,9 +224,14 @@ self._started = True
 self.operations.mark_running(self.clock.now_ms())
 ```
 
-Every `operations.*` call sits beside an action that already happened. No order
-of operations, branch or return changed, and nothing later reads what they
-record.
+`Platform.prepare_start()` creates the canonical session record before an
+externally owned startup action. The production composition root then calls
+`Platform.start_bus()` followed by `Platform.start()`, preserving the historical
+bus → storage → feeds order while allowing a bus-start exception to be recorded
+against the same session and re-raised unchanged. Direct deterministic callers
+of `Platform.start()` retain their prior synchronous-bus semantics; the Phase 11
+witness does not force a background dispatcher into tests or replay-style
+callers.
 
 ## 14. Platform stop mirror
 
@@ -328,56 +338,45 @@ it.
 
 ---
 
-## VALIDATION DEFERRED
+## VALIDATION
 
-**Nothing in this phase has been validated.** No test was written, changed or
-run; no linter, type checker, replay, container or platform tick was executed.
+Phase 11 was audited and remediated against frozen checkpoint
+`d768cb1c044849eab3a341365dd750e93697273e`.
 
-### Lifecycle
+The validation suite covers:
 
-* startup lifecycle
-* shutdown lifecycle
-* partial startup failure
-* partial shutdown failure
-* recorder startup
-* recorder shutdown
-* bus startup
-* feed startup
-* health convergence
-* warmup
+* operational registry transition idempotence;
+* session-scoped incidents and compaction retention;
+* bus-start and recorder-start failure witnessing with exception identity preserved;
+* clean and repeated shutdown;
+* operational readiness coherence, optional LUMEN handling, recording-disabled sessions, storage failure and kill-switch state;
+* the canonical `Platform.operational_snapshot()` path;
+* `GET /api/operations` returning a serializable snapshot;
+* repeated same-instant operational reads being observational and deterministic;
+* no OKAPI target/hedge registry mutation from operational GET/read paths;
+* operational metrics matching their authoritative component counters;
+* session summaries matching authoritative order/fill/reconciliation/hedge/P&L sources;
+* the PAPER-only boundary.
 
-### Reporting correctness
+A test-only focused-CI branch mirrored the four Phase 11 audit files into the
+existing Python 3.11 unit-test discovery path without changing production code
+or CI configuration. On production-equivalent Phase 11 code, all **14 Phase 11
+tests passed**. The job result was `1 failed, 1395 passed, 126 skipped`; the
+single failure was the pre-existing packaging assertion that treats
+`${TF_FEED:-simulated}` as a literal feed value.
 
-* readiness correctness
-* optional-agent handling
-* session manifest accuracy
-* config digest accuracy
-* session identity
-* operational snapshot consistency
-* cross-component snapshot timing
-* API projections
-* status tooling
-* start-paper tooling
+On the Phase 11 production branch, the PAPER boundary passes and
+`mypy --ignore-missing-imports core` passes. Ruff reports only the same three
+pre-existing findings in MARIN/OKAPI that were present before Phase 11.
+Python 3.11 unit + contract remains at the known baseline
+`1 failed, 1381 passed, 126 skipped` when the focused mirrors are absent.
 
-### Failure modes
+The backend-enabled Python 3.12 workflow still enters the repository's
+pre-existing long-running `Full suite` condition. The same condition was
+observed on the Phase 9 base before Phase 10 or Phase 11 remediation, so it is
+classified as repository baseline CI debt rather than a Phase 11 regression.
 
-* storage failure
-* bus failure
-* feed disconnect
-* LUMEN outage
-* MARIN mismatch
-* kill-switch state
+See `docs/phase11-validation-audit.md` for the frozen findings, remediation
+mapping, validation evidence and remaining baseline debt.
 
-### Framework properties
-
-* long-session retention
-* compaction
-* resource bounds
-* performance
-* logical-time equivalence
-* replay interaction
-
-## Testing status
-
-**No Phase 11 tests exist.** Treat every behaviour described here as
-constructed and unproven.
+**Final Phase 11 status: VALIDATED / CLOSED.**
