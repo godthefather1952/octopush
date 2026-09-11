@@ -569,7 +569,6 @@ class Platform:
         """
         record = self.current_session()
         portfolio = self.state.portfolio
-        execution = self.veska.metrics()
         reconciliation = self.marin.metrics()
         return SessionSummary(
             session_id=self.session_id,
