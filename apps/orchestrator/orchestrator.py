@@ -262,6 +262,7 @@ class Orchestrator:
                         "symbol": record.opportunity.symbol,
                         "from": previous.value,
                         "to": target.value,
+                        "reason": record.rejected_reason or "",
                     },
                 ).to_json_dict(),
             )
