@@ -22,6 +22,7 @@ Claude is unavailable the platform loses one weighted input and nothing else.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -159,20 +160,27 @@ class Lumen:
         if len(self.headlines) > 50:
             del self.headlines[:-50]
 
-    def _context(self, symbol: str) -> dict[str, Any]:
+    def _context(
+        self, symbol: str, *, now_ms: Millis | None = None
+    ) -> dict[str, Any]:
         """The structured facts LUMEN is given.
 
         Deliberately *not* the same context the pricing agents receive: feeding
         every agent identical input defeats the point of independent analysis.
         LUMEN sees the information environment and only a coarse market summary.
+
+        One logical instant governs both as_of_ms and the one-hour headline
+        boundary. evaluate() supplies the instant it already sampled; direct
+        callers get one clock read here.
         """
+        now = self.clock.now_ms() if now_ms is None else now_ms
         payload: dict[str, Any] = {
             "symbol": symbol,
-            "as_of_ms": self.clock.now_ms(),
+            "as_of_ms": now,
             "recent_headlines": [
                 item.to_payload()
                 for item in self.headlines[-10:]
-                if item.published_ms >= self.clock.now_ms() - 3_600_000
+                if item.published_ms >= now - 3_600_000
             ],
         }
         if self.market is not None:
@@ -202,7 +210,7 @@ class Lumen:
         request = IntelligenceRequest(
             task="information_environment",
             system=SYSTEM_PROMPT,
-            payload=self._context(symbol),
+            payload=self._context(symbol, now_ms=self.last_call_ms),
             response_schema=RESPONSE_SCHEMA,
             max_tokens=self.settings.lumen.max_tokens,
             timeout_s=self.settings.lumen.timeout_s,
@@ -228,10 +236,75 @@ class Lumen:
             return None
 
         self.consecutive_failures = 0
+        schema_error = self._response_schema_error(response.data)
+        if schema_error is not None:
+            log.warning(
+                "LUMEN response violated schema",
+                extra={"error": schema_error},
+            )
+            self.failures += 1
+            self._heartbeat()
+            self.intel_registry.mark_malformed(
+                analysis.analysis_id,
+                self._logical_now(),
+                error=schema_error,
+            )
+            return None
+
         opinion = self._to_opinion(symbol, response.data)
         self._heartbeat()
         self._record_outcome(analysis, opinion)
         return opinion
+
+    @staticmethod
+    def _response_schema_error(data: dict[str, Any]) -> str | None:
+        """Validate provider data against the authoritative RESPONSE_SCHEMA."""
+        required = (
+            "sentiment",
+            "attention",
+            "information_shock",
+            "direction",
+            "confidence",
+            "ttl_seconds",
+            "reason_codes",
+        )
+        missing = [name for name in required if name not in data]
+        if missing:
+            return f"missing required fields: {', '.join(missing)}"
+
+        def finite_number(name: str, lower: float, upper: float) -> str | None:
+            value = data.get(name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return f"{name} must be a number"
+            numeric = float(value)
+            if not math.isfinite(numeric) or not lower <= numeric <= upper:
+                return f"{name} must be between {lower:g} and {upper:g}"
+            return None
+
+        for name, lower, upper in (
+            ("sentiment", -1.0, 1.0),
+            ("attention", 0.0, 1.0),
+            ("direction", -1.0, 1.0),
+            ("confidence", 0.0, 1.0),
+        ):
+            error = finite_number(name, lower, upper)
+            if error is not None:
+                return error
+
+        if not isinstance(data.get("information_shock"), bool):
+            return "information_shock must be a boolean"
+
+        ttl = data.get("ttl_seconds")
+        if isinstance(ttl, bool) or not isinstance(ttl, int) or not 5 <= ttl <= 900:
+            return "ttl_seconds must be an integer between 5 and 900"
+
+        reason_codes = data.get("reason_codes")
+        if not isinstance(reason_codes, list) or not all(
+            isinstance(code, str) for code in reason_codes
+        ):
+            return "reason_codes must be an array of strings"
+
+        return None
 
     def _to_opinion(self, symbol: str, data: dict[str, Any]) -> AgentOpinion | None:
         try:
@@ -299,6 +372,7 @@ class Lumen:
                     payload=opinion.to_json_dict(),
                 )
             )
+            self._record_publication(opinion)
             published.append(opinion)
         return published
 
@@ -473,6 +547,12 @@ class Lumen:
             )
             return
         self.intel_registry.complete_analysis(analysis.analysis_id, now)
+
+    def _record_publication(self, opinion: AgentOpinion) -> None:
+        """Mark publication only after the bus accepted the opinion event."""
+        analysis = self.intel_registry.latest_for_symbol(opinion.symbol)
+        if analysis is None:
+            return
         self.intel_registry.link_opinion(
             analysis.analysis_id,
             PublishedOpinionRef(
@@ -485,7 +565,7 @@ class Lumen:
                 signal=opinion.signal,
                 confidence=opinion.confidence,
             ),
-            now,
+            self._logical_now(),
         )
 
     # -- query surface (Phase 10) -----------------------------------------
