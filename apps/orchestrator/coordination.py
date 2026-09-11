@@ -140,6 +140,9 @@ class CoordinationRegistry:
     continuation_blocked: int = 0
     traces_created: int = 0
     traces_closed: int = 0
+    opportunities_seen_total: int = 0
+    opportunities_created_total: int = 0
+    risk_rejections_total: int = 0
 
     # ------------------------------------------------------------------
     # tick lifecycle
@@ -342,12 +345,18 @@ class CoordinationRegistry:
             return
         record.opportunities_seen += opportunities_seen
         record.opportunities_created += opportunities_created
+        self.opportunities_seen_total += opportunities_seen
+        self.opportunities_created_total += opportunities_created
         record.consensus_requests += consensus_requests
         record.risk_evaluations += risk_evaluations
         record.execution_plans += execution_plans
         if now_ms is not None:
             record.updated_at = now_ms
         self._persist_tick(record)
+
+    def count_risk_rejection(self) -> None:
+        """Count one rejected risk decision. Observation only; gates are unchanged."""
+        self.risk_rejections_total += 1
 
     # -- tick queries ------------------------------------------------------
 
