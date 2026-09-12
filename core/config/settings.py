@@ -123,6 +123,34 @@ class VenueConfig(BaseModel):
     #: depth, and large enough for an ordinary full Coinbase L2 book; see the
     #: Batch 5 report for the measurement behind the default.
     max_book_levels_per_side: int = Field(default=10_000, gt=0, le=200_000)
+    #: Largest single WebSocket message the shared transport will accept from
+    #: this venue, in bytes.
+    #:
+    #: **This is a transport bound, not a storage bound.** It limits how big
+    #: one frame off the wire may be before the client refuses it; it says
+    #: nothing about how much of that message the platform then keeps.
+    #: ``max_book_levels_per_side`` remains the storage contract and is
+    #: unchanged by this value — a message large enough to arrive can still be
+    #: contained afterwards for overflowing the local book, and must be.
+    #:
+    #: A finite value on purpose. ``websockets`` defaults to 1 MiB, which a
+    #: legitimate full Coinbase level-2 snapshot exceeds: the field rehearsal
+    #: saw VENUE_B closed with code 1009 ("message too big") on every attempt
+    #: and never warmed a book. But the answer to that is a bigger bound, not
+    #: ``max_size=None`` — this is unauthenticated input from a public
+    #: endpoint, and an unbounded receive size makes the platform's memory a
+    #: function of what a remote server chooses to send.
+    #:
+    #: The 8 MiB default is roughly an order of magnitude above the ~1 MiB
+    #: snapshot that failed, which covers a full-depth L2 book for a
+    #: liquid instrument with room for it to grow, while staying small enough
+    #: that a single frame cannot threaten the process. The 64 MiB ceiling is
+    #: the validation bound: past that a single public market-data frame is no
+    #: longer plausible, and a configuration asking for one is more likely a
+    #: mistake than a requirement.
+    ws_max_message_bytes: int = Field(
+        default=8_388_608, gt=0, le=67_108_864
+    )
     #: Depth updates held per symbol while a REST checkpoint is in flight.
     #: Bounded on purpose: a buffer that grows without limit turns a slow
     #: checkpoint into an out-of-memory failure. At ~10 depth messages a

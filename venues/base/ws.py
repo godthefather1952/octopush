@@ -115,7 +115,19 @@ class WebSocketAdapter(VenueAdapter):
         import websockets
 
         url = self.connect_url()
-        async with websockets.connect(url, ping_interval=15, close_timeout=5) as ws:
+        # ``max_size`` is passed explicitly because the library default is
+        # 1 MiB and a legitimate full level-2 snapshot from a public venue can
+        # exceed it -- the connection is then closed with code 1009 before a
+        # single book is built, and the adapter reconnects into the same
+        # failure forever. The configured bound is finite by construction: see
+        # ``VenueConfig.ws_max_message_bytes`` for why this is a transport
+        # limit and why it does not relax the local book's storage contract.
+        async with websockets.connect(
+            url,
+            ping_interval=15,
+            close_timeout=5,
+            max_size=self.config.ws_max_message_bytes,
+        ) as ws:
             self._ws = ws
             self.stats.connected = True
             self.stats.connects += 1
