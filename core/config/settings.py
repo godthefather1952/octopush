@@ -799,10 +799,34 @@ def default_venues() -> list[VenueConfig]:
             name="VENUE_A",
             display_name="Venue A (Binance-style)",
             adapter="binance_public",
-            ws_url="wss://stream.binance.com:9443/stream",
-            rest_url="https://api.binance.com",
+            # P12-F2. The global Binance public endpoints
+            # (stream.binance.com / api.binance.com) answer HTTP 451 from the
+            # environment this platform is rehearsed in. 451 is an access
+            # decision the server makes about the caller, so it is not
+            # something to route around: no proxy, no mirror, no VPN and no
+            # undocumented endpoint was used or considered.
+            #
+            # Binance.US is the officially supported public alternative, and
+            # it was adopted only after a race-free probe corroborated every
+            # semantic this adapter depends on from Codespaces: REST
+            # /api/v3/depth returning lastUpdateId and both sides for both
+            # symbols, the combined stream, depthUpdate with U/u, contiguous
+            # update ids across 146 (BTCUSDT) and 103 (ETHUSDT) depth events,
+            # and a public trade delivered on the stream (id 31760198) while
+            # REST independently showed that trade occurring.
+            #
+            # Public market data only. No credential, no signature, no
+            # account endpoint and no order path exists here or anywhere else
+            # in this build.
+            ws_url="wss://stream.binance.us:9443/stream",
+            rest_url="https://api.binance.us",
             fees=FeeSchedule(maker_bps=1.0, taker_bps=5.0),
             latency_ms=35,
+            # Unchanged, and deliberately not reconciled with VENUE_B's
+            # USD pairs. Binance's dollar market settles in USDT and
+            # Coinbase's settles in USD; they are different instruments, and
+            # rewriting one into the other to manufacture a cross-venue pair
+            # is the defect (TIDAL-C3) this platform already removed once.
             symbols=["BTC-USDT", "ETH-USDT"],
         ),
         VenueConfig(
