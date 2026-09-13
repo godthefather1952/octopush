@@ -33,8 +33,11 @@ arguments reproduces the field failure and shows exactly where it happens.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
 import sys
+from dataclasses import dataclass
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -190,53 +193,202 @@ async def latest_public_trade(rest_base: str, venue_symbol: str) -> tuple[int, i
         return None
 
 
-async def trade_liveness(
-    rest_base: str,
-    symbols: list[str],
-    before: dict[str, tuple[int, int] | None],
-    ws_trade_events: int,
-) -> None:
-    """Classify the trade stream using independent public REST evidence."""
-    from venues.base.symbols import denormalize
-    from venues.venue_a import parser
+class StreamListener:
+    """Consumes the combined stream continuously in the background.
 
-    advanced = False
-    unavailable: list[str] = []
-    for symbol in symbols:
-        venue_symbol = denormalize(symbol, parser.SYMBOL_STYLE)
-        after = await latest_public_trade(rest_base, venue_symbol)
-        start = before.get(venue_symbol)
-        if after is None or start is None:
-            unavailable.append(venue_symbol)
-            continue
-        if after[0] != start[0]:
-            advanced = True
-            print(
-                f"    {venue_symbol}: public trade id {start[0]} -> {after[0]} "
-                "during the window"
-            )
-        else:
-            print(f"    {venue_symbol}: no new public trade (id still {start[0]})")
+    The listener exists because of a race in the previous probe. That version
+    sampled REST *before* opening the socket and again *after* closing it, so
+    a trade landing in either uncovered interval produced "REST advanced, no
+    WebSocket trades" and was classified a delivery failure — when in fact the
+    stream had simply not been listening yet, or had already stopped.
 
-    if unavailable:
-        record_status(
-            "Trade-stream liveness",
-            INCONCLUSIVE,
-            f"public trade state unavailable for {', '.join(unavailable)}; "
-            "cannot tell a quiet market from a broken stream",
-        )
-        return
+    Here the socket is open and this listener is already draining it before the
+    first REST baseline is taken, and it keeps draining until after the last
+    REST sample. Every REST-observed trade therefore falls inside a window the
+    stream was actually listening through, which is the only condition under
+    which "REST advanced but the stream delivered nothing" means anything.
+    """
 
-    status, detail = classify_trade_liveness(
-        rest_trades_advanced=advanced, ws_trade_events=ws_trade_events
+    def __init__(self) -> None:
+        self.frames = 0
+        self.depth_events = 0
+        self.trade_events = 0
+        self.trade_ids: list[int] = []
+        self.envelope_ok = True
+        self.sequencing_ok = True
+        self.contiguous = True
+        self.gap_detail = ""
+        self.error = ""
+        self._last_u: dict[str, int] = {}
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def consume(self, raw: str) -> None:
+        """Fold one raw frame into the counters. Pure; no I/O."""
+        message = json.loads(raw)
+        if "stream" not in message or "data" not in message:
+            self.envelope_ok = False
+            return
+        self.frames += 1
+        data = message["data"]
+        event = data.get("e")
+        if event == "depthUpdate":
+            self.depth_events += 1
+            stream = message["stream"]
+            if "U" not in data or "u" not in data:
+                self.sequencing_ok = False
+                return
+            if stream in self._last_u and int(data["U"]) != self._last_u[stream] + 1:
+                self.contiguous = False
+                self.gap_detail = f"{stream}: {self._last_u[stream]} -> {data['U']}"
+            self._last_u[stream] = int(data["u"])
+        elif event == "trade":
+            self.trade_events += 1
+            if "t" in data:
+                self.trade_ids.append(int(data["t"]))
+
+    async def run(self, connection) -> None:
+        """Drain frames until :meth:`stop` is called or the socket ends."""
+        while not self._stop:
+            try:
+                raw = await asyncio.wait_for(connection.recv(), timeout=5)
+            except TimeoutError:
+                continue  # a quiet market is not an error
+            except Exception as exc:
+                if not self._stop:
+                    self.error = f"{type(exc).__name__}: {exc}"
+                return
+            try:
+                self.consume(raw)
+            except (ValueError, KeyError, TypeError) as exc:
+                self.error = f"unparseable frame: {exc}"
+                return
+
+
+@dataclass
+class Observation:
+    """What the corroborated observation window saw, and in what order."""
+
+    trade_events: int
+    rest_advanced: bool
+    baseline: dict[str, int | None]
+    final: dict[str, int | None]
+    advanced_symbols: list[str]
+    unavailable: list[str]
+    #: Audit trail of the ordering, so the no-gap property is testable.
+    order: list[str]
+
+
+async def observe_trade_liveness(
+    *,
+    start_listener,
+    stop_listener,
+    sample_rest,
+    trade_events_so_far,
+    window_s: float,
+    poll_s: float,
+    sleep=asyncio.sleep,
+) -> Observation:
+    """Run the observation window with no uncovered REST interval.
+
+    The ordering is the whole point, and it is enforced here rather than left
+    to the caller to remember:
+
+    1. the listener starts, and is already draining the socket;
+    2. only then is the REST baseline taken;
+    3. REST is polled while the listener keeps running, so a trade anywhere in
+       the window is seen even if it is superseded before the end;
+    4. the final REST sample is taken with the listener **still** running;
+    5. the delivered-trade count is read;
+    6. only now does the listener stop.
+
+    Every dependency is injected so the ordering can be proven without a
+    network: see ``tests/unit/test_venue_a_probe_trade_liveness.py``.
+    """
+    order: list[str] = []
+
+    await start_listener()
+    order.append("listener-started")
+
+    baseline = await sample_rest()
+    order.append("rest-baseline")
+
+    highest: dict[str, int | None] = dict(baseline)
+    elapsed = 0.0
+    while elapsed < window_s:
+        await sleep(min(poll_s, window_s - elapsed))
+        elapsed += poll_s
+        polled = await sample_rest()
+        order.append("rest-poll")
+        for symbol, value in polled.items():
+            current = highest.get(symbol)
+            if value is not None and (current is None or value > current):
+                highest[symbol] = value
+
+    final = await sample_rest()
+    order.append("rest-final")
+    for symbol, value in final.items():
+        current = highest.get(symbol)
+        if value is not None and (current is None or value > current):
+            highest[symbol] = value
+
+    trade_events = trade_events_so_far()
+    order.append("read-ws-trade-count")
+
+    await stop_listener()
+    order.append("listener-stopped")
+
+    advanced_symbols = [
+        symbol
+        for symbol, start in baseline.items()
+        if start is not None
+        and highest.get(symbol) is not None
+        and highest[symbol] != start
+    ]
+    unavailable = [symbol for symbol, start in baseline.items() if start is None]
+
+    return Observation(
+        trade_events=trade_events,
+        rest_advanced=bool(advanced_symbols),
+        baseline=baseline,
+        final=final,
+        advanced_symbols=advanced_symbols,
+        unavailable=unavailable,
+        order=order,
     )
-    record_status("Trade-stream liveness", status, detail)
 
 
-async def probe_ws(ws_base: str, symbols: list[str], *, frames: int = 40) -> int:
-    """The combined stream, its event shape, and its sequence contiguity."""
+def record_stream_semantics(listener: StreamListener) -> None:
+    """Score the depth-stream requirements the adapter depends on."""
+    record("Combined-stream envelope present", listener.envelope_ok and listener.frames > 0,
+           f"{listener.frames} frames")
+    record("Depth events received", listener.depth_events > 0,
+           f"{listener.depth_events} depthUpdate")
+    record("Depth events carry U/u sequencing",
+           listener.depth_events > 0 and listener.sequencing_ok)
+    record(
+        "Depth update ids are contiguous",
+        listener.contiguous and listener.depth_events > 1,
+        listener.gap_detail
+        or ("too few depth events to judge" if listener.depth_events <= 1 else ""),
+    )
+    if listener.error:
+        record("Stream ran without error", False, listener.error)
+    # Trade events are deliberately NOT scored here. Zero of them may mean the
+    # market was quiet, which is not an endpoint defect; the verdict comes from
+    # the corroborated observation below.
+    print(f"    (trade events delivered while listening: {listener.trade_events})")
+
+
+async def probe_stream_and_trades(
+    ws_base: str, rest_base: str, symbols: list[str], *, window_s: float, poll_s: float
+) -> None:
+    """Open the stream, then corroborate its trade delivery against REST."""
     import websockets
 
+    from venues.base.symbols import denormalize
     from venues.venue_a import parser
 
     streams = "/".join(parser.stream_names(symbols))
@@ -258,63 +410,86 @@ async def probe_ws(ws_base: str, symbols: list[str], *, frames: int = 40) -> int
                 "  officially supported public endpoint that serves this\n"
                 "  environment, or record VENUE_A as an environment blocker.\n"
             )
-        return 0
+        return
 
     record("WebSocket combined stream reachable", True)
-    depth_seen = 0
-    trade_seen = 0
-    last_u: dict[str, int] = {}
-    contiguous = True
-    gap_detail = ""
+    listener = StreamListener()
+    venue_symbols = [denormalize(s, parser.SYMBOL_STYLE) for s in symbols]
+    task: asyncio.Task | None = None
+
+    async def start_listener() -> None:
+        nonlocal task
+        task = asyncio.create_task(listener.run(connection))
+        # Yield once so the listener is genuinely draining before any REST
+        # sample is taken, rather than merely scheduled.
+        await asyncio.sleep(0)
+
+    async def stop_listener() -> None:
+        listener.stop()
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+    async def sample_rest() -> dict[str, int | None]:
+        out: dict[str, int | None] = {}
+        for venue_symbol in venue_symbols:
+            latest = await latest_public_trade(rest_base, venue_symbol)
+            out[venue_symbol] = latest[0] if latest else None
+        return out
 
     try:
-        for _ in range(frames):
-            raw = await asyncio.wait_for(connection.recv(), timeout=20)
-            message = json.loads(raw)
-            # Combined-stream envelope: {"stream": ..., "data": {...}}
-            if "stream" not in message or "data" not in message:
-                record("Combined-stream envelope present", False, str(message)[:80])
-                break
-            data = message["data"]
-            event = data.get("e")
-            if event == "depthUpdate":
-                depth_seen += 1
-                stream = message["stream"]
-                if "U" not in data or "u" not in data:
-                    record("Depth events carry U/u sequencing", False, str(sorted(data))[:80])
-                    contiguous = False
-                    break
-                if stream in last_u and int(data["U"]) != last_u[stream] + 1:
-                    contiguous = False
-                    gap_detail = f"{stream}: {last_u[stream]} -> {data['U']}"
-                last_u[stream] = int(data["u"])
-            elif event == "trade":
-                trade_seen += 1
-    except Exception as exc:
-        record("Stream delivered frames", False, f"{type(exc).__name__}: {exc}")
+        print(f"  observing for {window_s:.0f}s with the listener active throughout\n")
+        observation = await observe_trade_liveness(
+            start_listener=start_listener,
+            stop_listener=stop_listener,
+            sample_rest=sample_rest,
+            trade_events_so_far=lambda: listener.trade_events,
+            window_s=window_s,
+            poll_s=poll_s,
+        )
     finally:
-        await connection.close()
+        listener.stop()
+        with contextlib.suppress(Exception):
+            await connection.close()
 
-    total = depth_seen + trade_seen
-    record("Combined-stream envelope present", total > 0, f"{total} frames")
-    record("Depth events received", depth_seen > 0, f"{depth_seen} depthUpdate")
-    record("Depth events carry U/u sequencing", depth_seen > 0 and bool(last_u))
-    record(
-        "Depth update ids are contiguous",
-        contiguous and depth_seen > 1,
-        gap_detail or ("too few depth events to judge" if depth_seen <= 1 else ""),
+    record_stream_semantics(listener)
+
+    print("\nTrade-stream liveness (corroborated against public REST)\n")
+    for venue_symbol in venue_symbols:
+        start = observation.baseline.get(venue_symbol)
+        end = observation.final.get(venue_symbol)
+        if start is None:
+            print(f"    {venue_symbol}: public trade state unavailable")
+        elif venue_symbol in observation.advanced_symbols:
+            print(f"    {venue_symbol}: public trade id {start} -> {end} while listening")
+        else:
+            print(f"    {venue_symbol}: no new public trade (id still {start})")
+
+    if observation.unavailable and not observation.trade_events:
+        record_status(
+            "Trade-stream liveness",
+            INCONCLUSIVE,
+            f"public trade state unavailable for {', '.join(observation.unavailable)}; "
+            "cannot tell a quiet market from a broken stream",
+        )
+        return
+
+    status, detail = classify_trade_liveness(
+        rest_trades_advanced=observation.rest_advanced,
+        ws_trade_events=observation.trade_events,
     )
-    # Trade events are deliberately NOT scored here. Zero of them may mean the
-    # market was quiet, which is not an endpoint defect; the verdict is
-    # ``trade_liveness()``, which corroborates against public REST state.
-    print(f"    (trade events observed: {trade_seen})")
-    return trade_seen
+    if status == PASS and listener.trade_ids:
+        detail += f" (e.g. trade id {listener.trade_ids[-1]})"
+    record_status("Trade-stream liveness", status, detail)
 
 
 async def main() -> int:
     ws_default, rest_default, symbols = configured_endpoints()
     ws_base = sys.argv[1] if len(sys.argv) > 1 else ws_default
     rest_base = sys.argv[2] if len(sys.argv) > 2 else rest_default
+    window_s = float(os.environ.get("TF_PROBE_WINDOW_S", "90"))
+    poll_s = float(os.environ.get("TF_PROBE_POLL_S", "10"))
 
     print("\nVENUE_A public-endpoint probe (P12-F2)")
     print(f"  WebSocket ... {ws_base}")
@@ -325,24 +500,10 @@ async def main() -> int:
     print("REST checkpoint semantics\n")
     await probe_rest(rest_base, symbols)
 
-    # Independent public evidence of whether the market traded at all, sampled
-    # either side of the listening window. Captured BEFORE the socket opens so
-    # the window it describes contains the window the stream observed.
-    from venues.base.symbols import denormalize
-    from venues.venue_a import parser
-
-    before = {
-        denormalize(symbol, parser.SYMBOL_STYLE): await latest_public_trade(
-            rest_base, denormalize(symbol, parser.SYMBOL_STYLE)
-        )
-        for symbol in symbols
-    }
-
     print("\nWebSocket stream semantics")
-    ws_trade_events = await probe_ws(ws_base, symbols)
-
-    print("\nTrade-stream liveness (corroborated against public REST)\n")
-    await trade_liveness(rest_base, symbols, before, ws_trade_events)
+    await probe_stream_and_trades(
+        ws_base, rest_base, symbols, window_s=window_s, poll_s=poll_s
+    )
 
     failures = [name for name, status, _ in RESULTS if status == FAIL]
     unresolved = [name for name, status, _ in RESULTS if status == INCONCLUSIVE]
