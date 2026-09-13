@@ -115,13 +115,31 @@ class VenueConfig(BaseModel):
     book_depth_levels: int = Field(default=25, gt=0, le=5_000)
     #: Hard safety bound on distinct price levels a local book may hold per
     #: side (storage, not the read-time ``book_depth_levels`` trim — see
-    #: ``LocalOrderBook``). A correctly-trimming feed never approaches this;
-    #: it exists only to fail a book closed if the untrimmed store somehow
-    #: grows without bound (an insert-only pathological stream, or a bug),
-    #: rather than let it grow forever. Comfortably above both
-    #: ``book_depth_levels``'s maximum (5,000) and Binance's REST checkpoint
-    #: depth, and large enough for an ordinary full Coinbase L2 book; see the
-    #: Batch 5 report for the measurement behind the default.
+    #: ``LocalOrderBook``). It exists to fail a book closed rather than let
+    #: storage grow without bound, and it is never a licence to trim: an
+    #: accepted snapshot is authoritative in full, and one that does not fit
+    #: is rejected whole.
+    #:
+    #: **10,000 is a conservative generic default, not a universal one.** It
+    #: covers ``book_depth_levels``'s maximum (5,000) and a Binance-style REST
+    #: checkpoint comfortably. It does **not** cover a full-book venue.
+    #:
+    #: This comment previously claimed 10,000 was "large enough for an
+    #: ordinary full Coinbase L2 book". Field measurement disproved that. A
+    #: Coinbase level-2 subscription delivers the *entire* order book, and a
+    #: live Codespaces rehearsal measured:
+    #:
+    #:     ETH-USD   8,363 bids / 11,278 asks   (~492 KB encoded)
+    #:     BTC-USD  21,109 bids / 21,203 asks   (~1.11 MB encoded)
+    #:
+    #: Both exceed 10,000 on at least one side, so every legitimate snapshot
+    #: was rejected, every rejection asked for a resync, and the venue sat in
+    #: a permanent clean-reconnect loop (P12-F3).
+    #:
+    #: A full-book venue therefore needs an explicit, evidence-based override
+    #: — see ``default_venues()``, where VENUE_B carries one. Raising this
+    #: default for every venue instead would remove the conservative ceiling
+    #: from simulated and Binance-style feeds that genuinely do not need it.
     max_book_levels_per_side: int = Field(default=10_000, gt=0, le=200_000)
     #: Largest single WebSocket message the shared transport will accept from
     #: this venue, in bytes.
@@ -796,6 +814,26 @@ def default_venues() -> list[VenueConfig]:
             fees=FeeSchedule(maker_bps=2.0, taker_bps=6.0),
             latency_ms=55,
             symbols=["BTC-USD", "ETH-USD"],
+            # P12-F3. A Coinbase level-2 subscription delivers the ENTIRE
+            # order book, not a depth-limited view, so the generic 10,000
+            # ceiling is simply the wrong size for this venue: a live
+            # rehearsal measured 21,109/21,203 levels on BTC-USD and
+            # 8,363/11,278 on ETH-USD, and every one of those legitimate
+            # snapshots was rejected into a permanent reconnect loop.
+            #
+            # 50,000 is set from that measurement: ~2.4x the largest side
+            # actually observed, still finite, still a quarter of the model's
+            # 200,000 maximum, and still fail-closed — an oversized snapshot
+            # is rejected whole, never trimmed. Measured resident cost is
+            # ~2.25 MiB for both symbols at the observed size and ~10 MiB if
+            # both books ever saturated this ceiling, which is negligible
+            # against the container budget and cannot turn a reconnect loop
+            # into a memory problem.
+            #
+            # Venue-specific on purpose. The default stays conservative for
+            # simulated and Binance-style feeds, which are depth-limited and
+            # have no evidence justifying a larger bound.
+            max_book_levels_per_side=50_000,
         ),
     ]
 
