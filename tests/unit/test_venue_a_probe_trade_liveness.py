@@ -445,3 +445,159 @@ class TestStreamListenerFolding:
         listener = probe.StreamListener()
         listener.consume('{"stream":"s","data":{"e":"depthUpdate"}}')
         assert listener.sequencing_ok is False
+
+
+# ======================================================================
+# P12-T2 — stopping semantics: time bounded, not frame bounded
+# ======================================================================
+
+
+class TestStoppingSemantics:
+    """The original probe stopped after a fixed count of combined frames.
+
+    ``depth@100ms`` dominates that budget: the field run spent all 40 frames
+    on depth updates before a single trade occurred, and reported a healthy
+    endpoint as incompatible. Frames are the wrong unit, because trades arrive
+    on the market's schedule rather than the stream's frame rate.
+
+    The window is now time bounded, and ends on whichever comes first: every
+    required semantic satisfied, or the deadline.
+    """
+
+    async def test_it_stops_early_once_every_semantic_is_satisfied(self, probe):
+        order: list[str] = []
+        start, stop = recording_listener(order)
+        sample, _ = scripted_rest([{"BTCUSDT": 1}])
+
+        result = await probe.observe_trade_liveness(
+            start_listener=start,
+            stop_listener=stop,
+            sample_rest=sample,
+            trade_events_so_far=lambda: 1,
+            window_s=600,
+            poll_s=1,
+            sleep=noop_sleep,
+            satisfied=lambda: True,
+        )
+
+        assert "satisfied-early" in result.order
+        assert "deadline-reached" not in result.order
+        assert "rest-poll" not in result.order, (
+            "already satisfied at the first check, so no polling was needed"
+        )
+
+    async def test_it_runs_to_the_deadline_when_never_satisfied(self, probe):
+        order: list[str] = []
+        start, stop = recording_listener(order)
+        sample, _ = scripted_rest([{"BTCUSDT": 1}])
+
+        result = await probe.observe_trade_liveness(
+            start_listener=start,
+            stop_listener=stop,
+            sample_rest=sample,
+            trade_events_so_far=lambda: 0,
+            window_s=3,
+            poll_s=1,
+            sleep=noop_sleep,
+            satisfied=lambda: False,
+        )
+
+        assert "deadline-reached" in result.order
+        assert "satisfied-early" not in result.order
+        assert result.order.count("rest-poll") == 3, "one poll per second of window"
+
+    async def test_the_window_is_finite_even_with_no_predicate(self, probe):
+        """No ``satisfied`` supplied must still terminate — never an open wait."""
+        order: list[str] = []
+        start, stop = recording_listener(order)
+        sample, _ = scripted_rest([{"BTCUSDT": 1}])
+
+        result = await probe.observe_trade_liveness(
+            start_listener=start,
+            stop_listener=stop,
+            sample_rest=sample,
+            trade_events_so_far=lambda: 0,
+            window_s=2,
+            poll_s=1,
+            sleep=noop_sleep,
+        )
+
+        assert "deadline-reached" in result.order
+        assert result.order[-1] == "listener-stopped"
+
+    async def test_stopping_early_still_preserves_the_no_gap_ordering(self, probe):
+        """An early exit must not skip the final REST sample or take it after
+        the listener has stopped — that would reintroduce the P12-F2 race."""
+        order: list[str] = []
+        start, stop = recording_listener(order)
+        sample, _ = scripted_rest([{"BTCUSDT": 1}])
+
+        result = await probe.observe_trade_liveness(
+            start_listener=start,
+            stop_listener=stop,
+            sample_rest=sample,
+            trade_events_so_far=lambda: 2,
+            window_s=600,
+            poll_s=1,
+            sleep=noop_sleep,
+            satisfied=lambda: True,
+        )
+
+        assert result.order.index("listener-started") < result.order.index("rest-baseline")
+        assert result.order.index("rest-final") < result.order.index("listener-stopped")
+        assert result.order[-2] == "read-ws-trade-count"
+
+    async def test_a_deadline_of_zero_terminates_immediately(self, probe):
+        order: list[str] = []
+        start, stop = recording_listener(order)
+        sample, _ = scripted_rest([{"BTCUSDT": 1}])
+
+        result = await probe.observe_trade_liveness(
+            start_listener=start,
+            stop_listener=stop,
+            sample_rest=sample,
+            trade_events_so_far=lambda: 0,
+            window_s=0,
+            poll_s=1,
+            sleep=noop_sleep,
+        )
+
+        assert result.order.count("rest-poll") == 0
+        assert result.order[-1] == "listener-stopped"
+
+
+class TestTheSatisfiedPredicateNeedsRealEvidence:
+    """A predicate that fired on a single depth frame would reintroduce the
+    false negative from the other direction — declaring success before the
+    stream had shown anything."""
+
+    def _listener_with(self, probe, *, depth: int, trade: int):
+        listener = probe.StreamListener()
+        for i in range(depth):
+            listener.consume(
+                '{"stream":"btcusdt@depth@100ms","data":'
+                f'{{"e":"depthUpdate","U":{i * 5 + 1},"u":{i * 5 + 5}}}}}'
+            )
+        for i in range(trade):
+            listener.consume(
+                '{"stream":"btcusdt@trade","data":{"e":"trade","t":'
+                f'{900 + i}}}}}'
+            )
+        return listener
+
+    def test_depth_alone_does_not_satisfy(self, probe):
+        listener = self._listener_with(probe, depth=40, trade=0)
+        assert listener.depth_events == 40
+        assert listener.trade_events == 0
+        # The literal field false negative: 40 depth frames, no trade.
+        assert not (listener.depth_events > 1 and listener.trade_events > 0)
+
+    def test_one_depth_event_and_a_trade_is_not_enough_for_contiguity(self, probe):
+        listener = self._listener_with(probe, depth=1, trade=1)
+        assert not (listener.depth_events > 1 and listener.trade_events > 0)
+
+    def test_contiguous_depth_plus_a_trade_satisfies(self, probe):
+        listener = self._listener_with(probe, depth=3, trade=1)
+        assert listener.contiguous
+        assert listener.sequencing_ok
+        assert listener.depth_events > 1 and listener.trade_events > 0

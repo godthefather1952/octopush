@@ -639,3 +639,115 @@ failure.
 ## Disposition
 
 **PHASE 12 BINANCE.US REMEDIATION CODE COMPLETE / FINAL TWO-VENUE FIELD RETEST REQUIRED**
+
+---
+
+# P12-T2 and the consolidated live-feed branch
+
+Branch: `remediate-phase12-live-feed-final`, whose history descends from
+`d8019db9d2ce62c9539605e5d344522cccaf234b` and carries the P12-F3 and P12-F2
+remediations already validated on the two preceding branches.
+
+## P12-T2 — probe stopping semantics: time bounded, not frame bounded
+
+**Status: REMEDIATED.**
+
+The original probe stopped after a fixed count of combined frames. Frames are
+the wrong unit: `depth@100ms` dominates the budget while trades arrive on the
+market's schedule, so the field run spent all 40 frames on depth updates
+before a single trade occurred and reported a healthy endpoint as
+incompatible. A longer frame budget would not have fixed the category error.
+
+The observation window is now bounded in **time** and ends on whichever comes
+first:
+
+- every required semantic satisfied — a valid envelope, contiguous `U`/`u`
+  sequencing across more than one depth event, and at least one delivered
+  trade; or
+- the finite deadline (`TF_PROBE_WINDOW_S`, default 90s).
+
+Stopping early cannot skip anything: the final REST sample and the delivered
+count are both taken with the listener still running, so the no-gap ordering
+that P12-F2 established is preserved on the early path too.
+
+The predicate deliberately requires more than one depth event *and* a trade.
+A predicate that fired on a single frame would replace the old false negative
+with a false positive — declaring success before the stream had shown
+anything.
+
+Tests (`tests/unit/test_venue_a_probe_trade_liveness.py`, 32 cases total):
+stops early when satisfied; runs to the deadline when never satisfied; is
+finite with no predicate supplied; terminates immediately at a zero deadline;
+preserves the no-gap ordering on the early path; and — reproducing the field
+false negative directly — 40 depth events with zero trades does **not**
+satisfy, while three contiguous depth events plus one trade does.
+
+## Second field measurement for P12-F3
+
+A later local SHADOW session measured larger Coinbase books than the
+Codespaces session:
+
+| Symbol | Bids | Asks |
+|---|---|---|
+| BTC-USD | 21,064 | **21,345** |
+| ETH-USD | 8,254 | 11,542 |
+| ETH-USD (second rejection logged) | 8,274 | 11,526 |
+
+The largest single side observed across every session to date is therefore
+**21,345**, not the 21,203 recorded earlier. The 50,000 ceiling still clears
+that by more than 2x, so no change to the bound is warranted — but the tests
+now assert against the worst case actually seen rather than the first case
+measured, and every one of the three rejections in the field log is covered by
+a test proving the old 10,000 ceiling rejected it and the new one accepts it.
+
+## Automated validation
+
+- Phase 12 shadow: **17 passed**;
+- WebSocket message bound: **18 passed** (transport unchanged: finite, 8 MiB);
+- field harness: **9 passed**;
+- venues and reconnect: **62 passed**;
+- book storage bound: **24 passed**;
+- P12-F3 + endpoints + probe: **79 passed**;
+- PAPER/live boundary: **30 passed**;
+- full unit suite, `env -u TF_SYMBOLS`: **881 passed / 2 skipped / 0 failed**;
+- mypy(`core/`): **PASS**;
+- Ruff: **exactly the three pre-existing baselines**, zero new findings.
+
+Ruff baselines, reported separately from this change and untouched by it:
+
+1. `agents/marin/agent.py:40` — I001
+2. `agents/marin/source.py:22` — I001
+3. `agents/okapi/registry.py:360` — SIM102
+
+## Field retest status
+
+**NOT PERFORMED — environment cannot support it.** This session has no Docker
+daemon, no PostgreSQL, no Redis and no outbound reachability to any exchange
+(both Binance.US and Coinbase probes return a proxy-level refusal, which is
+this environment's allowlist and is **not** evidence about either venue).
+
+No new field session was created, and no historical session was read or
+modified.
+
+Phase 12 is therefore **not** fully closed. The two-venue SHADOW rehearsal
+must still establish, on this branch:
+
+- VENUE_A: Binance.US REST checkpoint success, stable public WebSocket, depth
+  events, trades within a reasonable window, no HTTP 451 loop, BTC-USDT and
+  ETH-USDT remaining distinct from the USD instruments;
+- VENUE_B: full snapshot accepted, BTC-USD and ETH-USD usable, no code-1009
+  loop, no storage-overflow resync loop, no clean-close reconnect storm,
+  normal `l2update` flow;
+- TIDAL: usable market state, VENUE_B not stuck UNAVAILABLE, no runaway
+  desync/resync count;
+- SHADOW: truthful readiness, active recording, non-authoritative observers,
+  no real orders;
+- and on graceful `./stop-paper.sh`: `status = COMPLETE`, `ended_at` not null,
+  `events_lost = 0`, persisted events > 0.
+
+Zero cross-venue opportunities is expected and is not a failure, because the
+live instruments intentionally differ.
+
+## Disposition
+
+**PHASE 12 LIVE-FEED REMEDIATION CODE COMPLETE / TWO-VENUE SHADOW FIELD RETEST REQUIRED**

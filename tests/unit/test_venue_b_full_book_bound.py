@@ -386,3 +386,79 @@ class TestTheReconnectLoopIsGone:
 
         assert [s for s, _ in adapter.requests] == ["BTC-USD"]
         assert tidal.books[("VENUE_B", "BTC-USD")].overflow_count == 1
+
+
+# ======================================================================
+# A second, independent field measurement
+# ======================================================================
+
+#: A later local SHADOW session measured slightly larger books than the
+#: Codespaces session above. Both are recorded because the ceiling has to
+#: clear the worst case actually seen, not the first case seen.
+LOCAL_BTC_BIDS = 21_064
+LOCAL_BTC_ASKS = 21_345
+LOCAL_ETH_BIDS = 8_254
+LOCAL_ETH_ASKS = 11_542
+#: From the rejection logged for ETH-USD in the same session.
+LOCAL_ETH_BIDS_ALT = 8_274
+LOCAL_ETH_ASKS_ALT = 11_526
+
+#: The largest single side observed across every field session to date.
+LARGEST_OBSERVED_SIDE = max(
+    FIELD_BTC_BIDS, FIELD_BTC_ASKS, FIELD_ETH_BIDS, FIELD_ETH_ASKS,
+    LOCAL_BTC_BIDS, LOCAL_BTC_ASKS, LOCAL_ETH_BIDS, LOCAL_ETH_ASKS,
+    LOCAL_ETH_BIDS_ALT, LOCAL_ETH_ASKS_ALT,
+)
+
+
+class TestTheSecondFieldMeasurement:
+    def test_the_largest_side_ever_observed_is_the_local_btc_ask_side(self):
+        assert LARGEST_OBSERVED_SIDE == LOCAL_BTC_ASKS == 21_345
+
+    def test_the_ceiling_clears_the_worst_case_with_headroom(self):
+        assert LARGEST_OBSERVED_SIDE * 2 < VENUE_B_CEILING, (
+            "50,000 must remain more than double the largest side seen in any "
+            "session, not merely above the first one measured"
+        )
+
+    def test_the_local_btc_snapshot_is_accepted(self):
+        book = venue_b_book("BTC-USD")
+        book.apply_snapshot(
+            coinbase_snapshot("BTC-USD", bids=LOCAL_BTC_BIDS, asks=LOCAL_BTC_ASKS)
+        )
+        assert book.synced
+        assert book.overflow_count == 0
+        assert len(book.asks) == LOCAL_BTC_ASKS
+
+    def test_both_logged_eth_rejections_are_now_accepted(self):
+        """The two ETH-USD snapshot sizes the field log recorded as rejected."""
+        for bids, asks in (
+            (LOCAL_ETH_BIDS, LOCAL_ETH_ASKS),
+            (LOCAL_ETH_BIDS_ALT, LOCAL_ETH_ASKS_ALT),
+        ):
+            book = venue_b_book("ETH-USD")
+            book.apply_snapshot(coinbase_snapshot("ETH-USD", bids=bids, asks=asks))
+            assert book.synced, f"{bids}/{asks} must now be accepted"
+            assert book.overflow_count == 0
+
+    def test_the_old_ceiling_rejected_every_one_of_them(self):
+        """Each of these is a real rejection the field log recorded."""
+        for symbol, bids, asks in (
+            ("BTC-USD", LOCAL_BTC_BIDS, LOCAL_BTC_ASKS),
+            ("ETH-USD", LOCAL_ETH_BIDS, LOCAL_ETH_ASKS),
+            ("ETH-USD", LOCAL_ETH_BIDS_ALT, LOCAL_ETH_ASKS_ALT),
+        ):
+            old = LocalOrderBook(
+                venue="VENUE_B", symbol=symbol, max_depth=25, max_levels_per_side=10_000
+            )
+            with pytest.raises(BookOverflowError):
+                old.apply_snapshot(coinbase_snapshot(symbol, bids=bids, asks=asks))
+
+    def test_the_bound_is_still_enforced_above_the_worst_case(self):
+        """Raising the ceiling for real books must not remove it."""
+        book = venue_b_book("BTC-USD")
+        with pytest.raises(BookOverflowError):
+            book.apply_snapshot(
+                coinbase_snapshot("BTC-USD", bids=VENUE_B_CEILING + 1, asks=10)
+            )
+        assert book.needs_resync

@@ -290,6 +290,7 @@ async def observe_trade_liveness(
     window_s: float,
     poll_s: float,
     sleep=asyncio.sleep,
+    satisfied=None,
 ) -> Observation:
     """Run the observation window with no uncovered REST interval.
 
@@ -303,6 +304,18 @@ async def observe_trade_liveness(
     4. the final REST sample is taken with the listener **still** running;
     5. the delivered-trade count is read;
     6. only now does the listener stop.
+
+    **Time bounded, not frame bounded** (P12-T2). The original probe stopped
+    after a fixed count of combined frames, and ``depth@100ms`` dominates that
+    budget: the field run burned all 40 frames on depth updates before a
+    single trade occurred and called a healthy endpoint incompatible. Frames
+    are the wrong unit — trades arrive on the market's schedule, not on the
+    stream's frame rate.
+
+    So the loop ends on whichever comes first: every required semantic
+    satisfied, or the deadline. ``satisfied`` is an optional predicate over
+    what the listener has seen so far; without one the full window is used.
+    Either way the window is finite and the wait can never be indefinite.
 
     Every dependency is injected so the ordering can be proven without a
     network: see ``tests/unit/test_venue_a_probe_trade_liveness.py``.
@@ -318,6 +331,9 @@ async def observe_trade_liveness(
     highest: dict[str, int | None] = dict(baseline)
     elapsed = 0.0
     while elapsed < window_s:
+        if satisfied is not None and satisfied():
+            order.append("satisfied-early")
+            break
         await sleep(min(poll_s, window_s - elapsed))
         elapsed += poll_s
         polled = await sample_rest()
@@ -326,6 +342,8 @@ async def observe_trade_liveness(
             current = highest.get(symbol)
             if value is not None and (current is None or value > current):
                 highest[symbol] = value
+    else:
+        order.append("deadline-reached")
 
     final = await sample_rest()
     order.append("rest-final")
@@ -438,8 +456,27 @@ async def probe_stream_and_trades(
             out[venue_symbol] = latest[0] if latest else None
         return out
 
+    def every_semantic_satisfied() -> bool:
+        """Nothing further can be learned by listening longer.
+
+        Depth contiguity needs more than one depth event to mean anything, and
+        trade delivery needs at least one trade. Once both hold there is no
+        outcome a longer window could change, so the probe stops rather than
+        idling to its deadline.
+        """
+        return (
+            listener.envelope_ok
+            and listener.sequencing_ok
+            and listener.contiguous
+            and listener.depth_events > 1
+            and listener.trade_events > 0
+        )
+
     try:
-        print(f"  observing for {window_s:.0f}s with the listener active throughout\n")
+        print(
+            f"  observing for up to {window_s:.0f}s with the listener active "
+            "throughout, stopping early once every semantic is satisfied\n"
+        )
         observation = await observe_trade_liveness(
             start_listener=start_listener,
             stop_listener=stop_listener,
@@ -447,6 +484,7 @@ async def probe_stream_and_trades(
             trade_events_so_far=lambda: listener.trade_events,
             window_s=window_s,
             poll_s=poll_s,
+            satisfied=every_semantic_satisfied,
         )
     finally:
         listener.stop()
