@@ -480,3 +480,162 @@ No historical session was read or modified.
 ## Disposition
 
 **PHASE 12 FINAL LIVE-FEED REMEDIATION CODE COMPLETE / FIELD RETEST REQUIRED**
+
+---
+
+# P12-F3 CLOSED, and VENUE_A moved to Binance.US
+
+Remediation branch: `remediate-phase12-binance-us`, cut from
+`d5dd21438705055c0d1559ebdac833559822fa87`.
+
+## P12-F3 — FIELD VALIDATED / CLOSED
+
+A six-minute Codespaces SHADOW session, `session-906ed4553dd7411a8e3908751d7553dc`,
+validated the 50,000-level VENUE_B ceiling against real Coinbase books.
+
+| | BTC-USD | ETH-USD |
+|---|---|---|
+| connected | True | True |
+| quality | FRESH | FRESH |
+| reconnects | 0 | 0 |
+| sequence gaps | 0 | 0 |
+
+TIDAL HEALTHY with 0 errors. Observer failures 0, unattributable 0.
+
+The three regression counters this finding exists for were all zero:
+
+- VENUE_B `1009` / message-too-big: **0**
+- VENUE_B clean code-1000 closes: **0**
+- `BOOK_OVERFLOW`: **0**
+
+Graceful shutdown persisted `status = COMPLETE`, `ended_at = 1789275185852`,
+`events_lost = 0`, `persisted_events = 62147`, empty `failure_reason`.
+
+**P12-F3 is closed.** The reconnect loop is gone against the real venue, not
+only against a synthetic snapshot.
+
+## The two Python 3.12 unit failures were environment contamination
+
+Not a production defect, and nothing was changed to "fix" it.
+
+The Codespaces shell carried stale overrides — `TF_SYMBOLS=["BTC-USD","ETH-USD"]`
+and `TF_FEED=simulated`. An explicit `TF_SYMBOLS` correctly overrides the
+derived live strategy universe, which is why
+`test_the_strategy_universe_is_the_union_of_venue_symbols` and
+`test_each_adapter_gets_its_own_venue_symbols` failed: they were asserting
+against a universe the shell had pinned.
+
+With `env -u TF_SYMBOLS TF_FEED=live`, production settings resolve correctly:
+
+    symbols  = ["BTC-USD", "BTC-USDT", "ETH-USD", "ETH-USDT"]
+    VENUE_A  = ["BTC-USDT", "ETH-USDT"]
+    VENUE_B  = ["BTC-USD", "ETH-USD"]
+
+28 targeted instrument-identity tests passed; the full unit suite ran 834
+passed / 2 skipped / 0 failed. Validation commands for this work therefore use
+`env -u TF_SYMBOLS`.
+
+## P12-F2 — Binance.US adopted
+
+### Why the global endpoints were abandoned
+
+`wss://stream.binance.com:9443/stream` and `https://api.binance.com` both
+answer **HTTP 451** from Codespaces. 451 is an access decision the server makes
+about the caller. It was not bypassed: no proxy, no VPN, no mirror, no
+geographic evasion, no undocumented endpoint, no credential.
+
+### The race in the previous probe, and its fix
+
+The previous permanent probe sampled REST **before** opening the socket and
+again **after** closing it. Two intervals were therefore uncovered, and a trade
+landing in either one produced "REST advanced, WebSocket delivered nothing" —
+the exact signature of a broken trade stream. The probe could manufacture its
+own Case C.
+
+The corrected probe makes the ordering part of the contract:
+
+1. open the WebSocket;
+2. start the listener and yield, so it is genuinely draining — not merely
+   scheduled;
+3. take the REST baseline **with the listener already running**;
+4. poll REST through the window, so a trade that is superseded before the end
+   is still seen;
+5. take the final REST sample **with the listener still running**;
+6. read the delivered-trade count;
+7. only now stop the listener.
+
+`observe_trade_liveness()` enforces that ordering itself and returns an audit
+trail of it, with every dependency injected so the no-gap property is provable
+without a network. Classification is unchanged:
+
+| REST trade state | WS trade events | Verdict | Exit |
+|---|---|---|---|
+| advanced while listening | ≥ 1 | `PASS` | 0 |
+| did not advance | 0 | `INCONCLUSIVE` | 2 |
+| advanced while listening | 0 | `FAIL — TRADE STREAM DELIVERY INCOMPATIBLE` | 1 |
+
+### Race-free field result
+
+A 90-second race-free probe from Codespaces:
+
+- BTCUSDT public REST trade id **31760197 → 31760198** while the socket was
+  actively listening;
+- the WebSocket delivered **trade id 31760198**, price 77213.13000000, qty
+  0.00006000 — the same trade;
+- BTCUSDT depth events **146**, ETHUSDT depth events **103**;
+- ETHUSDT saw no REST trade advance in the window, so its individual delivery
+  stayed inconclusive — which is not a failure.
+
+**Overall: PASS — Binance.US trade delivery independently corroborated.**
+
+### The change
+
+Live VENUE_A only:
+
+    ws_url:    wss://stream.binance.com:9443/stream  ->  wss://stream.binance.us:9443/stream
+    rest_url:  https://api.binance.com               ->  https://api.binance.us
+
+Public market data only. Nothing else about VENUE_A changed: adapter, fees,
+latency, book depth, storage ceiling, transport ceiling, `DepthSynchronizer`,
+`U`/`u` continuity, the REST checkpoint handshake and the trade parser are all
+untouched.
+
+**Symbols are unchanged and stay unchanged.** VENUE_A is BTC-USDT/ETH-USDT and
+VENUE_B is BTC-USD/ETH-USD. They are different instruments; a live run finding
+no cross-venue opportunity is the correct result, and the strategy was not
+altered to manufacture one.
+
+## Automated validation
+
+- endpoint/config regression: **19 passed**;
+- P12-F3: **22 passed**;
+- corrected probe (classification + ordering + listener folding): **24 passed**;
+- Phase 12 suite: **17 passed**;
+- TIDAL book/storage/abstention: **98 passed**;
+- venue adapters, reconnect, transport: **80 passed**;
+- PAPER boundary: **30 passed**;
+- full unit suite, `env -u TF_SYMBOLS`: **867 passed / 2 skipped / 0 failed**
+  (834 + 19 new endpoint tests + 14 new probe tests — no test lost);
+- mypy(`core/`): **PASS**;
+- Ruff: **exactly the three pre-existing baselines**, zero new findings.
+
+The unit suite was run on Python 3.11, the interpreter this environment has the
+project installed under; `python3.12` is present but carries no pytest here. CI
+runs 3.12.
+
+## Field retest status
+
+**REQUIRED, NOT PERFORMED.** VENUE_B is field-validated, but the Binance.US
+endpoint change has never run inside the platform — only under the standalone
+probe. A two-venue rehearsal must still establish, for VENUE_A: REST checkpoint
+success, a stable WebSocket, successful depth synchronisation, no sequence
+gaps, and trade-stream behaviour matching the corrected liveness test; and for
+the platform: PAPER, SHADOW, LIVE, PaperExecutor, no private execution, zero
+observer failures and a healthy recorder.
+
+Cross-venue opportunities are **not** required and their absence is not a
+failure.
+
+## Disposition
+
+**PHASE 12 BINANCE.US REMEDIATION CODE COMPLETE / FINAL TWO-VENUE FIELD RETEST REQUIRED**
