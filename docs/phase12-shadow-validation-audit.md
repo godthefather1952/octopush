@@ -1,6 +1,29 @@
 # Phase 12 — Shadow validation audit
 
-**Disposition: PHASE 12 REMEDIATED / AUTOMATED VALIDATION PASS / FIELD SHADOW TEST PENDING.**
+**Disposition: PHASE 12 — VALIDATED / FIELD VALIDATED / CLOSED.**
+
+Final validated code checkpoint: `1571f086385aa20d707e02200bd691dcd4b941c3`
+Final field session: `session-8e64e5b6f1de456aa497a654842928ed`
+
+**How to read this document.** It is chronological, and the earlier sections
+are kept as they were written. They record, in order:
+
+1. the original Phase 12 code-and-contract validation (P12-C1 … P12-M2);
+2. the first SHADOW field rehearsal, which **failed**;
+3. three live-feed remediations — P12-F1, P12-F3, P12-F2 — plus two harness
+   defects, P12-T1 and P12-T2;
+4. the final successful two-venue SHADOW field rehearsal;
+5. closure.
+
+Section dispositions written before step 4 said things like "field retest
+required". Those were accurate when written and are **left in place as audit
+evidence**; each is annotated with a pointer to the final closure at the end of
+this document, which supersedes them. The failures are not erased — they are
+the reason the remediations exist.
+
+**Closure scope.** Phase 12 closure means the SHADOW framework and its
+live-public-data rehearsal requirements are validated. It does **not** mean
+Octopush is ready for live or real-money trading.
 
 ## Checkpoints
 
@@ -97,13 +120,15 @@ An intermediate boundary test incorrectly rejected every API path containing the
 
 The validated branch still has only TradingMode.PAPER, Docker TF_MODE=paper, PaperExecutor/PaperAccount, public unauthenticated adapters, no adapter order-submission capability, GET-only `/api/shadow`, GET-only `/api/pre-live`, no promotion route, no exchange credentials, and no live executor.
 
-## Remaining field validation
+## Remaining field validation *(as assessed at the time — since completed)*
 
 Automated closure does not validate simulated fills against real venue fills. The next allowed step is an actual Codespaces SHADOW field rehearsal against public live market data, while execution remains PAPER. Inspect readiness, recording, public-feed freshness, observer gaps, graceful shutdown, and session finalization before any later phase.
 
-## Final disposition
+## Disposition at code-and-contract closure *(historical)*
 
 **PHASE 12 REMEDIATED / AUTOMATED VALIDATION PASS / FIELD SHADOW TEST PENDING**
+
+*Historical, and superseded: see **Final Phase 12 closure** at the end of this document. This disposition was accurate when written.*
 
 Do not infer private-venue or live-deployment readiness from this closure.
 
@@ -128,7 +153,7 @@ Remediation branch: `remediate-phase12-live-feed-field`, cut from
 
 ## P12-F1 — Coinbase public snapshot exceeded the client receive limit
 
-**Severity: HIGH. Status: REMEDIATED IN CODE / FIELD RETEST PENDING.**
+**Severity: HIGH. Status: CLOSED / FIELD VALIDATED.** *(was: remediated in code, field retest pending)*
 
 VENUE_B failed every attempt with
 
@@ -266,7 +291,7 @@ The skip count differs from the 126 recorded above because the machine this
 ran on has no Redis or PostgreSQL; those backend suites skip rather than run.
 That is an environment difference, not a regression.
 
-## Field retest status
+## Field retest status *(as assessed at the time — since completed)*
 
 **NOT PERFORMED.** This remediation was produced in an environment with no
 Docker daemon, no PostgreSQL, no Redis and no outbound access to any exchange
@@ -286,9 +311,11 @@ The database state of `session-a884bd006c334809985844b466c805e4` was likewise
 not observable from here and was not modified. Neither historical session was
 touched.
 
-## Disposition
+## Disposition after the first live-feed remediation *(historical)*
 
 **PHASE 12 LIVE-FEED REMEDIATION — CODE COMPLETE / FIELD RETEST PENDING**
+
+*Historical, and superseded: see **Final Phase 12 closure** at the end of this document. This disposition was accurate when written.*
 
 P12-F1 is remediated in code and proven by test, including against a real
 socket. P12-T1 is remediated. P12-F2 is unresolved and deliberately left
@@ -308,7 +335,7 @@ Remediation branch: `remediate-phase12-final-live-feeds`, cut from
 
 ## P12-F3 — Coinbase full L2 snapshot exceeded the local storage bound
 
-**Severity: HIGH. Status: REMEDIATED IN CODE / FIELD RETEST REQUIRED.**
+**Severity: HIGH. Status: CLOSED / FIELD VALIDATED.** *(was: remediated in code, field retest required)*
 
 Once the snapshots arrived, the stack logged a *clean* close every few
 seconds:
@@ -389,7 +416,7 @@ was measured.
 
 ## P12-F2 — probe corrected; endpoint NOT adopted
 
-**Status: PROBE CORRECTED / ADOPTION PENDING A CORRECTED-PROBE RUN.**
+**Status: CLOSED / FIELD VALIDATED.** *(was: probe corrected, adoption pending a corrected-probe run; the corrected probe was subsequently run and passed)*
 
 Global Binance remains `HTTP 451` from Codespaces on both REST and WebSocket.
 That was not bypassed, evaded or worked around in any way.
@@ -461,7 +488,7 @@ place.
   `1 failed, 1453 passed, 131 skipped` — the single failure is the known
   `${TF_FEED:-simulated}` packaging baseline, untouched.
 
-## Field retest status
+## Field retest status *(as assessed at the time — since completed)*
 
 **NOT PERFORMED.** Same environment constraints as the previous pass: no
 Docker, no PostgreSQL, no Redis, and no exchange reachability. The following
@@ -477,9 +504,11 @@ remain unproven and must not be reported otherwise:
 
 No historical session was read or modified.
 
-## Disposition
+## Disposition after the second live-feed remediation *(historical)*
 
 **PHASE 12 FINAL LIVE-FEED REMEDIATION CODE COMPLETE / FIELD RETEST REQUIRED**
+
+*Historical, and superseded: see **Final Phase 12 closure** at the end of this document. This disposition was accurate when written.*
 
 ---
 
@@ -623,7 +652,7 @@ The unit suite was run on Python 3.11, the interpreter this environment has the
 project installed under; `python3.12` is present but carries no pytest here. CI
 runs 3.12.
 
-## Field retest status
+## Field retest status *(as assessed at the time — since completed)*
 
 **REQUIRED, NOT PERFORMED.** VENUE_B is field-validated, but the Binance.US
 endpoint change has never run inside the platform — only under the standalone
@@ -636,9 +665,11 @@ observer failures and a healthy recorder.
 Cross-venue opportunities are **not** required and their absence is not a
 failure.
 
-## Disposition
+## Disposition after the Binance.US adoption *(historical)*
 
 **PHASE 12 BINANCE.US REMEDIATION CODE COMPLETE / FINAL TWO-VENUE FIELD RETEST REQUIRED**
+
+*Historical, and superseded: see **Final Phase 12 closure** at the end of this document. This disposition was accurate when written.*
 
 ---
 
@@ -719,7 +750,7 @@ Ruff baselines, reported separately from this change and untouched by it:
 2. `agents/marin/source.py:22` — I001
 3. `agents/okapi/registry.py:360` — SIM102
 
-## Field retest status
+## Field retest status *(as assessed at the time — since completed)*
 
 **NOT PERFORMED — environment cannot support it.** This session has no Docker
 daemon, no PostgreSQL, no Redis and no outbound reachability to any exchange
@@ -748,6 +779,192 @@ must still establish, on this branch:
 Zero cross-venue opportunities is expected and is not a failure, because the
 live instruments intentionally differ.
 
-## Disposition
+## Disposition before the final field rehearsal *(historical)*
 
 **PHASE 12 LIVE-FEED REMEDIATION CODE COMPLETE / TWO-VENUE SHADOW FIELD RETEST REQUIRED**
+
+*Historical, and superseded: see **Final Phase 12 closure** at the end of this document. This disposition was accurate when written.*
+
+---
+
+# Final Phase 12 closure
+
+**PHASE 12 — VALIDATED / FIELD VALIDATED / CLOSED**
+
+This section supersedes every earlier disposition in this document. Those are
+kept above as audit evidence, because the failures they record are the reason
+the remediations exist.
+
+## Final checkpoints
+
+| | |
+|---|---|
+| Final validated code checkpoint | `1571f086385aa20d707e02200bd691dcd4b941c3` |
+| Branch | `remediate-phase12-live-feed-final` |
+| Final field session | `session-8e64e5b6f1de456aa497a654842928ed` |
+
+The rehearsal ran at that exact checkpoint, and the checkpoint was unchanged at
+the end of the run with a clean working tree — the field evidence describes the
+code as committed, not a local variant of it.
+
+## Run configuration and safety manifest
+
+    TF_MODE=paper
+    TF_PROFILE=shadow
+    TF_FEED=live
+    TF_INTELLIGENCE_PROVIDER=null
+
+The operational manifest confirmed:
+
+    trading_mode          = PAPER
+    operational_profile   = SHADOW
+    feed                  = LIVE
+    paper_executor        = true
+    private_venue_access  = false
+    real_order_submission = false
+
+No authenticated or private exchange path was used.
+
+## Harness results
+
+| Step | Result |
+|---|---|
+| Focused tests | RC=0 |
+| Start SHADOW | RC=0 |
+| Safety field check | RC=0 |
+| VENUE_A Binance.US public probe | RC=0 |
+| Full SHADOW field check | RC=0 |
+| Graceful shutdown | RC=0 |
+| VENUE_B clean-close count | **0** |
+| Final git status | clean |
+
+## VENUE_A — Binance.US
+
+Endpoints `wss://stream.binance.us:9443/stream` and `https://api.binance.us`,
+symbols `BTC-USDT` and `ETH-USDT`.
+
+| Symbol | connected | quality | reconnects | sequence gaps |
+|---|---|---|---|---|
+| BTC-USDT | true | FRESH | 0 | 0 |
+| ETH-USDT | true | FRESH | 0 | 0 |
+
+Recorded in the session: 2 `BOOK_SNAPSHOT`, 1,596 `BOOK_DELTA`, 15
+`TRADE_PRINT`, 1 `VENUE_CONNECTED`. **No HTTP 451 loop.** Closes **P12-F2**.
+
+## VENUE_B — Coinbase
+
+Existing public Coinbase endpoint, unchanged; symbols `BTC-USD` and `ETH-USD`.
+
+| Symbol | connected | quality | reconnects | sequence gaps |
+|---|---|---|---|---|
+| BTC-USD | true | FRESH | 0 | 0 |
+| ETH-USD | true | FRESH | 0 | 0 |
+
+Recorded in the session: 2 `BOOK_SNAPSHOT`, 12,311 `BOOK_DELTA`, 1,716
+`TRADE_PRINT`, 1 `VENUE_CONNECTED`. Zero clean-close reconnect events and zero
+`BOOK_RESYNC_REQUESTED` events.
+
+**No code-1009 / 1 MiB message-size loop** — closes the original **P12-F1**.
+**No 10,000-level storage-overflow loop** — closes **P12-F3**.
+
+## TIDAL and market state
+
+TIDAL HEALTHY at final observation, with all four live venue/symbol books
+usable and FRESH: `VENUE_A:BTC-USDT`, `VENUE_A:ETH-USDT`, `VENUE_B:BTC-USD`,
+`VENUE_B:ETH-USD`. No sequence gaps, no reconnect storms, no resync requests in
+the final recorded session.
+
+## Zero opportunities is the expected result
+
+The platform did not complete strategy warmup, and that is correct rather than
+a defect. NORO and ZEPHR require two venues contributing the **same**
+instrument, and the live universe intentionally has none:
+
+    VENUE_A:  BTC-USDT, ETH-USDT
+    VENUE_B:  BTC-USD,  ETH-USD
+
+NORO reported 0 of 4 symbols valuation-ready, because no symbol has the two
+cross-venue contributors a valuation needs. ZEPHR reported 4 usable
+venue/symbol pairs but no symbol with the two usable venues a cross-venue quote
+needs.
+
+USD and USDT are **not** collapsed — that is the post-TIDAL-C3 configuration,
+deliberately preserved. Consequently zero strategy opportunities, zero orders
+and zero fills are **not** Phase 12 failures, and this condition must not be
+described as an unresolved live-feed defect.
+
+## PAPER / SHADOW safety boundary
+
+Portfolio unchanged throughout: initial balance 100,000, cash 100,000, gross
+exposure 0, net exposure 0, no positions. Execution counters: 0 plans, 0
+orders, 0 fills. Kill switch clear. RUNE, VESKA and MARIN reconciliation all
+healthy. The observer remained observational only.
+
+No live executor, no credential boundary, no private connectivity, and no
+runtime shadow-to-live switch exists.
+
+## Recording and graceful shutdown
+
+`./stop-paper.sh`, RC=0. Post-shutdown PostgreSQL verification of
+`session-8e64e5b6f1de456aa497a654842928ed`:
+
+| Field | Value |
+|---|---|
+| status | **COMPLETE** |
+| started_at | 1789329020607 |
+| ended_at | **1789329440619** |
+| events_lost | **0** |
+| failure_reason | *(empty)* |
+| persisted_events | **34,898** |
+
+Data was preserved and no historical session was modified.
+
+## Final finding disposition
+
+### Live-feed and harness findings
+
+| ID | Finding | Status |
+|---|---|---|
+| P12-F1 | Coinbase WebSocket 1 MiB message-size failure | **CLOSED / FIELD VALIDATED** |
+| P12-T1 | Field harness polled the wrong API port | **CLOSED / FIELD VALIDATED** |
+| P12-F2 | Global Binance HTTP 451 / public live endpoint | **CLOSED / FIELD VALIDATED** |
+| P12-F3 | Coinbase full book exceeded the 10,000-level ceiling | **CLOSED / FIELD VALIDATED** |
+| P12-T2 | Frame-count probe false negative | **CLOSED / FIELD VALIDATED** |
+
+- **P12-F1** — finite 8 MiB receive bound; no code-1009 recurrence; stable
+  Coinbase live feed.
+- **P12-T1** — the final field harness completed successfully against the
+  repository's own API configuration.
+- **P12-F2** — official Binance.US public endpoint with REST, WebSocket, depth
+  and trades all working, zero reconnects, zero sequence gaps, probe RC=0.
+- **P12-F3** — VENUE_B-specific finite 50,000-level ceiling; both snapshots
+  accepted; stable deltas; zero overflow loop, zero clean-close storm, zero
+  `BOOK_RESYNC_REQUESTED`.
+- **P12-T2** — time-bounded semantic probe; final Binance.US probe RC=0.
+
+### Original audit findings
+
+`P12-C1`, `P12-H1`, `P12-H2`, `P12-H3`, `P12-H4`, `P12-H5`, `P12-M1` and
+`P12-M2` remain **REMEDIATED** and are not reopened by this closure.
+
+## What this closure does and does not mean
+
+Phase 12 closure means the SHADOW framework and its live-public-data rehearsal
+requirements are validated. **Nothing more.**
+
+It does **not** mean Octopush is ready for live or real-money trading. The
+following remain `NOT_IMPLEMENTED` and unchanged:
+
+- private venue connectivity;
+- live executor;
+- credential boundary;
+- live reconciliation;
+- deployment authorization.
+
+No shadow-to-live runtime promotion switch exists anywhere in this build.
+
+## Disposition
+
+**PHASE 12 — VALIDATED / FIELD VALIDATED / CLOSED**
+
+**PHASE 13 — NOT STARTED**

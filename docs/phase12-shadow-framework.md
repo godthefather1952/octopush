@@ -1,6 +1,16 @@
 # Phase 12 — Shadow framework
 
-**Status: VALIDATED / CLOSED at the Phase 12 code-and-contract boundary. FIELD SHADOW TEST PENDING.**
+**Status: PHASE 12 — VALIDATED / FIELD VALIDATED / CLOSED.**
+
+Code-and-contract validation closed first; the live-public-data SHADOW field
+rehearsal that was pending then has since been run and passed. Final validated
+code checkpoint `1571f086385aa20d707e02200bd691dcd4b941c3`, final field session
+`session-8e64e5b6f1de456aa497a654842928ed`. See
+`docs/phase12-shadow-validation-audit.md` for the full chronology and evidence.
+
+**Closure means the SHADOW framework and its live-public-data rehearsal
+requirements are validated — nothing more. It does not mean Octopush is ready
+for live or real-money trading.**
 
 ---
 
@@ -382,12 +392,32 @@ At `60190fca1ebce95a79fac7ad6f06f49e7662dbdf`:
 
 The deterministic equivalence test drives the same seeded market and logical clock under PAPER and SHADOW, exercises RUNE, and compares opportunity state, risk decisions, OMS orders, fills, portfolio state, OKAPI hedge records, MARIN result and kill-switch state. Economic summaries are equal; only observational shadow data differs.
 
-### Remaining field validation
+### Field validation — COMPLETED
 
-Code-and-contract closure does **not** establish simulator realism against real venue fills or live-deployment readiness. A field SHADOW rehearsal against real public market data remains pending, including reconnect/staleness behavior, real-market timestamp quality, long-session retention/resource behavior, and shutdown/session-finalization under an actual SHADOW run.
+*Historical note: at code-and-contract closure this section recorded a field
+rehearsal as still pending. It has since been run and passed.*
 
-No authenticated venue executor, private order channel, credential boundary, or shadow-to-live promotion switch was added. `PreLiveReadinessSnapshot` remains conservative.
+Code-and-contract closure on its own did **not** establish behaviour against
+real public market data, so a live SHADOW rehearsal was required: reconnect and
+staleness behaviour, real-market timestamp quality, long-session retention, and
+shutdown/session-finalisation under an actual run.
+
+That rehearsal was performed and passed, at code checkpoint
+`1571f086385aa20d707e02200bd691dcd4b941c3`, in field session
+`session-8e64e5b6f1de456aa497a654842928ed`: both venues stable with zero
+reconnects and zero sequence gaps, TIDAL healthy across all four live
+venue/symbol books, and a graceful shutdown persisting 34,898 events with
+`events_lost = 0`. The evidence, and the three live-feed defects found and
+fixed along the way, are recorded in
+`docs/phase12-shadow-validation-audit.md`.
+
+It still does **not** establish simulator realism against real venue fills, and
+it does not establish live-deployment readiness. No authenticated venue
+executor, private order channel, credential boundary, or shadow-to-live
+promotion switch was added. `PreLiveReadinessSnapshot` remains conservative:
+live executor, private venue connectivity, credential boundary, live
+reconciliation and deployment authorization are all `NOT_IMPLEMENTED`.
 
 ## Testing status
 
-**PHASE 12 REMEDIATED / AUTOMATED VALIDATION PASS / FIELD SHADOW TEST PENDING.**
+**PHASE 12 — VALIDATED / FIELD VALIDATED / CLOSED.**
