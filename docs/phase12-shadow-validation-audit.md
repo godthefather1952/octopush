@@ -294,3 +294,189 @@ P12-F1 is remediated in code and proven by test, including against a real
 socket. P12-T1 is remediated. P12-F2 is unresolved and deliberately left
 truthful in production. None of the three may be called field-validated until
 a Codespaces rehearsal produces the evidence above.
+
+---
+
+# Second live-feed remediation — P12-F3 and the P12-F2 probe correction
+
+The first remediation's P12-F1 transport fix was confirmed working by real
+Codespaces diagnostics: with the 8 MiB ceiling, both Coinbase snapshots were
+received intact. That exposed the next defect underneath it.
+
+Remediation branch: `remediate-phase12-final-live-feeds`, cut from
+`d8019db9d2ce62c9539605e5d344522cccaf234b`.
+
+## P12-F3 — Coinbase full L2 snapshot exceeded the local storage bound
+
+**Severity: HIGH. Status: REMEDIATED IN CODE / FIELD RETEST REQUIRED.**
+
+Once the snapshots arrived, the stack logged a *clean* close every few
+seconds:
+
+    VENUE_B ... sent 1000 (OK); then received 1000 (OK)
+
+Measured live snapshot sizes:
+
+| Symbol | Bids | Asks | Encoded |
+|---|---|---|---|
+| ETH-USD | 8,363 | 11,278 | ~492,570 bytes |
+| BTC-USD | 21,109 | 21,203 | ~1,111,949 bytes |
+
+Both exceed the generic `max_book_levels_per_side` of 10,000 on at least one
+side. The loop was therefore entirely self-inflicted and entirely correct at
+every step: `apply_snapshot` rejected the oversized snapshot, TIDAL raised the
+overflow path, `VenueBAdapter.request_resync` closed the socket deliberately,
+Coinbase sent another legitimate full snapshot on reconnect, and the same
+rejection happened again. TIDAL never saw a usable VENUE_B book, so nothing
+downstream could warm.
+
+Coinbase documents the level-2 subscription as delivering the **entire** order
+book. The 10,000 ceiling was simply the wrong size for that venue.
+
+**Fix: `VENUE_B.max_book_levels_per_side = 50_000`, venue-specific.**
+
+Justification is the field measurement: the largest side actually observed was
+21,203, so 50,000 is ~2.4x observed headroom. It remains finite, remains a
+quarter of the model's 200,000 maximum, and leaves the fail-closed overflow
+path completely unchanged.
+
+What this is *not*: not a trim, not a top-N, not a rolling eviction, not a
+reinterpretation of `book_depth_levels`, and not a global default increase.
+VENUE_A and the simulated venues stay at 10,000, because depth-limited feeds
+have no evidence justifying more.
+
+### Memory impact
+
+Measured directly with `tracemalloc` against real `LocalOrderBook` instances,
+both symbols loaded:
+
+| Scenario | Resident book storage |
+|---|---|
+| At observed field size (21,203/side) | **2.25 MiB** |
+| Both books saturating the 50,000 ceiling | **10.00 MiB** |
+
+10 MiB is the absolute worst case this ceiling permits for the two configured
+symbols, against a container budget measured in gigabytes. Solving the
+reconnect loop does not trade it for a memory risk.
+
+### Documentation correction
+
+`VenueConfig.max_book_levels_per_side` previously claimed 10,000 was "large
+enough for an ordinary full Coinbase L2 book". Field evidence disproves that,
+and the comment has been corrected rather than left standing as a known-false
+invariant in production code. It now states that 10,000 is a conservative
+generic default, that full-book venues require explicit overrides, and what
+was measured.
+
+### Tests
+
+`tests/unit/test_venue_b_full_book_bound.py`, 22 cases:
+
+- **A** — VENUE_B carries the explicit ceiling; VENUE_A, the generic default,
+  the simulated venues, the P12-F1 transport bound and both symbol lists are
+  all asserted unchanged;
+- **B** — snapshots at the exact measured field shape (21,109/21,203 and
+  8,363/11,278) are accepted and leave the book synced, plus a direct
+  demonstration that the old 10,000 ceiling rejects both;
+- **C** — one level past 50,000 still raises `BookOverflowError`, with no
+  partial install, `synced=False`, `needs_resync=True`, and previously
+  authoritative state preserved intact;
+- **D** — levels far beyond `book_depth_levels` remain in authoritative
+  storage while the read view stays trimmed;
+- **E** — through the real TIDAL/`ResyncBridge` wiring: a field-sized snapshot
+  requests **no** resync (the loop is gone) and yields usable state for both
+  symbols, while a genuinely oversized one still requests one.
+
+## P12-F2 — probe corrected; endpoint NOT adopted
+
+**Status: PROBE CORRECTED / ADOPTION PENDING A CORRECTED-PROBE RUN.**
+
+Global Binance remains `HTTP 451` from Codespaces on both REST and WebSocket.
+That was not bypassed, evaded or worked around in any way.
+
+The Binance.US probe passed REST depth for both symbols and passed every
+depth-stream requirement — combined-stream envelope, `depthUpdate`, `U`/`u`,
+contiguous ids, 159 depth events with zero sequence gaps over 60 seconds. It
+observed **zero trade events**, and the old probe scored that as a failure.
+
+That verdict was not supportable, and correcting it is the substance of this
+pass. Zero trade events is two different situations with one appearance: a
+quiet market with nothing to deliver, or a trade stream that failed to deliver
+what did happen. Only the second is an incompatibility. Waiting longer does
+not distinguish them — a longer window makes a quiet market less likely, never
+impossible.
+
+The corrected probe samples **public** `/api/v3/trades` either side of the
+listening window and classifies:
+
+| REST trade state | WS trade events | Verdict |
+|---|---|---|
+| did not advance | 0 | `INCONCLUSIVE` — no trade occurred; **not** a failure |
+| advanced | ≥ 1 | `PASS` |
+| advanced | 0 | `FAIL — TRADE STREAM DELIVERY INCOMPATIBLE` |
+
+Delivered events are checked first: if the stream delivered trades, the stream
+works, whatever the REST sample happened to catch. `INCONCLUSIVE` is a third
+status that does not count against the endpoint, and the probe exits 2 for it
+rather than 0 or 1, so a quiet market is never silently read as a pass.
+
+The probe remains public, unauthenticated and read-only; tests assert that no
+credential, signature, private or order endpoint and no write verb appears in
+its executable code.
+
+`tests/unit/test_venue_a_probe_trade_liveness.py`, 10 cases, covers all three
+required classifications plus the delivery-wins edge case and the public /
+read-only guarantees.
+
+**The endpoint was NOT changed.** The adoption rule requires the corrected
+probe to pass, including the trade-liveness check — and the corrected probe
+has never been run, because this environment has no outbound access to any
+exchange. Adopting on the strength of a probe run that used the *old*,
+unsound trade scoring would be exactly the guess the rule exists to prevent.
+`default_venues()` still carries `wss://stream.binance.com:9443/stream` and
+`https://api.binance.com`, and VENUE_A's symbols remain BTC-USDT/ETH-USDT.
+
+To settle it, run from Codespaces:
+
+    python scripts/lib/probe_venue_a.py wss://stream.binance.us:9443/stream https://api.binance.us
+
+Exit 0 (all met, trade liveness `PASS`) authorises the endpoint change. Exit 2
+means re-run when the market is active. Exit 1 means leave the blocker in
+place.
+
+## Automated validation of this remediation
+
+- P12-F3 tests: **22 passed**;
+- P12-F2 probe tests: **10 passed**;
+- P12-F1 transport tests: **18 passed**, transport still finite 8 MiB, never
+  `None`;
+- Phase 12 suite: **17 passed**;
+- TIDAL book / storage / abstention: **98 passed**;
+- venue adapters and reconnect: **62 passed**;
+- field-harness tests: **9 passed**;
+- PAPER boundary: **30 passed**;
+- mypy(`core/`): **PASS**;
+- Ruff: **exactly the three pre-existing baselines**, zero new findings;
+- Python 3.11 `tests/unit tests/contract`:
+  `1 failed, 1453 passed, 131 skipped` — the single failure is the known
+  `${TF_FEED:-simulated}` packaging baseline, untouched.
+
+## Field retest status
+
+**NOT PERFORMED.** Same environment constraints as the previous pass: no
+Docker, no PostgreSQL, no Redis, and no exchange reachability. The following
+remain unproven and must not be reported otherwise:
+
+- VENUE_B accepts its initial snapshot, raises no `BOOK_OVERFLOW`, shows no
+  recurring clean-1000 reconnect loop, and makes BTC-USD and ETH-USD usable to
+  TIDAL;
+- whether Binance.US passes the corrected trade-liveness check;
+- ticks, observer failures, recorder health, readiness codes, memory over the
+  rehearsal window;
+- graceful shutdown, session `COMPLETE`, `ended_at`, `events_lost == 0`.
+
+No historical session was read or modified.
+
+## Disposition
+
+**PHASE 12 FINAL LIVE-FEED REMEDIATION CODE COMPLETE / FIELD RETEST REQUIRED**
