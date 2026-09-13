@@ -837,7 +837,26 @@ def default_venues() -> list[VenueConfig]:
             rest_url="https://api.exchange.coinbase.com",
             fees=FeeSchedule(maker_bps=2.0, taker_bps=6.0),
             latency_ms=55,
-            symbols=["BTC-USD", "ETH-USD"],
+            # P13-B1. Coinbase lists USDT products alongside its USD ones, and
+            # a public protocol probe confirmed it serves them over the very
+            # endpoint, channels and parser already configured here: BTC-USDT
+            # and ETH-USDT both delivered a full snapshot, live l2updates and
+            # public trade prints, with zero exchange errors and zero parser
+            # failures. No new adapter, no new endpoint, no quote substitution.
+            #
+            # Adding them is what gives the cross-venue strategy a genuinely
+            # shared instrument. Before this, VENUE_A quoted only USDT and
+            # VENUE_B only USD, so no canonical symbol had two contributors and
+            # the detector could never return a dislocation -- correctly, since
+            # BTC-USD and BTC-USDT are different instruments.
+            #
+            # The USD markets stay. They are real markets Coinbase lists, they
+            # are not duplicates of the USDT ones, and they remain
+            # single-contributor by design. USD and USDT are NOT aliased,
+            # merged or renamed anywhere: the overlap here is two venues
+            # listing the same instrument, which is the only honest way to get
+            # one.
+            symbols=["BTC-USD", "ETH-USD", "BTC-USDT", "ETH-USDT"],
             # P12-F3. A Coinbase level-2 subscription delivers the ENTIRE
             # order book, not a depth-limited view, so the generic 10,000
             # ceiling is simply the wrong size for this venue: a live

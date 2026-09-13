@@ -1,11 +1,19 @@
 # Phase 13 — Shadow validation audit
 
-**Disposition: PHASE 13 AUDIT — COMPLETE / FINDINGS FROZEN. REMEDIATION NOT STARTED.**
+**Disposition: PHASE 13 AUDIT — COMPLETE / FINDINGS FROZEN.**
+**P13-B1 — REMEDIATED IN CODE / FIELD VALIDATION REQUIRED (Batch A).**
+**All other findings — NOT REMEDIATED.**
 
-This is the first Phase 13 document in the repository. Phase 13 had not been
-specified before, so this audit does two things: it proposes a contract derived
-from the code as it actually stands, and it audits the repository against that
-contract. Nothing here is implemented.
+This is the first Phase 13 document in the repository. The audit sections below
+are as originally frozen; a remediation-status section is appended at the end,
+along with a correction to the roadmap label this document initially proposed.
+
+**Roadmap note, stated up front because §3 below gets it wrong:** the official
+roadmap is `PHASE 13 = Venue Expansion`, not the "Shadow Evidence Framework"
+that §3 proposes. That proposal is withdrawn — see *Roadmap-label correction*
+at the end. The findings themselves were derived from code and stand; the ones
+concerning the shadow evidence layer are retained as follow-through findings
+for whichever phase owns that work.
 
 ## 1. Checkpoints
 
@@ -489,3 +497,145 @@ No production, test, script, configuration, CI or Docker file was modified by
 this audit. Phase 12 remains closed and unmodified. No venue was added, no
 strategy behaviour changed, no authenticated or private exchange access
 introduced, and USD and USDT remain distinct instruments.
+
+---
+
+# Roadmap-label correction
+
+**The official roadmap reads:**
+
+    PHASE 12 = Shadow Validation
+    PHASE 13 = Venue Expansion
+    PHASE 14 = Strategy Expansion
+
+Section 3 of this document proposed relabelling Phase 13 as a "Shadow Evidence
+Framework". That was a redefinition of the roadmap and is **withdrawn**. Phase
+13 is **Venue Expansion**.
+
+The findings themselves stand — they were derived from code and remain
+accurate. P13-H1 … P13-H5, P13-M1 … P13-M4 and P13-L1 … P13-L2 are retained as
+**follow-through findings** about the shadow evidence layer, to be scheduled
+against whichever phase owns that work. They are not Phase 13 deliverables and
+none of them is remediated here.
+
+What the audit got right, and what it missed: it correctly proved from code
+that the live configuration had no same-instrument overlap, and correctly
+refused to manufacture one. It then reasoned that resolving this required a
+*third venue*, and that was too narrow a search. A subsequent field probe found
+the overlap available on a venue already configured.
+
+# P13-B1 remediation — Batch A: live symbol overlap
+
+## Audit finding
+
+The production live configuration had no canonical symbol with two venue
+contributors, so `find_dislocation` could never return a dislocation and no
+live opportunity could exist. Proven from code, not inferred.
+
+That finding was **correct for the configuration it inspected** and is not
+rewritten here.
+
+## Subsequent field discovery
+
+A direct public protocol probe was run from the Dev Container at this
+document's own checkpoint (`62ab561ab685c4e66cfc61543d708f352346796b`, clean
+tree), against the **already-configured** endpoint
+`wss://ws-feed.exchange.coinbase.com`, using the repository's own
+`venues.venue_b.parser.subscribe_message()` to build the subscription and
+`parse_message()` to read the replies, on the existing `level2_batch` /
+`matches` / `heartbeat` channels.
+
+Requesting `BTC-USDT` and `ETH-USDT`, over 60 seconds:
+
+| | BTC-USDT | ETH-USDT |
+|---|---|---|
+| snapshots | 1 | 1 |
+| initial snapshot size | 1,234 bids / 1,288 asks | 523 bids / 796 asks |
+| `l2update` | 610 | 319 |
+| trade events | 1 | 4 |
+
+Totals across both products: 120 heartbeats, 929 `l2update`, 2 `last_match`,
+3 `match`, 2 snapshots, 1 `subscriptions` acknowledgement. **Zero** exchange
+application errors, **zero** Octopush parser failures, probe RC 0.
+
+So Coinbase genuinely lists and serves both products, the existing endpoint,
+channels, adapter and parser all accept them unchanged, and no quote
+substitution is involved anywhere.
+
+The blocker's remediation is therefore narrower than the audit assumed:
+
+    same existing venue + genuine overlapping instruments
+
+rather than adding a third venue.
+
+## Remediation
+
+`VENUE_B` live configuration now carries the markets Coinbase actually lists:
+
+```
+symbols = ["BTC-USD", "ETH-USD", "BTC-USDT", "ETH-USDT"]
+```
+
+`VENUE_A` is unchanged at `["BTC-USDT", "ETH-USDT"]`.
+
+Resulting contributor map:
+
+| Symbol | Contributors |
+|---|---|
+| BTC-USDT | VENUE_A, VENUE_B |
+| ETH-USDT | VENUE_A, VENUE_B |
+| BTC-USD | VENUE_B only |
+| ETH-USD | VENUE_B only |
+
+The derived strategy universe is unchanged in content and free of duplicates:
+`["BTC-USD", "BTC-USDT", "ETH-USD", "ETH-USDT"]`.
+
+**USD and USDT are not collapsed.** Nothing was renamed or aliased, the USD
+markets remain as real single-contributor markets, `venues/base/symbols.py` is
+untouched, and `denormalize` still renders every symbol as itself. The overlap
+exists because two venues genuinely list the same instrument — the only honest
+way to obtain one.
+
+Nothing else changed: not the Coinbase endpoint, adapter or parser, not
+`book_depth_levels`, not the 50,000-level storage ceiling, not the 8 MiB
+transport bound, not the detector, not RUNE, VESKA, PaperExecutor or any
+threshold.
+
+## Structural consequence, proved
+
+`tests/unit/test_phase13_venue_overlap.py` drives the real
+`find_dislocation`. With two venue states on `BTC-USDT` it now returns a
+dislocation across `VENUE_A`/`VENUE_B`; with the single `BTC-USD` state it
+still returns `None`; and a `BTC-USD` query with USDT states present *still*
+returns `None`, because the detector groups by exact canonical symbol. The
+TIDAL-C3 guard is re-proved under the new configuration rather than assumed.
+
+## Resource note
+
+The observed USDT snapshots are far smaller than the USD ones — 1,234/1,288
+and 523/796 against BTC-USD's 21,109/21,203. The storage ceiling is per side
+and per book, so doubling the subscription count does not approach it. No
+bound was raised, lowered or unbounded.
+
+## Status
+
+**P13-B1 — REMEDIATED IN CODE / FIELD VALIDATION REQUIRED**
+
+Automated tests prove structural overlap. They cannot prove that the combined
+live feed stays stable with all six venue/symbol subscriptions running
+together. The environment this batch ran in has no Docker, no PostgreSQL, no
+Redis and no exchange reachability, so no field rehearsal was performed and
+none is simulated.
+
+The field rehearsal must establish: six connected, FRESH books with no
+reconnect storm and no sequence gaps; two usable contributors for each of
+BTC-USDT and ETH-USDT and one for each USD market; TIDAL healthy; NORO no
+longer reporting zero valuation-ready symbols solely for want of a second
+contributor; ZEPHR recognising the overlapping instruments as two-venue; and
+none of the Phase 12 failure signatures returning (HTTP 451, code 1009,
+message-too-big, `max_levels_per_side` overflow, clean-close 1000 loop,
+`BOOK_RESYNC_REQUESTED` storm, sequence-gap storm, parser failures, Coinbase
+subscription errors). An actual dislocation is **not** required — structural
+eligibility and stable data are the criteria.
+
+**PHASE 13 — VENUE EXPANSION IN PROGRESS**

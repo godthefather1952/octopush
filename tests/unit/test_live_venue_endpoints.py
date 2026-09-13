@@ -69,21 +69,51 @@ class TestSymbolIntegrity:
     def test_venue_a_symbols_are_usdt(self):
         assert live("VENUE_A").symbols == ["BTC-USDT", "ETH-USDT"]
 
-    def test_venue_b_symbols_are_usd(self):
-        assert live("VENUE_B").symbols == ["BTC-USD", "ETH-USD"]
+    def test_venue_b_carries_its_usd_and_usdt_markets(self):
+        """Coinbase lists both, and a public probe confirmed it serves both."""
+        assert live("VENUE_B").symbols == [
+            "BTC-USD",
+            "ETH-USD",
+            "BTC-USDT",
+            "ETH-USDT",
+        ]
 
-    def test_the_two_venues_share_no_instrument(self):
-        assert set(live("VENUE_A").symbols).isdisjoint(live("VENUE_B").symbols), (
-            "a shared symbol here would mean USD and USDT had been collapsed"
-        )
+    def test_the_two_venues_overlap_on_exactly_the_usdt_pairs(self):
+        """P13-B1. The overlap exists because both venues genuinely list these.
 
-    def test_no_live_venue_quotes_both_settlement_assets(self):
-        for config in default_venues():
-            quotes = {symbol.split("-", 1)[1] for symbol in config.symbols}
-            assert len(quotes) == 1, (
-                f"{config.name} mixes settlement assets {quotes}; a venue's "
-                "symbols must reflect what it actually lists"
-            )
+        This assertion replaced an earlier one requiring *no* overlap. That
+        was right while VENUE_B carried only USD markets; it would be wrong
+        now, and weakening it to "some overlap" would lose the point. The
+        exact set is what matters.
+        """
+        overlap = set(live("VENUE_A").symbols) & set(live("VENUE_B").symbols)
+        assert overlap == {"BTC-USDT", "ETH-USDT"}
+
+    def test_the_usd_markets_remain_single_venue(self):
+        """They are Coinbase's own, and are not duplicates of the USDT pairs."""
+        assert {"BTC-USD", "ETH-USD"}.isdisjoint(live("VENUE_A").symbols)
+
+    def test_a_venue_lists_a_settlement_asset_only_where_it_really_trades_it(self):
+        """The replacement for the old one-quote-per-venue rule.
+
+        That rule encoded an accident of the configuration rather than a
+        property of the venues: Coinbase genuinely trades both USD and USDT
+        markets, so requiring one settlement asset per venue would now force
+        the configuration to lie. What must stay true is narrower and real —
+        every configured symbol names an instrument the venue actually lists,
+        and USD is never written where USDT is meant.
+        """
+        listings = {config.name: set(config.symbols) for config in default_venues()}
+        # Binance.US is configured for its USDT markets only.
+        assert listings["VENUE_A"] == {"BTC-USDT", "ETH-USDT"}
+        # Coinbase for both, which is what it lists.
+        assert listings["VENUE_B"] == {"BTC-USD", "ETH-USD", "BTC-USDT", "ETH-USDT"}
+        # And no canonical symbol is ever spelled two ways.
+        for symbols in listings.values():
+            for symbol in symbols:
+                base, quote = symbol.split("-", 1)
+                assert quote in {"USD", "USDT"}
+                assert f"{base}-{quote}" == symbol
 
 
 class TestVenueBEndpointsAndCeiling:

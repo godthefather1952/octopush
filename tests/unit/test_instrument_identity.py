@@ -45,21 +45,41 @@ class TestLiveVenueSubscriptions:
             "ethusdt@trade",
         ]
 
-    def test_coinbase_subscribes_to_its_usd_markets(self):
+    def test_coinbase_subscribes_to_the_markets_it_actually_lists(self):
+        """Its USD markets and its USDT markets, each named as itself.
+
+        A public protocol probe confirmed Coinbase serves all four over the
+        endpoint and channels already configured here (P13-B1).
+        """
         venue = next(v for v in default_venues() if v.name == "VENUE_B")
-        assert venue.symbols == ["BTC-USD", "ETH-USD"]
+        assert venue.symbols == ["BTC-USD", "ETH-USD", "BTC-USDT", "ETH-USDT"]
         message = parser_b.subscribe_message(venue.symbols)
-        assert message["product_ids"] == ["BTC-USD", "ETH-USD"]
+        assert message["product_ids"] == [
+            "BTC-USD",
+            "ETH-USD",
+            "BTC-USDT",
+            "ETH-USDT",
+        ], "every product must be requested under its own name"
 
-    def test_the_live_venues_share_no_instrument(self):
-        """The honest consequence of the fix, asserted so it stays deliberate.
+    def test_the_live_venues_overlap_only_where_both_genuinely_list(self):
+        """The overlap this test previously forbade now exists — correctly.
 
-        If a future change makes these overlap it should be because the venues
+        The earlier version asserted no overlap at all, and said in its own
+        docstring that if one ever appeared it should be "because the venues
         genuinely list the same instrument, not because a formatter rewrote a
-        quote again.
+        quote again". That is exactly what happened: Coinbase lists BTC-USDT
+        and ETH-USDT, a public probe confirmed it serves them, and they were
+        added to its configuration. Nothing was renamed or aliased.
+
+        So the assertion becomes the precise one: overlap on the USDT pairs,
+        and on nothing else.
         """
         venues = {v.name: set(v.symbols) for v in default_venues()}
-        assert venues["VENUE_A"] & venues["VENUE_B"] == set()
+        assert venues["VENUE_A"] & venues["VENUE_B"] == {"BTC-USDT", "ETH-USDT"}
+        # The USD markets are Coinbase's alone. They are not duplicates of the
+        # USDT ones and must never be folded into them.
+        assert {"BTC-USD", "ETH-USD"} <= venues["VENUE_B"]
+        assert not {"BTC-USD", "ETH-USD"} & venues["VENUE_A"]
 
     def test_simulated_venues_share_every_instrument(self):
         venues = {v.name: set(v.symbols) for v in simulated_venues()}
@@ -98,10 +118,18 @@ class TestAdapterWiring:
         platform = build_platform(settings, clock=clock, bus=bus, store=store)
 
         assert platform.adapters["VENUE_A"].symbols == ["BTC-USDT", "ETH-USDT"]
-        assert platform.adapters["VENUE_B"].symbols == ["BTC-USD", "ETH-USD"]
+        assert platform.adapters["VENUE_B"].symbols == [
+            "BTC-USD",
+            "ETH-USD",
+            "BTC-USDT",
+            "ETH-USDT",
+        ]
         # The universe is wider than either venue; neither adapter inherited it.
+        # VENUE_B now carries four of the four canonical symbols, so compare
+        # by identity of the list rather than by length -- the point is that
+        # each adapter is given its own configured markets, not the union.
         assert settings.symbols != platform.adapters["VENUE_A"].symbols
-        assert settings.symbols != platform.adapters["VENUE_B"].symbols
+        assert sorted(settings.symbols) != platform.adapters["VENUE_B"].symbols
 
     def test_the_binance_url_asks_for_the_configured_markets(
         self, monkeypatch, clock, bus, store
@@ -324,7 +352,12 @@ class TestLiveFeedCannotAliasInstruments:
         settings = load_settings()
         by_venue = {v.name: v.symbols for v in settings.enabled_venues}
         assert by_venue["VENUE_A"] == ["BTC-USDT", "ETH-USDT"]
-        assert by_venue["VENUE_B"] == ["BTC-USD", "ETH-USD"]
+        assert by_venue["VENUE_B"] == ["BTC-USD", "ETH-USD", "BTC-USDT", "ETH-USDT"]
+        # Overlap where both genuinely list; USD remains Coinbase's alone.
+        assert set(by_venue["VENUE_A"]) & set(by_venue["VENUE_B"]) == {
+            "BTC-USDT",
+            "ETH-USDT",
+        }
 
     def test_the_binance_parser_reports_usdt(self):
         """Whatever the configuration says, the wire says USDT."""

@@ -145,8 +145,18 @@ class TestLiveVenueConfiguration:
         for config in default_venues():
             assert config.ws_max_message_bytes == 8_388_608
 
-    def test_venue_b_symbols_are_unchanged(self):
-        assert live_venue("VENUE_B").symbols == ["BTC-USD", "ETH-USD"]
+    def test_venue_b_symbols_include_its_usd_and_usdt_markets(self):
+        """P13-B1 added the USDT products Coinbase genuinely lists.
+
+        The storage ceiling this module exists for is unaffected: it is
+        per-side and per-book, so more books does not mean a bigger book.
+        """
+        assert live_venue("VENUE_B").symbols == [
+            "BTC-USD",
+            "ETH-USD",
+            "BTC-USDT",
+            "ETH-USDT",
+        ]
 
     def test_venue_a_symbols_are_unchanged(self):
         """USD and USDT are different instruments and stay that way."""
